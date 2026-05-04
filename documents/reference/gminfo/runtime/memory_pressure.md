@@ -45,6 +45,6 @@
 
 1. **com.google.android.configupdater:** PendingIntent FLAG_IMMUTABLE crash (8 occurrences, non-fatal, restarts silently). Android 12 PendingIntent mutability enforcement — Google never patched this for AAOS.
 
-2. **zeno.carlink:** MediaBrowserService session token crash (2 occurrences). Root cause: double `setSessionToken()` call in `CarlinkManager.initialize`.
+2. **zeno.carlink:** MediaBrowserService session token crash (2 occurrences). Symptom of a structural AAOS limitation, not an isolated app bug. `MediaBrowserServiceCompat.setSessionToken()` is one-shot per Service lifetime — once set, a second call throws `IllegalStateException: The session token has already been set`. Carlink's `CarlinkManager.initialize` triggered this on display-mode reinit; guarded with a static `mediaSessionToken` + `updateSessionToken()` to prevent the double-set. The deeper issue (third-party app session destruction stranding the cluster on a dead token until reinstall/reboot) is structural and cannot be fully fixed from third-party scope. See `known_issues.md` § "Third-Party Media MediaSession Token Mismatch" for the full picture.
 
 3. **com.google.android.apps.automotive.templates.host:** ForegroundServiceStartNotAllowedException (2 occurrences). Boot race condition — `BootCompleteReceiver` calls `startForegroundService` when not yet allowed. Google AAOS platform bug.

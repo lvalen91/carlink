@@ -5,12 +5,19 @@
 **Android Version:** 12 (API 32)
 **Research Date:** January 2026
 **Updated:** 2026-05-03 — added cross-platform analysis vs CT5 / AAOS 14 + corrected understanding of maneuver-icon path
+**Updated:** 2026-05-04 — corrected platform naming to GM VCU 1.0 / CIP (Bosch VCUNM1) per Bosch installer manual; clarified that the icon-substitution behavior is verified on AAOS 14 only and may not apply to early VCU vehicles that shipped on AAOS 12/13
 
 ---
 
-## ⚠ 2026-05-03 ADDENDUM — Cross-platform finding (CT5 vs Silverado)
+## ⚠ Platform naming note (2026-05-04)
 
-**Static decompilation analysis only. NOT yet hardware-verified. Runtime evidence reported by user: CT5 cluster shows GM-internal-style maneuver glyphs regardless of which projection source provides the icon (carlink-internal CarPlay design OR AA passthrough bitmap). Silverado renders the actual app-provided bitmap correctly.**
+GM's successor to the Info 3.x platform is officially named **GM Vehicle Cockpit Unit (VCU) 1.0**, type designation **Cockpit Integration Platform ("CIP")**, Bosch hardware model **VCUNM1** (MID variant, Qualcomm 8155; HIGH variant likely VCUNH1, Qualcomm 8195). Source: Bosch "Vehicle Cockpit Unit (VCU) Technical Description and Installers Manual," v1, 09/14/23. The manual states verbatim: *"GM VCU 1.0 is a technology upgrade for the previous generation GM Cockpit ECU platform ('Info 3.x')."* The 2026 Cadillac CT5 used as the test specimen below is a VCU vehicle running AAOS 14. References to "CT5" in this addendum should be read as "the VCU/CIP platform as observed on AAOS 14 firmware." The icon-substitution behavior described below is verified against AAOS 14 firmware extracts only — early VCU vehicles that shipped on AAOS 12 or 13 (before OTA upgrade) are not yet characterized and may behave differently.
+
+---
+
+## ⚠ 2026-05-03 ADDENDUM — Cross-platform finding (VCU/CIP on AAOS 14 vs Silverado on AAOS 12)
+
+**Static decompilation analysis only. NOT yet hardware-verified. Runtime evidence reported by user: CT5 cluster (VCU/CIP, AAOS 14) shows GM-internal-style maneuver glyphs regardless of which projection source provides the icon (carlink-internal CarPlay design OR AA passthrough bitmap). Silverado (Info 3.7, AAOS 12) renders the actual app-provided bitmap correctly.**
 
 ### Both platforms have an ECU-side glyph library
 
@@ -84,14 +91,18 @@ This is consistent with: GM's design intent is uniform cluster appearance regard
 
 ### Cross-platform summary table
 
-| Property | Silverado AAOS 12 | CT5 AAOS 14 |
+| Property | Info 3.7 / gminfo37 (Silverado, AAOS 12) | VCU / CIP / VCUNM1 (CT5, AAOS 14) |
 |---|---|---|
+| GM platform name | Info 3.x | GM VCU 1.0 / Cockpit Integration Platform ("CIP") |
+| Hardware vendor / model | Intel Atom + Renesas RH850 (gminfo37 module) | Bosch VCUNM1 (Qualcomm 8155 + RH850F1KM/KH); HIGH variant likely VCUNH1 (Qualcomm 8195) |
+| Hypervisor | GHS INTEGRITY | BlackBerry QNX 7.x |
 | Cluster ECU has glyph library | YES (per Protos$maneuverIconType wire format) | YES (same enum schema) |
 | VMSPlugin forwards URI on imminent turn | YES | YES |
 | VMSPlugin forwards TurnType enum on imminent turn | NO | YES (`setManeuverType()` at NavigationStateProtoUtils:562) |
-| ECU renders app-provided bitmap | YES (parallel URI-resolution channel, mechanism unverified) | NO (enum-driven sprite preferred) |
+| ECU renders app-provided bitmap | YES (parallel URI-resolution channel, mechanism unverified) | NO (enum-driven sprite preferred) — verified on AAOS 14 only |
 | ECU renders own glyph from enum | Only for upcoming-step preview list (`gm.navigation.models.Maneuver` list path) | YES, for imminent turn |
 | Was carlink's ClusterIconShimProvider needed | YES (without it, no icon at all) | NO (futile; bitmap is masked) |
+| Early VCU on AAOS 12/13 (pre-upgrade) | n/a | UNCHARACTERIZED — divergence is at the VMSPlugin layer (`setManeuverType()` call) which may have been introduced in the AAOS 14 build; pre-AAOS-14 VCU behavior is not yet verified |
 
 ### Unknowns (require hardware verification)
 
@@ -122,6 +133,7 @@ Templates Host (identical Silv + CT5):
 mempalace cross-references:
 - `gminfo37/projection/drawer_gminfo37_projection_6fcb0bc8369266b42fc97dee` — initial finding (CT5 vs Silv divergence)
 - `carlink_native/architecture/drawer_carlink_native_architecture_92ce1e0f483ffbe8312a7821` — IClusterHmi wire-format spec for cluster
+- `gminfo37/platform/drawer_gminfo37_platform_fe0c8a960a9d2ce90fcabefd` — GM AAOS platform naming (Info 3.x → VCU 1.0 / CIP / Bosch VCUNM1) sourced from Bosch installer manual
 
 ---
 
@@ -129,7 +141,7 @@ mempalace cross-references:
 
 This document describes how navigation turn-by-turn data flows from projection sources (CarPlay, Android Auto) and built-in navigation (Google Maps) to the vehicle instrument cluster display. The cluster shows basic directions including turn arrows, street names, and distance to the next turn.
 
-> **2026-05-03 NOTE on the original Silverado-only architecture below:** The pipeline diagrams and component map below describe Silverado AAOS 12 specifically. CT5 and other AAOS 14 GM platforms use the same upstream (carlink → Templates Host → AAOS framework) but diverge inside `VMSPlugin` (system app) where CT5 added enum forwarding alongside the URI. See addendum above for the corrected understanding. The original Silverado architecture below remains accurate for AAOS 12 / Info 3.7.
+> **2026-05-03 NOTE on the original Silverado-only architecture below:** The pipeline diagrams and component map below describe Silverado AAOS 12 (Info 3.7) specifically. The VCU/CIP platform on AAOS 14 (CT5 and equivalent EVs/newer ICE vehicles) uses the same upstream (carlink → Templates Host → AAOS framework) but diverges inside `VMSPlugin` (system app) where AAOS 14 added enum forwarding alongside the URI. See addendum above for the corrected understanding. The original Silverado architecture below remains accurate for AAOS 12 / Info 3.7.
 
 ---
 

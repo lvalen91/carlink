@@ -20,12 +20,12 @@ I did this app for me and my use, but sharing so others can use it. Don't expect
 > Instrument Panel Cluster and Heads Up Display (HUD) Support
 >
 > Song Information:
-> Due to an AAOS bug. Song metadata displaying on the Cluster is hit or miss. The simplified explanation, the OS gives media apps an ID number (token). The app using this token for song information. The OS sends the info to the cluster to be displayed. When app force closes or on OS sleep a token mismatch occurs. The App keeps using the original token and the OS ignores it. There are no known ways for third-party apps to fix this.
+> Due to an AAOS bug. Song metadata displaying on the Cluster is hit or miss. The simplified explanation, the App creates a session 'token' and hands it to the OS. The Native Media Player and the Cluster both read song info from it. When the App crashes, force closes, or the OS sleeps the session dies. The App can't hand out a new one, the API only allows the token to be set once. The Native Media Player recovers down its own path, but the Cluster keeps holding the dead token and goes blank. Only an app reinstall or a head unit reboot will clear it. There are no known ways for third-party apps to fix this.
 >
 > Navigation Turn-By-Turn
 > Adapter firmware strips away nav details iPhones provide. It is narrows down to basic manuvers. The app forwards this to the cluster. CarPlay does not provide navigation icons. The app has its own internal set for CP. Android Auto does provide manuver images, which is forwarded to the cluster. They are more detailed and accurate.
 >
-> GM EVs or those on the Qualcom radios do not use any icon provided by the app. GM VMSPlugin only passes the manuver type to the cluster. The Cluster ECU renders its own internal icon set.
+> Vehicles running the GM VCU radio (most EVs and newer Fuel/ICE vehicles) on GM AAOS 14+ do not use any icon provided by the app. GM VMSPlugin still passes them, but the Cluster ECU ignores it and renders from its own internal icon set based on the manuver type. Earlier VCU vehicles on AAOS 12 or 13 may have behaved differently before being upgraded.
 >
 > My truck doesn't have an HUD, so i cannot test this. However, some Silverado and Hummer EV users have reported that the HUD does show navigation. I can only test for the software in my Silverado. GM and others can easily change how that is controlled so if it works, great. If it doesnt.. too bad.
 

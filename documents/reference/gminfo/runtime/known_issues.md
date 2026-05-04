@@ -57,6 +57,24 @@ Only TCPU and TGPU are real thermal zones. TBATTERY and TSKN are stubs returning
 
 `com.google.android.apps.automotive.templates.host` throws ForegroundServiceStartNotAllowedException during boot. `BootCompleteReceiver` calls `startForegroundService` when the app is not yet in a state that allows foreground service starts. This is a Google AAOS platform bug (2 occurrences observed).
 
+## Third-Party Media MediaSession Token Mismatch (AAOS structural bug)
+
+User-visible symptom: any third-party media app — including carlink_native — that crashes, is force-closed, or has its session destroyed (OS sleep, USB disconnect, etc.) will keep producing metadata, but the cluster will go blank or stale while the in-dash native Media Player continues to display correct song info. The only fixes are app reinstall or a head unit reboot.
+
+Root cause is a structural Android framework limitation, not a GM-specific bug:
+
+- `MediaBrowserServiceCompat.setSessionToken()` is **one-shot per Service instance lifetime**. A second call on the same Service throws `IllegalStateException: The session token has already been set`.
+- When the app's session is destroyed (`onSessionDestroyed`), the underlying MediaSession dies but the singleton `MediaBrowserService` keeps a stale reference to the dead token. The app cannot hand out a fresh token from the same Service.
+- Privileged AAOS consumers (Media Center / GMCarMediaService / ClusterService) keep their bindings to the old token instead of rediscovering the new session.
+- Google's official guidance ([Building a media browser client](https://developer.android.com/media/legacy/audio/mediabrowser)) confirms: *"the session cannot become functional again within the lifetime of the MediaBrowserService"* — clients must `disconnect()` so the OS can destroy the Service. On AAOS the clients are GM system services the third-party app cannot control.
+- Why the in-dash player still works while the cluster doesn't: they read down different paths. The native Media Player goes via `MediaSessionManager` directly and recovers; the cluster path goes through `GMCarMediaService` → `ClusterService` and stays bound to the dead token.
+
+Workaround applied in carlink_native: deactivate-and-reactivate the existing `MediaSession` rather than recreate it (`MediaSessionManager.refresh()`); on `DISCONNECTED` use `STATE_PAUSED` instead of `STATE_STOPPED` + cleared metadata so cluster controllers stay attached. Static `mediaSessionToken` with guarded `updateSessionToken()` prevents the double-set crash on display-mode reinit. None of this fully recovers from a process-death scenario — only the OS killing the Service does.
+
+Crash references: see `runtime/memory_pressure.md` for the two `setSessionToken()`-double-call FATAL EXCEPTION events observed in the 3.7GB logcat corpus, and the surrounding section on broader AAOS media-token state.
+
+Affects: all GM AAOS platforms (Info 3.x and VCU/CIP) — this is an Android-framework-level limitation, not platform-specific.
+
 ## VIP MCU Health Telemetry
 
 PLSS_PMPAL reports at 1Hz via IPC: `health:48 10 0 0 0 0` (consistent across all sessions). Format: 6 integer fields, values stable — no anomalies detected.
