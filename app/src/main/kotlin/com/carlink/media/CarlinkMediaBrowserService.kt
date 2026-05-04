@@ -10,14 +10,18 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.util.Log
+import androidx.annotation.VisibleForTesting
 import androidx.core.app.NotificationCompat
 import androidx.core.app.ServiceCompat
+import androidx.media3.session.DefaultMediaNotificationProvider
 import androidx.media3.session.MediaLibraryService
 import androidx.media3.session.MediaLibraryService.MediaLibrarySession
 import androidx.media3.session.MediaSession
 import com.carlink.BuildConfig
 import com.carlink.MainActivity
 import com.carlink.R
+import com.carlink.logging.logInfo
+import com.carlink.util.LogCallback
 
 private const val TAG = "CARLINK_BROWSER"
 
@@ -86,30 +90,33 @@ class CarlinkMediaBrowserService : MediaLibraryService() {
     private var isForeground = false
     private val foregroundLock = Any()
 
+    /**
+     * Initialize the [MediaSessionManager] singleton synchronously here so AAOS
+     * `onGetSession` probes (which arrive within ~50 ms of `onCreate` at boot) find a
+     * live session token. Owning the lifecycle in the MBS — rather than in MainActivity
+     * — closes the boot-race window where AAOS auto-launches the MBS without ever
+     * launching MainActivity, so the older Activity-scoped initialize() never ran and
+     * the latch-based wait timed out returning `null` (a permanent controller rejection
+     * per Media3 docs).
+     */
     override fun onCreate() {
         super.onCreate()
         instance = this
         createNotificationChannel()
         if (BuildConfig.DEBUG) Log.d(TAG, "[BROWSER_SERVICE] onCreate")
+        MediaSessionManager.getOrCreate(applicationContext, serviceLogCallback).initialize()
     }
 
     /**
-     * Return the live [MediaLibrarySession] for the requesting controller.
-     *
-     * Returns `null` if [MediaSessionManager] hasn't created the session yet (pre-init
-     * or post-release). Per Media3 docs, `null` permanently rejects this controller's
-     * connection — in practice [MediaSessionManager.initialize] runs synchronously
-     * during CarlinkManager's init sequence, ahead of any AAOS bind.
+     * Return the live [MediaLibrarySession] for the requesting controller. Guaranteed
+     * non-null after [onCreate] returns (the OS only dispatches binder calls — including
+     * `onGetSession` — after `Service.onCreate` completes).
      */
     override fun onGetSession(controllerInfo: MediaSession.ControllerInfo): MediaLibrarySession? {
         if (BuildConfig.DEBUG) {
             Log.d(TAG, "[BROWSER_SERVICE] onGetSession from ${controllerInfo.packageName} uid=${controllerInfo.uid}")
         }
-        val session = MediaSessionManager.getMediaLibrarySession()
-        if (session == null && BuildConfig.DEBUG) {
-            Log.w(TAG, "[BROWSER_SERVICE] MediaLibrarySession not yet initialized — rejecting bind")
-        }
-        return session
+        return MediaSessionManager.getMediaLibrarySession()
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -117,8 +124,57 @@ class CarlinkMediaBrowserService : MediaLibraryService() {
         return super.onStartCommand(intent, flags, startId)
     }
 
+    /**
+     * Override of [MediaLibraryService.onTaskRemoved] (inherited from [MediaSessionService]).
+     *
+     * Rationale based on observations of media3-session 1.10.0 source on 2026-05-03 — these
+     * are point-in-time observations, not contract guarantees. Re-verify against the current
+     * Media3 release before relying on this for refactoring decisions.
+     *
+     * Observed default implementation (around MediaSessionService.java:737-743 as of the
+     * 2026-05-03 read) calls `pauseAllPlayersAndStopSelf()` whenever
+     * `!isAnySessionPlaying()`. The observed `isAnySessionPlaying()` (around line 912-920)
+     * iterates sessions and checks `Player.isPlaying()`. Per Player javadoc as of 1.10.0,
+     * `isPlaying()` requires `STATE_READY + playWhenReady` simultaneously — which appears
+     * not to be reachable for [UsbAdapterPlayer] during the CONNECTING phase (Player is
+     * `STATE_BUFFERING + playWhenReady=true`, so isPlaying() returned false in observed
+     * runs). If a future Media3 release changes the predicate (e.g., admits
+     * STATE_BUFFERING), this override's premise weakens and should be reconsidered.
+     *
+     * Observed `pauseAllPlayersAndStopSelf()` then calls `setPlayWhenReady(false)` on every
+     * session player before `stopSelf()`. For [UsbAdapterPlayer] that routes through
+     * [UsbAdapterPlayer.handleSetPlayWhenReady] → [UsbAdapterPlayer.Callback.onPause] →
+     * [MediaSessionManager.MediaControlCallback.onPause] →
+     * `CarlinkManager.sendKey(CommandMapping.PAUSE)` — which would emit a SPURIOUS USB
+     * PAUSE command to the connected phone even though the user only swiped the launcher.
+     * The override below avoids this cascade.
+     *
+     * Override: when our manual FGS is held (CONNECTING/STREAMING), call `stopSelf()`
+     * directly — observed doc warning around MediaSessionService.java:723-725 (2026-05-03)
+     * stating that when playback is not ongoing, the service must be terminated or the
+     * system will crash and restart it. `stopSelf()` satisfies that without invoking the
+     * player-side pause cascade. When the manual FGS is not held, defer to the default.
+     *
+     * Line numbers above are point-in-time references; expect drift across Media3 releases
+     * and grep the symbol names rather than the line numbers when re-verifying.
+     */
+    override fun onTaskRemoved(rootIntent: Intent?) {
+        if (isForeground) {
+            if (BuildConfig.DEBUG) {
+                Log.d(TAG, "[BROWSER_SERVICE] onTaskRemoved during FGS — stopSelf without pause cascade")
+            }
+            stopSelf()
+            return
+        }
+        super.onTaskRemoved(rootIntent)
+    }
+
     override fun onDestroy() {
         if (BuildConfig.DEBUG) Log.d(TAG, "[BROWSER_SERVICE] onDestroy")
+        // Release the MediaSession singleton here — this is the one and only
+        // shutdown path for the session now that MBS owns its lifecycle. MainActivity
+        // is no longer responsible.
+        MediaSessionManager.releaseInstance()
         instance = null
         stopForegroundMode()
         super.onDestroy()
@@ -161,6 +217,13 @@ class CarlinkMediaBrowserService : MediaLibraryService() {
             .setPriority(NotificationCompat.PRIORITY_LOW)
             .setCategory(NotificationCompat.CATEGORY_SERVICE)
             .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
+            // Use Media3's auto-FGS notification group key so that, during any brief overlap
+            // between our manual FGS notification (CONNECTING) and Media3's
+            // DefaultMediaNotificationProvider notification (active playback), both notifications
+            // — which already share NOTIFICATION_ID per `notify()` replace-by-id semantics — also
+            // share a group, eliminating cross-path UI churn. Verified group key value at
+            // DefaultMediaNotificationProvider.java:250 in 1.10.0.
+            .setGroup(DefaultMediaNotificationProvider.GROUP_KEY)
             .setContentIntent(contentIntent)
             .build()
     }
@@ -224,8 +287,28 @@ class CarlinkMediaBrowserService : MediaLibraryService() {
     // ──────────────────────────────────────────────────────────────────────
 
     companion object {
+        /**
+         * LogCallback used by the [MediaSessionManager] singleton when it's bootstrapped
+         * from the MBS at boot — i.e. before MainActivity has had a chance to install its
+         * own callback. Routes through the same top-level [logInfo] used elsewhere in the
+         * app so MediaSession events appear in both logcat and FileLogManager exports.
+         */
+        private val serviceLogCallback = object : LogCallback {
+            override fun log(message: String) = logInfo(message, tag = "MEDIA_SESSION")
+            override fun log(tag: String, message: String) = logInfo(message, tag = tag)
+        }
+
         private const val NOTIFICATION_CHANNEL_ID = "carlink_connection"
-        private const val NOTIFICATION_ID = 1001
+
+        /**
+         * Foreground-service notification id. MUST equal Media3's
+         * `DefaultMediaNotificationProvider.DEFAULT_NOTIFICATION_ID` so the manual FGS
+         * notification (CONNECTING phase) and Media3's auto-FGS notification (active
+         * playback) collapse into a single notification slot. See class-level KDoc
+         * for full context. Verified by `MediaNotificationIdTest`.
+         */
+        @VisibleForTesting
+        internal const val NOTIFICATION_ID = 1001
         private const val ACTION_START_FOREGROUND = "ACTION_START_FOREGROUND"
 
         @Volatile private var instance: CarlinkMediaBrowserService? = null

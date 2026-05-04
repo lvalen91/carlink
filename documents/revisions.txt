@@ -404,3 +404,95 @@
    - MediaSessionManager.kt libraryCallback gains [PROBE] logs on onConnect/onDisconnected/onGetLibraryRoot/onGetChildren/onGetItem/onSubscribe. BuildConfig.DEBUG-gated, R8-stripped in release.
 
 [123] :: Code Cleanup
+
+[124] :: Media3 Code changes and some GM AAOS Code testing
+
+[125] :: Media3 debug code added for testing.
+
+[126] :: GM cluster regression fix + OS native media browser placeholder.
+   - UsbAdapterPlayer.kt getState() inactive branch now returns a placeholder MediaItem at STATE_READY, not empty timeline + STATE_IDLE.
+   - Restores v99 always-visible session contract; platform MediaSession.isActive stays true through GM's 88s lazy-bind window.
+   - PLACEHOLDER_METADATA companion constant ("Carlink"/"Not connected") added to UsbAdapterPlayer.kt.
+   - MediaSessionManager.setInactive() publishes placeholder metadata + STATE_READY instead of MediaMetadata.EMPTY + STATE_IDLE.
+   - MediaLibrarySession.Callback.onGetChildren returns one non-playable info item: "Browsing not available — open the app for projection".
+   - Replaces indefinite "Loading..." spinner shown by AAOS Media Center / AVRCP browse on empty library result.
+   - onGetItem resolves BROWSE_INFO_ITEM_ID so legacy MediaBrowserCompat clients fetching by id get the same metadata. 
+
+[127] :: Media3 audit-driven correctness fixes — observations against Media3 1.10.0 source (2026-05-03); see in-tree KDoc for re-verify advisories.
+   - CarlinkMediaBrowserService.kt onTaskRemoved override added: stopSelf() while FGS held, skips default pauseAllPlayersAndStopSelf() cascade.
+   - Avoids spurious USB PAUSE when swiping app during CONNECTING (STATE_BUFFERING did not satisfy isAnySessionPlaying() in observed Media3 1.10.0).
+   - CarlinkMediaBrowserService.kt buildNotification adds setGroup(DefaultMediaNotificationProvider.GROUP_KEY) — aligns manual FGS with Media3 auto-FGS group "media3_group_key".
+   - MediaSessionManager.kt onConnect uses controller.isTrusted instead of hand-rolled isTrustedController + hasMediaContentControlPermission helpers.
+   - Trust gate now also covers STATUS_BAR_SERVICE and enabled notification listeners — prior hand-rolled check missed those cases.
+   - MediaSessionManager.kt removed unused android.content.pm.PackageManager and android.os.Process imports after helper removal.
+   - MediaSessionManager.kt rootExtras putInt uses MediaConstants.EXTRAS_VALUE_CONTENT_STYLE_LIST_ITEM constant (=1) instead of magic-number literal.
+   - MediaSessionManager.kt onSubscribe gains KDoc documenting super-reject of BROWSE_INFO_ITEM_ID (intentional; non-browsable info-item not a subscribe target).
+   - MediaSessionManager.kt onGetChildren gains comment documenting deliberate deviation from Media3 doc preference for empty list.
+   - Empirical AAOS spinner-on-empty-list behavior justifies single info-row return.
+   - MediaSessionManager.kt LegacyConversions citation no longer references brittle line numbers — line ranges drift across releases.
+   - UsbAdapterPlayer.kt + MediaSessionManager.kt KDoc corrected: Media3 observed to call setActive(true) once at MediaSessionLegacyStub.start() — never via player-state predicate.
+   - Cluster regression cause re-attributed: downstream consumer metadata-visibility evaluation, not platform isActive flipping. Code behavior unchanged.
+   - UsbAdapterPlayer.kt setSessionActive KDoc + playbackState field comment cleaned of stale isActive-derivation claims.
+   - app/build.gradle.kts extracted val media3Version = "1.10.0"; both implementation lines reference $media3Version. Eliminates version drift risk.
+   - GmBrokerPermissionTest.kt KDoc + assertion message updated to reference MediaSession.ControllerInfo.isTrusted() after helper removal.
+   - AndroidManifest.xml FileProvider comment corrected: zero grantUriPermission calls observed in androidx.media3.session sources on 2026-05-03; Media3 does not auto-grant.
+   - Manual MediaSessionManager.grantUriToConsumers() is the actual mechanism; session resolves artworkUri server-side via BitmapLoader and ships decoded Bitmap.
+   - MediaSessionManager.kt KNOWN OS DEFICIENCY KDoc corrected against AOSP source observations 2026-05-03.
+   - PlaybackViewModel re-located: lives in car-media-common (not CarLauncher); CarLauncher consumes it via homescreen/audio/MediaViewModel.
+   - "Rebinds to cached-but-stale controller" framing inverted: controller is nulled at onSessionDestroyed and never replaced (three layered ComponentName-equality guards).
+   - SharedPreferences path /data/user/0/com.android.car/ marked unverified; only the file name "com.android.car.media.car_media_service" is confirmed.
+   - In-tree TODO at PlaybackViewModel.java:306 cited as AOSP-side acknowledgment of the orphaned-controller-resurrection gap.
+   - Audit-cycle KDoc/comment reframing: blocks authored this cycle now use observation-framed language with date stamps and re-verify advisories.
+   - Replaces hard claims with dated observations — prevents future sessions trusting stale assertions as Media3 or AOSP contracts.
+   - Affected: CarlinkMediaBrowserService.kt, UsbAdapterPlayer.kt, MediaSessionManager.kt, AndroidManifest.xml, GmBrokerPermissionTest.kt.
+
+[128] :: Play Store distribution split — play/sideload product flavors resolve issue #6 ClusterIconContentProvider authority collision on AAB upload.
+   - app/build.gradle.kts adds distribution flavor dimension: sideload (GM literal authority) and play (zeno.carlink.ClusterIconContentProvider).
+   - manifestPlaceholders["clusterIconAuthority"] + buildConfigField CLUSTER_ICON_AUTHORITY drive the per-variant authority value.
+   - androidComponents.beforeVariants disables playDebug — Play Console rejects debuggable bundles, so the variant has no purpose.
+   - Net build matrix: sideloadDebug (APK), sideloadRelease (APK), playRelease (AAB). Three rows in Build Variants and Generate Signed wizard.
+   - AndroidManifest.xml ClusterIconShimProvider authority now ${clusterIconAuthority} placeholder; resolved per flavor at manifest merge time.
+   - ClusterIconShimProvider.kt AUTHORITY switched from const literal to BuildConfig.CLUSTER_ICON_AUTHORITY (val, since BuildConfig is not const).
+   - URI building (content://$AUTHORITY/img/...) and onCreate log line both pick up the per-flavor authority transparently.
+   - NavigationStateManager.kt CLUSTER_ICON_PROVIDER_AUTHORITY intentionally left literal — runtime guard must probe the actual Templates Host call target.
+   - Inline comment warns future contributors NOT to template the probe for symmetry; would convert graceful fallback into silent failure.
+   - playRelease behavior: Play Console accepts upload, resolveContentProvider(GM) returns null, isAccessible=false, dropCurrentManeuverIcon() runs, type-based icons render.
+   - sideload behavior unchanged: shim claims GM authority, Templates Host calls land on it, AA bitmap maneuver icons render in cluster.
+   - Path 2 chosen over strict-issue-fix (templating all three references) after analysis of canUseAaManeuverIcon() consumer chain.
+   - Affected: app/build.gradle.kts, AndroidManifest.xml, ClusterIconShimProvider.kt, NavigationStateManager.kt.
+
+[129] :: Cluster blank-card fixes — CountDownLatch bind-race mitigation, explicit placeholder publish at init, state-aware adapter-lifecycle text.
+   - MediaSessionManager.kt companion adds initLatch (CountDownLatch) and awaitInitialized(timeoutMs); reset in release().
+   - CarlinkMediaBrowserService.onGetSession blocks up to 1500ms on awaitInitialized when session null instead of permanent reject.
+   - Addresses Silv MediaSourceViewModel.java:117-125 single-shot null-token check that permanently fails the cluster bind.
+   - MediaSessionManager.initialize() now explicitly pushes placeholder via updatePlaybackState + updateMediaMetadata before initLatch.countDown().
+   - Forces Media3 legacy bridge to propagate placeholder to MediaSessionCompat synchronously, eliminating null-mmdCompat window.
+   - Addresses Silv processMetadata smali :cond_4b3 silent "un handled response" log when MediaController.getMetadata() returns null.
+   - buildPlaceholderMetadata(artist) helper added; sets Title, DisplayTitle, Artist, Subtitle so all consumer fallback chains render same text.
+   - setProjectionActive(connectingPhase) overload added; setInactive and setProjectionActive() route through buildPlaceholderMetadata.
+   - CarlinkManager.updateMediaSessionState passes connectingPhase=true on CONNECTING and connectingPhase=false on DEVICE_CONNECTED.
+   - Phase-aware placeholder text: "Not connected", "Connecting to phone...", "Waiting for media..." across adapter lifecycle.
+   - Static analysis verified Media3 1.10.0 MediaSessionImpl wires platformToken synchronously in constructor — no Approach B forcing needed.
+   - MediaSessionManager.updatePlaceholderArtist(text) added; refreshes only metadata, leaves PlaybackState and isSessionActive untouched.
+   - CarlinkManager.setStatusText now mirrors UI status text to MediaSession placeholder when state != STREAMING.
+   - Cluster, cardview, and CarMediaApp surfaces show the same curated state strings the main app UI shows as adapter transitions.
+   - Reuses existing 19+ user-facing status messages (Searching for adapter, Initializing, Waiting for phone, Reconnecting, etc.).
+   - Eliminates duplication between hardcoded MediaSession placeholders and main-UI status — single source of truth.
+   - Streaming gate prevents status text from clobbering live CarPlay/AA track metadata during active playback.
+   - Affected: MediaSessionManager.kt, CarlinkMediaBrowserService.kt, CarlinkManager.kt.
+
+[130] :: Boot-race fix — MediaSession ownership moved from MainActivity to CarlinkMediaBrowserService.onCreate; closes blank-card window at AAOS auto-launch.
+   - MediaSessionManager.kt companion adds getOrCreate(context, log), instance(), releaseInstance() singleton API; old initLatch + awaitInitialized removed.
+   - CarlinkMediaBrowserService.onCreate now calls getOrCreate(applicationContext, serviceLogCallback).initialize() so session exists before any binder dispatch.
+   - onGetSession simplified to one-liner returning getMediaLibrarySession() — no latch wait, no null-on-timeout permanent rejection.
+   - CarlinkMediaBrowserService.onDestroy now calls releaseInstance() — single shutdown path; MainActivity no longer responsible for session release.
+   - serviceLogCallback companion routes MEDIA_SESSION events through top-level logInfo so file logs capture boot-time session activity.
+   - MainActivity.applyAudioTransferModeToMediaSession reads singleton via instance(); defensive getOrCreate fallback if MBS unstarted (am-start path).
+   - Defensive bootstrap fires "[MEDIA_SESSION] singleton missing — bootstrapped from Activity (unexpected)" warning; should be unreachable in normal boot flow.
+   - BLUETOOTH audio mode toggle now calls setInactive() instead of release() — preserves session token, avoids triggering AOSP rebind gap.
+   - MainActivity.onDestroy no longer calls mediaSessionManager.release() — Activity drops local reference, MBS owns full lifecycle.
+   - Pre-fix boot test: onGetSession at +43ms, MediaSessionManager init at +4515ms, init timeout fired, CarLauncher home card blank.
+   - Post-fix boot test: MediaSessionManager init at +160-219ms, onGetSession at +1ms after init, GM/AAOS observer bound succeeds, card populates.
+   - Two reboot tests confirmed fix: card shows placeholder ("Phone rejected configuration") then real track metadata once phone connects.
+   - Force-stop+relaunch case still hits documented AOSP rebind gap (PlaybackViewModel.java:306 orphaned-controller TODO) — not addressable app-side.
+   - Affected: MediaSessionManager.kt, CarlinkMediaBrowserService.kt, MainActivity.kt.

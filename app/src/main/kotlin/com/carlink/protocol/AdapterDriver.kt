@@ -75,6 +75,12 @@ class AdapterDriver(
     private val sessionStart = AtomicLong(0)
     private var initMessagesCount = 0
 
+    // Diagnostic: per-type message arrival counter. Emits a [TYPE_COUNTS_5s] summary
+    // every 5s on the USB read thread. Designed to prove which raw message types are
+    // flowing on USB without polluting logs with per-message [RECV] floods.
+    private val typeCounts = mutableMapOf<Int, Int>()
+    private var lastTypeDumpMs = 0L
+
     /**
      * Start the adapter communication with smart initialization.
      *
@@ -365,6 +371,20 @@ class AdapterDriver(
                 ) {
                     messagesReceived.incrementAndGet()
                     bytesReceived.addAndGet((dataLength + HEADER_SIZE).toLong())
+
+                    // Diagnostic per-type tally — proves which raw message types are
+                    // arriving on USB without per-message log noise. Single-threaded
+                    // (USB read thread) so plain map mutation is safe.
+                    typeCounts[type] = (typeCounts[type] ?: 0) + 1
+                    val now = System.currentTimeMillis()
+                    if (now - lastTypeDumpMs > 5000L) {
+                        val summary = typeCounts.entries
+                            .sortedByDescending { it.value }
+                            .joinToString(", ") { "0x${it.key.toString(16).padStart(2, '0')}=${it.value}" }
+                        log("[TYPE_COUNTS_5s] $summary")
+                        typeCounts.clear()
+                        lastTypeDumpMs = now
+                    }
 
                     // For VIDEO_DATA with direct processing, data is null (processed directly by videoProcessor)
                     // Just signal the message handler that video is streaming

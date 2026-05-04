@@ -14,6 +14,21 @@ I did this app for me and my use, but sharing so others can use it. Don't expect
 
 ## Work In progress - Something is always changing.. Not always good
 
+> [!IMPORTANT]
+> Limitations
+> Instrument Panel Cluster and Heads Up Display (HUD) Support
+>
+> Song Information:
+> Due to an AAOS bug. Song metadata displaying on the Cluster is hit or miss. The simplified explanation, the OS gives all apps an ID number. The app using this ID passes Song Info. The OS sends the info to the cluster to be displayed. Sometimes the OS forgets the ID it gives out. So the App keeps using the original ID given and the OS ignores it. There is no known way to force a new ID from within the app. It either works or it doesnt. Read the documentation on this for a detailed explanation. THis unfortunetlty also
+>
+> Navigation Turn-By-Turn
+> Adapter firmware strips away navigation information iphones provide and narrows it down to simple turn by turn directions. The app forwards this to the cluster. CarPlay does not provide navigation symboles. So the App has its own for what it gets from the adapter. Android Auto does provide manuver images, so that is forwarded to the cluster.
+> My truck doesn't have an HUD, so i cannot test this. However, some Silverado and Hummer EV users have reported that the HUD does show navigation. I can only test for the software in my Silverado. GM and others can easily change how that is controlled so if it works, great. If it doesnt.. too bad.
+
+> [!TIP]
+> Before complaining about Audio issues.
+> 1. Disconnect and forget the Phone and Vehicle from each others Bluetooth. The adapter defaults to audio routing THROUGH the adapter for both microhone input and audio output. Make sure you allowed microphone access to the app.
+> 2. Steering Wheel Voice/Call Control doesn't work. That is a system-level app featuer and this is not that. If you want Steering Wheel Voice Controls, then ignore #1 and set the in-app adapter audio routing to Bluetooth. THe Phone and Vehicle will stay connected for ALL audio related events.
 
 > [!IMPORTANT]
 >My 2024 Silverado gminfo3.7 Intel AAOS radio is the target Platform and my only hardware for testing. 
@@ -36,6 +51,7 @@ Buffers create corruption. Queues create lies.
 >Video is a best-effort, disposable representation of UI state.
 Audio is a continuous time signal that must never stall.
 Video may drop. Audio may buffer. Neither may block the other
+
 
 ```
 Video:

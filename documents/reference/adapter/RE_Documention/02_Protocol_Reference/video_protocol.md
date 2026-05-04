@@ -606,11 +606,14 @@ The 2,735B IDR encodes the AA startup animation — a nearly uniform dark backgr
 
 ## Navigation Video Protocol (iOS 13+)
 
-### Activation (Testing Verified Feb 2026)
+### Activation
 
-Navigation video is activated by **sending `naviScreenInfo` in BoxSettings**. This is the confirmed, tested primary mechanism. The firmware parses `naviScreenInfo` at `0x16e5c` and branches directly to `HU_SCREEN_INFO` path, bypassing the `AdvancedFeatures` config check.
+Navigation video activation requires **two conditions**:
 
-**`AdvancedFeatures=1` is NOT required** when `naviScreenInfo` is provided.
+1. **One-time persistent unlock.** `AdvancedFeatures=1` must have been processed by the adapter at least once in its lifetime, which causes ARMadb to write `/etc/RiddleBoxData/HU_NAVISCREEN_INFO`. This file persists across reboots and across reverting `AdvancedFeatures=0`. AppleCarPlay session-init reads it to set `g_bSupportNaviScreen=1`; without that, `_AltScreenSetup` is never called regardless of host signaling. (Originally documented during the Jan 2026 discovery of navigation video.)
+2. **Per-session activation.** Host sends `naviScreenInfo` in BoxSettings (Path A — recommended), OR `AdvancedFeatures=1` is currently set (Path B — legacy).
+
+The firmware parses `naviScreenInfo` at `0x16e5c` and branches directly to `HU_SCREEN_INFO` (`0x170d6`), bypassing the **parser-side** `AdvancedFeatures` check. That bypass alone is insufficient on a virgin adapter, since `g_bSupportNaviScreen` won't be set — both gates must clear.
 
 ### Handshake Sequence (INCONCLUSIVE)
 
@@ -634,8 +637,9 @@ if ((msg.value as number) === 508 && this.config.naviScreen?.enabled) {
 **Recommendation:** Echo 508 back if received (low cost, may be needed in some firmware paths), but the primary activation mechanism is `naviScreenInfo` in BoxSettings.
 
 **Prerequisites for navigation video:**
-- `naviScreenInfo` must be sent in BoxSettings JSON (confirmed requirement)
-- `AdvancedFeatures=1` is NOT required when `naviScreenInfo` is provided
+- Adapter must have had `AdvancedFeatures=1` processed at least once (one-time persistent unlock — see Activation section). On virgin adapters, run `riddleBoxCfg -s AdvancedFeatures 1 && riddleBoxCfg --upConfig` once via SSH.
+- `naviScreenInfo` must be sent in BoxSettings JSON for Path A activation
+- After the one-time unlock, `AdvancedFeatures` can be left at 0 — Path A continues to work
 - CarPlay navigation app becomes active on phone
 - Host's `naviScreen.enabled` config must be true
 

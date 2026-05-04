@@ -14,8 +14,10 @@ import android.util.Log
 import androidx.media3.common.C
 import androidx.media3.common.MediaItem
 import androidx.media3.common.MediaMetadata
+import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
 import androidx.media3.session.LibraryResult
+import androidx.media3.session.MediaConstants
 import androidx.media3.session.MediaLibraryService
 import androidx.media3.session.MediaLibraryService.MediaLibrarySession
 import androidx.media3.session.MediaSession
@@ -31,8 +33,10 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
-
+import kotlinx.coroutines.withContext
 private const val TAG = "CARLINK_MEDIA"
 
 /**
@@ -53,6 +57,7 @@ private val URI_GRANT_CONSUMERS = listOf(
     "com.gm.rhmi",
     "com.gm.cluster",
     "com.gm.gmaudio.tuner",
+    "com.gm.gmaudio.server",
     "com.gm.car.media.gmcarmediaservice",
     "com.android.car.media",
     "com.android.car.cluster",
@@ -131,41 +136,84 @@ private val URI_GRANT_CONSUMERS = listOf(
  * fallback for SIRI / PHONE_CALL / navigation-prompt contexts. The default AudioAttributes
  * preserves AAOS focus routing.
  *
- * MEDIA3 SESSION "ACTIVE" STATE
- * Media3's [MediaSession] does not expose `isActive` — AAOS Media Center derives the
- * session's "available media source" status from the backing [Player]'s state:
- *   STATE_IDLE + empty timeline → inactive (stopped / disconnected)
- *   STATE_BUFFERING             → active (connecting / waiting for data)
- *   STATE_READY                 → active (has source; play or pause)
- *   STATE_ENDED                 → active (playback finished)
- * [setProjectionActive] / [setInactive] set the appropriate Player state so the
- * AAOS switcher visibility matches the USB adapter lifecycle.
+ * MEDIA3 SESSION "ACTIVE" STATE (observations as of 2026-05-03; re-verify on upgrade)
+ * Media3's [MediaSession] does not expose a public `isActive` API surface. Based on
+ * Media3 1.10.0 source as read on 2026-05-03 (around MediaSessionLegacyStub.start()),
+ * the platform-side android.media.session.MediaSession.isActive flag appeared to be set
+ * to true ONCE inside the session start path, with no observed `setActive(false)` call
+ * before session release. Within that observation, Player state and timeline emptiness
+ * did not appear to toggle the platform active flag — but this is an internal Media3
+ * detail without a public contract guarantee, so re-verify when upgrading Media3.
  *
- * KNOWN OS DEFICIENCY — stale homescreen Media card after force-stop
- * ------------------------------------------------------------------
- * AAOS platform limitation, not specific to this app. Reproduced on:
- *   - zeno.carlink (our Media3 projection app) — 2026-04-21.
+ * AAOS Media Center / GMCarMediaService / cluster appear to gate "available media source"
+ * visibility on a combination of (a) session metadata payload and (b) playlist (timeline)
+ * presence — both of which ARE driven by [Player.State]. Empirical mapping observed on
+ * GM AAOS 2024 Silverado at 2026-05-03 only:
+ *   Empty timeline + STATE_IDLE                            → switcher drops Carlink (regression)
+ *   Non-empty timeline + STATE_READY + playWhenReady=false → source visible, paused
+ *   Non-empty timeline + STATE_BUFFERING + playWhenReady=true → source is "preparing"
+ * These mappings were observed on a single firmware build; treat them as field findings,
+ * not specifications. [setProjectionActive] / [setInactive] choose the [Player.State]
+ * combination that produced the desired switcher behavior on the observed firmware.
+ *
+ * OBSERVED OS BEHAVIOR — stale homescreen Media card after force-stop
+ * -------------------------------------------------------------------
+ * The findings below are point-in-time observations as of 2026-05-03 from the AOSP
+ * source tree readings noted, plus on-device repros on the firmware/builds named.
+ * Treat them as field findings, not as a contract guarantee. AOSP and OEM firmware
+ * change frequently; re-verify on upgrade or before relying on these for design
+ * decisions in newer code.
+ *
+ * Reproduced (under the test conditions noted) on:
+ *   - zeno.carlink (this Media3 projection app) — 2026-04-21.
  *   - Apple Music 5.2.1 (com.apple.android.music), a first-party vendor app using
  *     standard MediaBrowserService + MediaSession — 2026-04-21, same symptom.
- * Any media app in the AAOS ecosystem hits this; do not build app-side workarounds.
- * By extension the same failure is expected on the GM WidgetPanel media widget and
- * the GM Cluster media panel (they consume MediaSession through the same plumbing).
+ * The repro on a first-party vendor app on the same date suggests the issue is not
+ * specific to this app's code; on that basis we did not pursue app-side workarounds.
+ * The same failure plausibly affects the GM WidgetPanel media widget and the GM
+ * Cluster media panel (they appear to consume MediaSession through the same
+ * plumbing), but that has not been independently confirmed.
  *
- * Symptom: force-stopping the app and relaunching (with the data source — phone,
- *   streaming service, etc. — still producing content) leaves CarLauncher's homescreen
- *   Media card showing only the app name with no metadata/artwork. The new session
- *   token is ACTIVE, CarMediaService dumpsys reports `current playback media component:
- *   <package>` and `media playback state: 3` (PLAYING), but the card stays blank.
+ * Symptom (as observed): force-stopping the app and relaunching (with the data
+ *   source — phone, streaming service, etc. — still producing content) left
+ *   CarLauncher's homescreen Media card showing only the app name with no
+ *   metadata/artwork. The new session token was ACTIVE; CarMediaService dumpsys
+ *   reported `current playback media component: <package>` and `media playback
+ *   state: 3` (PLAYING); the card stayed blank.
  *
- * Root cause is NOT fixable from app code:
- *   - CarLauncher's PlaybackViewModel binds a MediaController reference to the original
- *     session token. When force-stop tears down the session, `onSessionDestroyed` nulls
- *     the controller, but no code path re-binds to the freshly minted session (same
- *     package, new session token) on the next inactive→active transition.
- *   - CarMediaService additionally persists "last playback primary = zeno.carlink" to
- *     SharedPreferences at `/data/user/0/com.android.car/`; on boot the service replays
- *     that selection to CarLauncher, which then rebinds to its cached-but-stale
- *     controller reference.
+ * Apparent root cause (per AOSP source read on 2026-05-03; line numbers and class
+ * paths may drift in newer branches — grep symbol names rather than line numbers
+ * when re-verifying):
+ *   - The relevant ViewModel observed in the read was
+ *     `com.android.car.media.common.playback.PlaybackViewModel` in the
+ *     `car-media-common` library (CarLauncher itself appeared to consume it via
+ *     `com.android.car.carlauncher.homescreen.audio.MediaViewModel`). On the read
+ *     date PlaybackViewModel binds a `MediaControllerCompat` to the original
+ *     session token (around PlaybackViewModel.java:156) and on `onSessionDestroyed`
+ *     nulls the controller (around line 303-308) with an in-tree TODO at line 306
+ *     ("consider keeping track of orphaned callbacks in case they are resurrected"),
+ *     which appears to acknowledge an unhandled gap.
+ *   - The controller did not appear to be replaced on the same-package
+ *     inactive→active transition because three layered equality guards short-
+ *     circuited the rebind path on the AOSP read: `CarMediaService.setPrimaryMediaSource`
+ *     early-returned when the new ComponentName equaled the current one (around
+ *     line 1311); upstream `MediaSourceViewModel.updateModelState` early-returned
+ *     on `MediaSource.equals` (which appeared to compare on ComponentName only);
+ *     and `PlaybackViewModel.onMediaBrowsingStateChanged` itself early-returned on
+ *     equal BrowsingState. Within those observations, a freshly minted MediaSession
+ *     token for the same package never caused `onMediaBrowsingStateChanged` to
+ *     re-fire, and the nulled controller stayed nulled.
+ *   - CarMediaService also appeared to persist "last playback primary" to a
+ *     SharedPreferences file named `com.android.car.media.car_media_service`
+ *     (CarMediaService.java around lines 118-121, 535 in the read). The on-disk
+ *     path was not confirmed by this audit; an earlier comment here pointed at
+ *     `/data/user/0/com.android.car/` which we are flagging as unverified.
+ *     On boot, `initUser` (around line 450) appeared to read that preference and
+ *     re-assert the selection via `notifyListeners` (around line 487), but the
+ *     same equality guards above appeared to prevent any actual rebind — so the
+ *     symptom observed was a CarLauncher card with no controller bound, not a
+ *     card bound to a stale token. (An earlier wording in this KDoc described it
+ *     as the latter; corrected here to match the AOSP source as read.)
  *
  * Workarounds tried (all failed):
  *   - Two-step source switch (select another source, switch back).
@@ -174,23 +222,34 @@ private val URI_GRANT_CONSUMERS = listOf(
  *   - Emulator restart.
  *   - Force-stop + relaunch with fresh session token.
  *
- * Only fix: full package **uninstall + reinstall + emulator restart**. `adb install -r`
- * (replace) does NOT clear the cached state; the install must remove the package so
- * CarMediaService's SharedPreferences purge the stored primary-source reference.
+ * Only workaround that succeeded in our 2026-05-03 testing: full package uninstall +
+ * reinstall + emulator restart. `adb install -r` (replace) did not clear the cached
+ * state in the runs observed; the install needed to remove the package to (apparently)
+ * cause CarMediaService's SharedPreferences to purge the stored primary-source
+ * reference. This is a behavioral observation, not a documented contract — different
+ * AOSP/firmware revisions may behave differently, and a future Media3 or AAOS update
+ * could make a less-invasive workaround viable.
  *
  * Implication: the [setProjectionActive]/[setInactive] toggle below is architecturally
  * correct (session should not squat as playback-primary when the adapter is idle) but
- * does not and cannot resolve the stale-card bug — that requires a patch to
- * CarLauncher's PlaybackViewModel inside AAOS itself.
+ * did not appear to resolve the stale-card behavior in our 2026-05-03 testing —
+ * resolution likely requires a fix in `car-media-common` PlaybackViewModel (e.g.
+ * handling orphaned-controller resurrection per the in-tree TODO observed at
+ * PlaybackViewModel.java:306, or loosening the ComponentName-only equality in the
+ * observed `MediaSource.equals` so same-package new-token transitions notify
+ * listeners). This depends on AOSP behavior that may be addressed in newer releases;
+ * re-test after AOSP updates before assuming the workaround is still necessary.
  *
- * BACKWARDS COMPATIBILITY WITH GM AAOS OBSERVERS
- * Media3 [MediaSession] internally registers a platform-level
+ * OBSERVED BACKWARDS COMPATIBILITY WITH GM AAOS OBSERVERS (as of 2026-05-03)
+ * Media3 [MediaSession] appears to register a platform-level
  * `android.media.session.MediaSession` for legacy observers. Decompiled
- * GMCarMediaService (c0/g.java:105 MediaSessionCompat.Token.a(..getSessionToken()),
- * :176 getSystemService("media_session"), :241 android.media.session.MediaController
- * .registerCallback) confirms GM binds via MediaBrowserCompat/MediaControllerCompat
- * shims over platform APIs — never touches androidx directly. Media3 migration is
- * transparent to the ClusterService → IClusterHmi widget pipeline.
+ * GMCarMediaService on the firmware tested (c0/g.java:105
+ * MediaSessionCompat.Token.a(..getSessionToken()), :176
+ * getSystemService("media_session"), :241 android.media.session.MediaController
+ * .registerCallback) appeared to bind via MediaBrowserCompat/MediaControllerCompat
+ * shims over platform APIs — we did not see direct androidx usage. On that basis the
+ * Media3 migration appears transparent to the ClusterService → IClusterHmi widget
+ * pipeline on the build tested. Re-verify on different GM firmware revisions.
  */
 class MediaSessionManager(
     private val context: Context,
@@ -231,6 +290,15 @@ class MediaSessionManager(
     private var lastPushedPositionMs: Long = 0L
     private var lastPushedTimeNanos: Long = 0L
 
+    // Tracks the duration last pushed to UsbAdapterPlayer.durationMs. Without this,
+    // the dedup gate below suppresses every updatePlaybackState after the first
+    // state-change push, so a duration that arrived AFTER that first push (e.g.,
+    // first MEDIA_DATA tick lacked MediaSongDuration) never reaches the player.
+    // Empirical bug observed 2026-05-02 on Silverado gminfo37: [SNAPSHOT] reported
+    // dur=TIME_UNSET while [MEDIA_DATA] had dur=208341ms for ~3 minutes until the
+    // next track change forced a push.
+    private var lastPushedDurationMs: Long = 0L
+
     /** Position must drift more than this from the AAOS-extrapolated value to be
      *  considered a genuine user seek. 2 s absorbs USB/cluster jitter without suppressing
      *  seeks. Validated 2026-04-20 POTATO session 154850 — all surviving seek events were
@@ -252,6 +320,48 @@ class MediaSessionManager(
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
     private val mainHandler = Handler(Looper.getMainLooper())
     private val sessionLock = Any()
+
+    // Periodic state-snapshot diagnostic. Active only on debug builds (see [initialize]);
+    // emits one [SNAPSHOT] line every [SNAPSHOT_INTERVAL_MS] showing player + controller
+    // state so a logcat capture can correlate USB events against published session state
+    // without needing `dumpsys media_session` interleaved.
+    private var snapshotJob: Job? = null
+
+    /**
+     * Diagnostic [Player.Listener] attached to [UsbAdapterPlayer] in [initialize]. Mirrors
+     * the deltas Media3 derives from the player's [State] (transitions, play-when-ready,
+     * is-playing, errors) so a debug-build logcat capture shows what controllers actually
+     * observe — without this we only see what we POSTED, not what Media3 PUBLISHED.
+     *
+     * Callbacks run on the application looper per [Player] contract; gated on
+     * [BuildConfig.DEBUG] to keep release builds zero-cost.
+     */
+    private val playerListener = object : Player.Listener {
+        override fun onPlaybackStateChanged(playbackState: Int) {
+            if (BuildConfig.DEBUG) log("[MEDIA_SESSION] [LISTENER] onPlaybackStateChanged $playbackState")
+        }
+        override fun onIsPlayingChanged(isPlaying: Boolean) {
+            if (BuildConfig.DEBUG) log("[MEDIA_SESSION] [LISTENER] onIsPlayingChanged $isPlaying")
+        }
+        override fun onPlayWhenReadyChanged(playWhenReady: Boolean, reason: Int) {
+            if (BuildConfig.DEBUG) log("[MEDIA_SESSION] [LISTENER] onPlayWhenReadyChanged $playWhenReady reason=$reason")
+        }
+        override fun onMediaItemTransition(mediaItem: MediaItem?, reason: Int) {
+            if (BuildConfig.DEBUG) log("[MEDIA_SESSION] [LISTENER] onMediaItemTransition id=${mediaItem?.mediaId} reason=$reason")
+        }
+        override fun onMediaMetadataChanged(metadata: MediaMetadata) {
+            if (BuildConfig.DEBUG) {
+                log(
+                    "[MEDIA_SESSION] [LISTENER] onMediaMetadataChanged title=${metadata.title} " +
+                        "artist=${metadata.artist} album=${metadata.albumTitle} " +
+                        "artBytes=${metadata.artworkData?.size ?: 0} artUri=${metadata.artworkUri}",
+                )
+            }
+        }
+        override fun onPlayerError(error: PlaybackException) {
+            log("[MEDIA_SESSION] [LISTENER] onPlayerError ${error.errorCodeName}: ${error.message}")
+        }
+    }
 
     /**
      * [MediaLibrarySession.Callback] for AAOS Media Center browse-tree queries. carlink_native
@@ -276,12 +386,31 @@ class MediaSessionManager(
                         "paramsExtras=${params?.extras}",
                 )
             }
-            // Root extras replicate the legacy AAOS content-style hints so the media
-            // source switcher lists Carlink with the expected card presentation even
-            // though the browse tree below is empty.
+            // Root extras carry the AAOS content-style hints so the media source switcher
+            // lists Carlink with the expected card presentation even though the browse tree
+            // below is empty. The two EXTRAS_KEY_CONTENT_STYLE_* values are the Media3 1.10.0
+            // constants (verified from media3-session-1.10.0-sources.jar) and resolve to the
+            // legacy "android.media.browse.CONTENT_STYLE_*_HINT" extras consumed by AAOS
+            // Media Center / GMCarMediaService via the MediaBrowserCompat bridge.
+            //
+            // SEARCH_SUPPORTED has no Media3 constant in 1.10.0 (confirmed absent from
+            // androidx.media3.session.MediaConstants); the legacy string is kept to
+            // declare to MediaBrowserCompat consumers that this projection app does NOT
+            // support search (CarPlay/AA owns search on the phone).
             val rootExtras = Bundle().apply {
-                putInt("android.media.browse.CONTENT_STYLE_BROWSABLE_HINT", 1)
-                putInt("android.media.browse.CONTENT_STYLE_PLAYABLE_HINT", 1)
+                // Per Media3 1.10.0 source observed on 2026-05-03 (around
+                // MediaConstants.java:301), EXTRAS_VALUE_CONTENT_STYLE_LIST_ITEM resolved
+                // to the legacy DESCRIPTION_EXTRAS_VALUE_CONTENT_STYLE_LIST_ITEM (value 1).
+                // Using the named constant avoids a magic-number literal and tracks any
+                // future value change. Re-verify the resolved value on Media3 upgrades.
+                putInt(
+                    MediaConstants.EXTRAS_KEY_CONTENT_STYLE_BROWSABLE,
+                    MediaConstants.EXTRAS_VALUE_CONTENT_STYLE_LIST_ITEM,
+                )
+                putInt(
+                    MediaConstants.EXTRAS_KEY_CONTENT_STYLE_PLAYABLE,
+                    MediaConstants.EXTRAS_VALUE_CONTENT_STYLE_LIST_ITEM,
+                )
                 putBoolean("android.media.browse.SEARCH_SUPPORTED", false)
             }
             val rootItem = MediaItem.Builder()
@@ -311,11 +440,37 @@ class MediaSessionManager(
                 Log.d(
                     TAG,
                     "[MEDIA_SESSION] [PROBE] onGetChildren caller=${browser.packageName} uid=${browser.uid} " +
-                        "ifaceVer=${browser.interfaceVersion} parentId=$parentId page=$page pageSize=$pageSize " +
-                        "(empty tree)",
+                        "ifaceVer=${browser.interfaceVersion} parentId=$parentId page=$page pageSize=$pageSize",
                 )
             }
-            return Futures.immediateFuture(LibraryResult.ofItemList(ImmutableList.of(), params))
+            // DOC DEVIATION: the Media3 onGetChildren spec (as read on 2026-05-03) said
+            // "Return an empty list for no children rather than using error codes." We
+            // deliberately diverge based on field observations. On the firmware tested as
+            // of 2026-05-03 (AAOS Media Center, Android Auto media list, Bluetooth AVRCP
+            // browse), an empty result list with RESULT_SUCCESS appeared to be treated as
+            // "still loading" rather than "no content," with a spinner held indefinitely
+            // on the consumer side. Returning a single non-browsable, non-playable INFO
+            // item gave the user a visible explanation in our testing; in the rendering
+            // observed both LIST_ITEM and SINGLE_ITEM styles produced one row, and
+            // isPlayable=false suppressed phantom playback requests. If a later AAOS host
+            // changes the empty-list behavior, prefer
+            // `LibraryResult.ofItemList(ImmutableList.of(), params)` to align with the
+            // documented preference. Re-test before relying on either branch on a new
+            // host build.
+            val infoItem = MediaItem.Builder()
+                .setMediaId(BROWSE_INFO_ITEM_ID)
+                .setMediaMetadata(
+                    MediaMetadata.Builder()
+                        .setTitle("Browsing not available")
+                        .setSubtitle("Carlink mirrors phone projection — open the app to start CarPlay/Android Auto")
+                        .setIsBrowsable(false)
+                        .setIsPlayable(false)
+                        .build(),
+                )
+                .build()
+            return Futures.immediateFuture(
+                LibraryResult.ofItemList(ImmutableList.of(infoItem), params),
+            )
         }
 
         override fun onGetItem(
@@ -349,6 +504,20 @@ class MediaSessionManager(
                     .build()
                 return Futures.immediateFuture(LibraryResult.ofItem(rootItem, null))
             }
+            if (mediaId == BROWSE_INFO_ITEM_ID) {
+                val infoItem = MediaItem.Builder()
+                    .setMediaId(BROWSE_INFO_ITEM_ID)
+                    .setMediaMetadata(
+                        MediaMetadata.Builder()
+                            .setTitle("Browsing not available")
+                            .setSubtitle("Carlink mirrors phone projection — open the app to start CarPlay/Android Auto")
+                            .setIsBrowsable(false)
+                            .setIsPlayable(false)
+                            .build(),
+                    )
+                    .build()
+                return Futures.immediateFuture(LibraryResult.ofItem(infoItem, null))
+            }
             return Futures.immediateFuture(LibraryResult.ofError(SessionError.ERROR_BAD_VALUE))
         }
 
@@ -373,15 +542,53 @@ class MediaSessionManager(
             session: MediaSession,
             controller: MediaSession.ControllerInfo,
         ): MediaSession.ConnectionResult {
+            val packageName = controller.packageName
+            val uid = controller.uid
+            // Media3's documented trust check (per background-playback docs). Per
+            // `ControllerInfo.isTrusted()` javadoc as observed in Media3 1.10.0 source on
+            // 2026-05-03 (around MediaSession.java:687-688), the predicate covers: own UID,
+            // SYSTEM_UID, MEDIA_CONTENT_CONTROL, STATUS_BAR_SERVICE, and enabled
+            // notification listeners. That superset includes SystemUI media controls and
+            // notification-listener brokers our prior hand-rolled gate would have rejected.
+            // The exact predicate set may evolve across Media3 releases; re-verify on
+            // upgrade. Line numbers are point-in-time — grep the symbol if they drift.
+            val isTrusted = controller.isTrusted
+
+            // Always log GM/AAOS observer connections at INFO so field logcats from real
+            // hardware reveal which brokers actually bind. Helpful for diagnosing
+            // "carlink doesn't appear in source X" reports — the observer either binds
+            // (visible here) or doesn't (and the explanation is firmware-side, e.g.
+            // GMAudioServer.MediaSessionUtils.SOURCES_PACKAGE allowlist).
+            val isGmAaosObserver = packageName.startsWith("com.gm.") ||
+                packageName.startsWith("com.android.car.") ||
+                packageName == "com.android.systemui"
+            if (isGmAaosObserver) {
+                Log.i(
+                    TAG,
+                    "[MEDIA_SESSION] GM/AAOS observer bound: package=$packageName uid=$uid " +
+                        "trusted=$isTrusted ifaceVer=${controller.interfaceVersion}",
+                )
+            }
+
             if (BuildConfig.DEBUG) {
                 Log.d(
                     TAG,
-                    "[MEDIA_SESSION] [PROBE] onConnect caller=${controller.packageName} uid=${controller.uid} " +
+                    "[MEDIA_SESSION] [PROBE] onConnect caller=$packageName uid=$uid trusted=$isTrusted " +
                         "ifaceVer=${controller.interfaceVersion} ctrlVer=${controller.controllerVersion} " +
                         "connectionHints=${controller.connectionHints}",
                 )
             }
-            return super.onConnect(session, controller)
+
+            return if (isTrusted) {
+                super.onConnect(session, controller)
+            } else {
+                Log.w(
+                    TAG,
+                    "[MEDIA_SESSION] Rejecting untrusted controller package=$packageName uid=$uid " +
+                        "(no MEDIA_CONTENT_CONTROL permission and not system/own UID)",
+                )
+                MediaSession.ConnectionResult.reject()
+            }
         }
 
         override fun onDisconnected(
@@ -398,6 +605,56 @@ class MediaSessionManager(
             super.onDisconnected(session, controller)
         }
 
+        /**
+         * Defensive sink for "play from media id" requests routed through Media3's
+         * legacy bridge. On Silverado AAOS 12 the cluster's steering-wheel favorite
+         * button (keycodes 137/138) reaches `GMMediaKeyService` which may dispatch
+         * `transportControls.playFromMediaId(...)` — but only when the active source
+         * is classified as `DAB|AM|FM|XM` (verified in
+         * GMAudioServer.GMMediaKeyService.handleSWCKeys). Carlink registers as a
+         * projection bridge, not a radio source, so the call is unlikely to land
+         * here. If it ever does (misclassification), Media3 routes it to this
+         * callback. We log and reject — returning an empty list short-circuits the
+         * Media3 player and avoids modifying our mirror playlist.
+         */
+        override fun onAddMediaItems(
+            mediaSession: MediaSession,
+            controller: MediaSession.ControllerInfo,
+            mediaItems: MutableList<MediaItem>,
+        ): ListenableFuture<MutableList<MediaItem>> {
+            if (mediaItems.isNotEmpty()) {
+                val ids = mediaItems.take(3).map { it.mediaId }
+                Log.w(
+                    TAG,
+                    "[MEDIA_SESSION] onAddMediaItems from ${controller.packageName} uid=${controller.uid} " +
+                        "ifaceVer=${controller.interfaceVersion} count=${mediaItems.size} firstIds=$ids — " +
+                        "carlink is a projection mirror with no library; rejecting",
+                )
+            }
+            return Futures.immediateFuture(mutableListOf())
+        }
+
+        /**
+         * Subscription handler — logging-only override; behavior is delegated to the default
+         * implementation.
+         *
+         * Per the Media3 docs read on 2026-05-03, the default `super.onSubscribe` calls
+         * [onGetItem] for [parentId] and accepts the subscription only if [onGetItem]
+         * returns `RESULT_SUCCESS` with an `isBrowsable=true` item. Mapping for our
+         * [parentId]s under that observed behavior:
+         *   - [ROOT_ID]              → [onGetItem] returns isBrowsable=true → subscription
+         *                              accepted, [notifyChildrenChanged] becomes deliverable.
+         *   - [BROWSE_INFO_ITEM_ID]  → [onGetItem] returns isBrowsable=false → subscription
+         *                              rejected. This is intentional under the current
+         *                              design: the info-item is a terminal display row,
+         *                              not a browsable parent, so a rejection there is the
+         *                              behavior we want.
+         *   - any other id           → [onGetItem] returns ERROR_BAD_VALUE → subscription
+         *                              rejected.
+         * If a future Media3 release changes the default behavior of `onSubscribe`, this
+         * mapping needs to be re-verified — the override only logs, so any default change
+         * propagates here automatically.
+         */
         override fun onSubscribe(
             session: MediaLibrarySession,
             browser: MediaSession.ControllerInfo,
@@ -482,19 +739,38 @@ class MediaSessionManager(
                 .build()
             currentInstance = this
 
-            // Session starts INACTIVE. UsbAdapterPlayer's default isSessionActive=false
-            // produces an empty playlist + STATE_IDLE from getState() — platform
-            // MediaSession.isActive is false until CarlinkManager's state machine hits
-            // DEVICE_CONNECTED (phone PLUGGED on adapter) and calls [setProjectionActive].
+            if (BuildConfig.DEBUG) {
+                p.addListener(playerListener)
+                startStateSnapshotLogging()
+            }
+
+            // EXPLICITLY push placeholder metadata to the legacy MediaSessionCompat
+            // before signalling the latch. Without this, Media3 only propagates the
+            // Player's initial state to the legacy bridge LAZILY on the first state
+            // mutation. If a legacy MediaController consumer (the GMRHMIService cluster
+            // on Silv + CT5) calls getMetadata() between session-build and the first
+            // mutation, it reads null. The Silv cluster's processMetadata smali at
+            // /tmp/silv_rhmi_smali/com/gm/rhmi/audio/service/AudioClusterPresentationService.smali:10820
+            // (:cond_4b3) silently logs "un handled response" and returns when it sees
+            // a null MediaMetadata — leaving the cluster card blank with no recovery.
             //
-            // This replaces the earlier "always-active with 'Not connected' placeholder"
-            // design. The old design permanently occupied AAOS's playback-primary slot,
-            // blocking other media apps from promoting and blocking CarLauncher's
-            // PlaybackViewModel from re-evaluating its MediaController after session-token
-            // changes (e.g., post-force-stop-relaunch). Starting inactive lets AAOS
-            // properly observe a later inactive→active transition as a bona-fide
-            // primary-source-eligible event.
-            log("[MEDIA_SESSION] Initialized INACTIVE (Media3 session id=$SESSION_ID)")
+            // setSessionActive(false) is already the player's initial state, so this
+            // call is a no-op for active state. The updateMediaMetadata + updatePlaybackState
+            // calls force Media3 to push the placeholder to the legacy compat session
+            // synchronously. Verified 2026-05-03 against Media3 1.10.0 source — see
+            // /tmp/media3_session_src/androidx/media3/session/MediaSessionImpl.java
+            // and MediaSessionLegacyStub.java.
+            p.updatePlaybackState(Player.STATE_READY, false, 0L, C.TIME_UNSET)
+            p.updateMediaMetadata(buildPlaceholderMetadata("Not connected"))
+
+            // Session starts in the INACTIVE gate (placeholder metadata path). The
+            // Player's getState() returns a single non-empty MediaItem at STATE_READY +
+            // playWhenReady=false, so platform MediaSession.isActive=true throughout
+            // the lifecycle — AAOS observers see Carlink as a present, ready-but-paused
+            // source from the moment the service is bound, including during GM's ~88s
+            // lazy bind window. [setProjectionActive] flips the gate to live metadata
+            // when DEVICE_CONNECTED fires; [setInactive] flips back to placeholder.
+            log("[MEDIA_SESSION] Initialized (placeholder pushed, Media3 session id=$SESSION_ID)")
         } catch (e: Exception) {
             // Log then rethrow so CarlinkManager's outer try/catch observes the failure.
             // Swallowing here would leave `mediaSessionManager` assigned to an instance with
@@ -515,6 +791,7 @@ class MediaSessionManager(
         try {
             // Cancel scope outside the lock: non-blocking, and any in-flight
             // mainHandler.post will observe mediaSession == null under the lock.
+            snapshotJob = null
             scope.cancel()
             synchronized(sessionLock) {
                 lastArtJob = null
@@ -526,6 +803,7 @@ class MediaSessionManager(
                 // sample `onDestroy`), the Player is NOT released by MediaSession.release();
                 // the app must release it explicitly. Release player BEFORE the session so
                 // the session's controller teardown sees a still-valid Player reference.
+                player?.removeListener(playerListener)
                 player?.release()
                 mediaSession?.release()
                 mediaSession = null
@@ -541,6 +819,7 @@ class MediaSessionManager(
                 lastPushedPlaying = null
                 lastPushedPositionMs = 0L
                 lastPushedTimeNanos = 0L
+                lastPushedDurationMs = 0L
             }
             log("[MEDIA_SESSION] Released")
         } catch (e: Exception) {
@@ -689,6 +968,17 @@ class MediaSessionManager(
             try {
                 val builder = MediaMetadata.Builder()
                     .setTitle(title ?: "Unknown")
+                    // We set BOTH setTitle and setDisplayTitle because, per Media3
+                    // 1.10.0 source observed on 2026-05-03, the
+                    // LegacyConversions.convertToMediaMetadataCompat path appeared to
+                    // populate METADATA_KEY_TITLE only from `title` and
+                    // METADATA_KEY_DISPLAY_TITLE only from `displayTitle` — i.e. the two
+                    // fields appeared independent, not auto-cross-populated. Some
+                    // GM/AAOS observers in the firmware tested preferred DISPLAY_TITLE,
+                    // so setting both was the safe choice. Re-verify if Media3's
+                    // conversion logic changes on upgrade. (Line numbers omitted —
+                    // they drift across releases; grep the function name if needed.)
+                    .setDisplayTitle(title ?: "Unknown")
                     .setArtist(artist ?: "Unknown")
                     .setAlbumTitle(album ?: "")
                     .setSubtitle(appName ?: "Carlink")
@@ -713,13 +1003,19 @@ class MediaSessionManager(
     }
 
     private fun grantUriToConsumers(uri: Uri) {
+        var granted = 0
+        var skipped = 0
         for (pkg in URI_GRANT_CONSUMERS) {
             try {
                 context.grantUriPermission(pkg, uri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
-            } catch (_: Exception) {
-                // Package not installed on this build; ignore.
+                granted++
+                if (BuildConfig.DEBUG) Log.d(TAG, "[MEDIA_SESSION] grantUriPermission OK pkg=$pkg uri=$uri")
+            } catch (e: Exception) {
+                skipped++
+                if (BuildConfig.DEBUG) Log.d(TAG, "[MEDIA_SESSION] grantUriPermission skipped pkg=$pkg: ${e.message}")
             }
         }
+        if (BuildConfig.DEBUG) Log.d(TAG, "[MEDIA_SESSION] grantUriToConsumers: granted=$granted skipped=$skipped uri=$uri")
     }
 
     /**
@@ -734,13 +1030,16 @@ class MediaSessionManager(
      * via clipboard / activity launches and is documented as "potentially dangerous".
      */
     private fun revokeUriFromConsumers(uri: Uri) {
+        var revoked = 0
         for (pkg in URI_GRANT_CONSUMERS) {
             try {
                 context.revokeUriPermission(pkg, uri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                revoked++
             } catch (_: Exception) {
                 // Grant already gone / package uninstalled; ignore.
             }
         }
+        if (BuildConfig.DEBUG) Log.d(TAG, "[MEDIA_SESSION] revokeUriFromConsumers: revoked=$revoked uri=$uri")
     }
 
     /**
@@ -760,7 +1059,13 @@ class MediaSessionManager(
                 lastPushedPositionMs
             }
             val seekDetected = kotlin.math.abs(position - expectedPosition) > seekThresholdMs
-            if (!stateChanged && !seekDetected) return
+            // durationStale forces a push when currentDurationMs has been updated by a later
+            // updateMetadata call but neither stateChanged nor seekDetected fires. Without
+            // this, the player's durationMs stays at its first-push value (often C.TIME_UNSET
+            // when the first MEDIA_DATA tick lacked MediaSongDuration) until the next track
+            // change incidentally re-pushes via seekDetected.
+            val durationStale = currentDurationMs > 0 && currentDurationMs != lastPushedDurationMs
+            if (!stateChanged && !seekDetected && !durationStale) return
 
             try {
                 val durationMs = if (currentDurationMs > 0) currentDurationMs else C.TIME_UNSET
@@ -768,10 +1073,15 @@ class MediaSessionManager(
                 lastPushedPlaying = playing
                 lastPushedPositionMs = position
                 lastPushedTimeNanos = now
-                val reason = if (stateChanged) "state change" else "seek"
+                lastPushedDurationMs = if (durationMs == C.TIME_UNSET) 0L else durationMs
+                val reason = when {
+                    stateChanged -> "state change"
+                    seekDetected -> "seek"
+                    else -> "duration refresh"
+                }
                 log(
                     "[MEDIA_SESSION] Playback: ${if (playing) "PLAYING" else "PAUSED"} " +
-                        "($reason, pos=${position}ms)",
+                        "($reason, pos=${position}ms, dur=${durationMs}ms)",
                 )
             } catch (e: Exception) {
                 log("[MEDIA_SESSION] Failed to update playback state: ${e.message}")
@@ -804,26 +1114,91 @@ class MediaSessionManager(
      * session token.
      */
     fun setProjectionActive() {
+        setProjectionActive(connectingPhase = true)
+    }
+
+    /**
+     * Variant of [setProjectionActive] that publishes phase-specific placeholder text.
+     * Distinguishes the CONNECTING phase ("Connecting to phone...") from the
+     * DEVICE_CONNECTED phase ("Waiting for media...") so all consumer surfaces
+     * (cardview, CarMediaApp, cluster) display meaningful state across the adapter
+     * lifecycle, not just generic "Connecting...".
+     *
+     * @param connectingPhase  true for CarlinkManager.State.CONNECTING (USB handshake
+     *                         in progress); false for CarlinkManager.State.DEVICE_CONNECTED
+     *                         (handshake complete, awaiting first MEDIA_DATA frame).
+     */
+    fun setProjectionActive(connectingPhase: Boolean) {
         synchronized(sessionLock) {
             val p = player ?: return
             try {
                 // Flip active FIRST so getState() returns a non-empty playlist before
                 // the playback-state and metadata updates hit invalidateState.
                 p.setSessionActive(true)
-                p.updatePlaybackState(Player.STATE_BUFFERING, false, 0L, C.TIME_UNSET)
-                p.updateMediaMetadata(
-                    MediaMetadata.Builder()
-                        .setTitle("Carlink")
-                        .setArtist("Connecting...")
-                        .build(),
-                )
+                // playWhenReady=true with STATE_BUFFERING signals "preparing to play
+                // imminently" to AOSP CarMediaService.MediaControllerCallback. Combined
+                // with the CONNECTING-time call site (CarlinkManager.updateMediaSessionState),
+                // this matches v113's USB-attach arbitration weight and triggers
+                // CarMediaService's "Changing media source due to playback state change"
+                // promotion path before any other source can claim primary playback.
+                p.updatePlaybackState(Player.STATE_BUFFERING, true, 0L, C.TIME_UNSET)
+                val artist = if (connectingPhase) "Connecting to phone..." else "Waiting for media..."
+                p.updateMediaMetadata(buildPlaceholderMetadata(artist))
                 // Reset dedup so the next real playback frame isn't elided.
                 lastPushedPlaying = null
                 lastPushedPositionMs = 0L
                 lastPushedTimeNanos = 0L
-                log("[MEDIA_SESSION] State: ACTIVE (projection starting)")
+                lastPushedDurationMs = 0L
+                log("[MEDIA_SESSION] State: ACTIVE ($artist, playWhenReady=true)")
             } catch (e: Exception) {
                 log("[MEDIA_SESSION] Failed to set projection-active state: ${e.message}")
+            }
+        }
+    }
+
+    /**
+     * Build a state-aware placeholder MediaMetadata. All AAOS consumer surfaces
+     * (CarMediaApp, cardview audio card, cluster) read TITLE / DISPLAY_TITLE /
+     * ARTIST / DISPLAY_SUBTITLE — the same set across surfaces. Setting the full
+     * set at construction means surfaces with different fallback chains all
+     * render identical text. The `artist` parameter conveys adapter link state
+     * across the lifecycle: "Adapter not detected", "Connecting to phone...",
+     * "Waiting for media...", or any other phase string the caller chooses.
+     *
+     * Why this matters for the cluster blank-card bug: the silv cluster's
+     * processMetadata smali at AudioClusterPresentationService.smali:10820
+     * (:cond_4b3) silently logs and returns when MediaMetadata is null. The
+     * carlink session must therefore ALWAYS expose non-null metadata —
+     * including the moments before the first real MEDIA_DATA frame arrives.
+     */
+    private fun buildPlaceholderMetadata(artist: String): MediaMetadata =
+        MediaMetadata.Builder()
+            .setTitle("Carlink")
+            .setDisplayTitle("Carlink")
+            .setArtist(artist)
+            .setSubtitle(artist)
+            .build()
+
+    /**
+     * Refresh the placeholder MediaMetadata's artist/subtitle line without touching
+     * PlaybackState or session-active flags. Used by [CarlinkManager.setStatusText]
+     * to mirror the main-UI status string into the MediaSession so cluster, cardview,
+     * and CarMediaApp surfaces show the same user-facing state text the user sees
+     * in the app's main UI as the adapter transitions through its lifecycle
+     * (Searching for adapter, Initializing, Waiting for phone, Phone connected,
+     * Reconnecting, etc.).
+     *
+     * Caller is expected to gate on `state != STREAMING` — once real CarPlay/AA
+     * track metadata is flowing via [publishMetadata], status text would clobber it.
+     * No-op if the player isn't constructed yet.
+     */
+    fun updatePlaceholderArtist(text: String) {
+        synchronized(sessionLock) {
+            val p = player ?: return
+            try {
+                p.updateMediaMetadata(buildPlaceholderMetadata(text))
+            } catch (e: Exception) {
+                log("[MEDIA_SESSION] Failed to update placeholder artist: ${e.message}")
             }
         }
     }
@@ -851,9 +1226,15 @@ class MediaSessionManager(
         synchronized(sessionLock) {
             val p = player ?: return
             try {
+                // Flip the gate first; the Player's inactive branch will substitute
+                // PLACEHOLDER_METADATA + STATE_READY in getState() regardless of what
+                // we cache below. The explicit updates below ensure listeners observe
+                // a clean transition (onPlaybackStateChanged + onMediaMetadataChanged
+                // fire to placeholder values rather than carrying stale active-session
+                // metadata into the next active phase).
                 p.setSessionActive(false)
-                p.updatePlaybackState(Player.STATE_IDLE, false, 0L, C.TIME_UNSET)
-                p.updateMediaMetadata(MediaMetadata.EMPTY)
+                p.updatePlaybackState(Player.STATE_READY, false, 0L, C.TIME_UNSET)
+                p.updateMediaMetadata(buildPlaceholderMetadata("Not connected"))
                 // Reset dedup + art state. Revoke any still-published URI grant so
                 // consumers don't retain access to album art from an ended session.
                 lastArtUri?.let { revokeUriFromConsumers(it) }
@@ -866,7 +1247,8 @@ class MediaSessionManager(
                 lastPushedPlaying = null
                 lastPushedPositionMs = 0L
                 lastPushedTimeNanos = 0L
-                log("[MEDIA_SESSION] State: INACTIVE (no projection)")
+                lastPushedDurationMs = 0L
+                log("[MEDIA_SESSION] State: INACTIVE (placeholder, ready-paused)")
             } catch (e: Exception) {
                 log("[MEDIA_SESSION] Failed to set inactive state: ${e.message}")
             }
@@ -878,12 +1260,55 @@ class MediaSessionManager(
         logCallback.log(message)
     }
 
+    /**
+     * Launch a coroutine that emits one [SNAPSHOT] line every [SNAPSHOT_INTERVAL_MS] until
+     * [release] cancels [scope]. Reads player state on the application looper (per
+     * [SimpleBasePlayer] contract) via [Dispatchers.Main.immediate]. Debug-only — gated
+     * at the call site in [initialize].
+     */
+    private fun startStateSnapshotLogging() {
+        snapshotJob?.cancel()
+        snapshotJob = scope.launch {
+            while (isActive) {
+                delay(SNAPSHOT_INTERVAL_MS)
+                withContext(Dispatchers.Main.immediate) {
+                    val p: UsbAdapterPlayer
+                    val ms: MediaLibrarySession
+                    synchronized(sessionLock) {
+                        p = player ?: return@withContext
+                        ms = mediaSession ?: return@withContext
+                    }
+                    val controllers = try {
+                        ms.connectedControllers.size
+                    } catch (e: Exception) {
+                        -1
+                    }
+                    val md = p.mediaMetadata
+                    log(
+                        "[MEDIA_SESSION] [SNAPSHOT] state=${p.playbackState} " +
+                            "playing=${p.isPlaying} pwr=${p.playWhenReady} " +
+                            "pos=${p.contentPosition}ms dur=${p.duration}ms " +
+                            "title=${md.title} artist=${md.artist} ctrls=$controllers",
+                    )
+                }
+            }
+        }
+    }
+
     companion object {
         /** Session ID — must be unique within the app package. */
         private const val SESSION_ID = "CarlinkMediaSession"
 
+        /** Periodic state snapshot interval. 10s balances signal vs. log noise. */
+        private const val SNAPSHOT_INTERVAL_MS = 10_000L
+
         /** Root mediaId for the (empty) browse tree — projection app. */
         private const val ROOT_ID = "carlink_root"
+
+        /** Single info-only child returned by [onGetChildren] so the OS native media
+         *  browser shows an explanatory line instead of an indefinite "Loading" spinner.
+         *  isBrowsable=false, isPlayable=false — purely informational. */
+        private const val BROWSE_INFO_ITEM_ID = "carlink_browse_info"
 
         /**
          * Single live [MediaSessionManager] instance. Set by [initialize]; cleared by
@@ -904,26 +1329,44 @@ class MediaSessionManager(
         @Volatile
         private var currentInstance: MediaSessionManager? = null
 
+        private val instanceLock = Any()
+
         /**
-         * Return the currently-live [MediaLibrarySession], or `null` if no manager has
-         * been initialized (pre-plugin-attach or post-release).
+         * Get-or-create the process-wide [MediaSessionManager] singleton. Called from
+         * [CarlinkMediaBrowserService.onCreate] so the session exists before any AAOS
+         * `onGetSession` probe arrives. Subsequent callers (e.g. MainActivity) get the
+         * same instance back — `initialize()` is idempotent.
          *
-         * Race note: AAOS may call [MediaLibraryService.onGetSession] before
-         * [MediaSessionManager.initialize] has created the session. `null` is a
-         * permanent connection rejection per Media3 docs. Empirical:
-         * - POTATO GM AAOS 2026-04-20 063729: Initialized 06:37:11.771, first GM
-         *   onGetLibraryRoot 06:38:39.768 (88s gap, GM binds lazily after handshake).
-         *   Zero "rejecting bind" warnings across 3 sessions.
-         * - AAOS emulator 2026-04-20 21:55: early MediaController probe arrived 434ms
-         *   BEFORE initialize, logged "rejecting bind" once — handled cleanly (probe
-         *   was pre-discovery, subsequent real bind succeeded).
+         * Boot-race fix (2026-05-03): previously the manager was constructed from
+         * MainActivity, which is not started by AAOS at boot. AAOS auto-launched the
+         * MBS, probed `onGetSession` within ~50 ms, and the latch-based wait timed out
+         * after 1500 ms returning `null` — a permanent controller rejection per Media3
+         * docs. Owning the lifecycle in the MBS closes that window: `Service.onCreate`
+         * runs synchronously before any binder dispatch, so the session is alive by
+         * the time `onGetSession` is called.
+         */
+        fun getOrCreate(context: Context, logCallback: LogCallback): MediaSessionManager =
+            synchronized(instanceLock) {
+                currentInstance ?: MediaSessionManager(context, logCallback).also {
+                    currentInstance = it
+                }
+            }
+
+        /** Return the live singleton, or `null` if [getOrCreate] hasn't run yet. */
+        fun instance(): MediaSessionManager? = currentInstance
+
+        /** Release the singleton (called from [CarlinkMediaBrowserService.onDestroy]). */
+        fun releaseInstance() {
+            synchronized(instanceLock) { currentInstance }?.release()
+        }
+
+        /**
+         * Return the currently-live [MediaLibrarySession], or `null` if [getOrCreate]
+         * has not been called or the session was released.
          *
          * Atomic snapshot: the [currentInstance] read and the subsequent [mediaSession]
          * read happen as one critical section on the instance's [sessionLock], so
-         * [release] cannot null [mediaSession] between the two reads. Without this,
-         * a caller could observe `currentInstance != null` and then see
-         * `currentInstance.mediaSession == null` during an in-flight release, returning
-         * null for a session that was live when the lookup started.
+         * [release] cannot null [mediaSession] between the two reads.
          */
         fun getMediaLibrarySession(): MediaLibrarySession? {
             val inst = currentInstance ?: return null

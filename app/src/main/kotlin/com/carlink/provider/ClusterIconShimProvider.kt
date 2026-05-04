@@ -10,6 +10,7 @@ import android.net.Uri
 import android.os.ParcelFileDescriptor
 import androidx.core.graphics.scale
 import androidx.core.net.toUri
+import com.carlink.BuildConfig
 import com.carlink.logging.Logger
 import java.io.ByteArrayOutputStream
 import java.util.Collections
@@ -42,8 +43,10 @@ import java.util.LinkedHashMap
 class ClusterIconShimProvider : ContentProvider() {
     companion object {
         private const val TAG = Logger.Tags.ICON_SHIM
-        private const val AUTHORITY =
-            "com.google.android.apps.automotive.templates.host.ClusterIconContentProvider"
+        // Per-flavor (BuildConfig.CLUSTER_ICON_AUTHORITY, see app/build.gradle.kts).
+        // Must mirror the manifest's android:authorities so URI building stays
+        // consistent with the registered provider authority for this variant.
+        private val AUTHORITY: String = BuildConfig.CLUSTER_ICON_AUTHORITY
         // Bounded to cap memory: maneuver-icon diversity per trip is small, so 20
         // entries is enough to cover a full drive without re-encoding repeats.
         // At ~10-40 KiB per PNG this caps peak footprint at ~200-800 KiB.

@@ -5,6 +5,7 @@ import android.hardware.usb.UsbManager
 import android.os.PowerManager
 import android.view.Surface
 import androidx.core.content.edit
+import com.carlink.BuildConfig
 import com.carlink.audio.DualStreamAudioManager
 import com.carlink.audio.MicrophoneCaptureManager
 import com.carlink.gnss.GnssForwarder
@@ -1502,6 +1503,22 @@ class CarlinkManager(
 
     private fun setStatusText(text: String) {
         callback?.onStatusTextChanged(text)
+        // Mirror status text to MediaSession placeholder so cluster, cardview, and
+        // CarMediaApp surfaces all show the same user-facing state the main app UI
+        // shows as the adapter transitions through DISCONNECTED → CONNECTING →
+        // DEVICE_CONNECTED phases (Searching for adapter, Initializing, Waiting
+        // for phone, Phone connected, Reconnecting, etc.). Single source of truth.
+        //
+        // Gate on state != STREAMING — once real CarPlay/AA track metadata is
+        // flowing via processMediaMetadata → MediaSessionManager.publishMetadata,
+        // status text would clobber the live track title/artist. The setStatusText
+        // call sites during STREAMING (e.g. "Adapter not responding — reconnecting")
+        // are state-recovery transitions where placeholder text is no longer
+        // appropriate; the next state transition (back to CONNECTING) will rearm
+        // the mirror.
+        if (state != State.STREAMING) {
+            mediaSessionManager?.updatePlaceholderArtist(text)
+        }
     }
 
     /**
@@ -1534,10 +1551,19 @@ class CarlinkManager(
     private fun updateMediaSessionState(state: State) {
         when (state) {
             State.CONNECTING -> {
-                // Adapter is attached (USB handshake in progress) but no phone is
-                // projecting yet. MediaSession stays INACTIVE so AAOS consumers treat
-                // Carlink as not-a-valid-playback-source until a phone actually plugs in.
-                mediaSessionManager?.setInactive()
+                // Adapter is attached (USB handshake in progress). Activate the
+                // MediaSession NOW with STATE_BUFFERING + playWhenReady=true so AOSP
+                // CarMediaService.MediaControllerCallback.onPlaybackStateChanged sees
+                // a "preparing to play" arbitration signal at USB-attach time, matching
+                // v113's setStateConnecting behavior. Without this, the session stays
+                // STATE_IDLE through CONNECTING and only goes BUFFERING on PLUGGED —
+                // by which time an already-PLAYING source (e.g., FM) is undisplaceable
+                // per CarMediaService rule "newly-PLAYING displaces non-PLAYING only".
+                // See verification thread + Agent 2 AOSP source citation, 2026-05-02.
+                //
+                // connectingPhase=true publishes "Connecting to phone..." so cluster +
+                // cardview + CarMediaApp surfaces show meaningful state during handshake.
+                mediaSessionManager?.setProjectionActive(connectingPhase = true)
                 // Start foreground service early to maintain process priority during handshake
                 CarlinkMediaBrowserService.startConnectionForeground(context)
                 // Acquire wake lock to ensure USB operations aren't interrupted
@@ -1557,11 +1583,11 @@ class CarlinkManager(
 
             State.DEVICE_CONNECTED -> {
                 // PLUGGED event received — phone is attached to adapter and iAP2/AA
-                // handshake has identified it as CarPlay or Android Auto. Projection is
-                // imminent (video/audio frames will follow within ~1-2 seconds). Flip the
-                // MediaSession ACTIVE so AAOS consumers bind to us as the playback-primary
-                // candidate, ready to render metadata when MEDIA_DATA frames arrive.
-                mediaSessionManager?.setProjectionActive()
+                // handshake has identified it as CarPlay or Android Auto. Session was
+                // already activated at CONNECTING; re-publish with phase-specific text
+                // ("Waiting for media...") since the user can now see we're past the
+                // handshake and just waiting for the first MEDIA_DATA frame.
+                mediaSessionManager?.setProjectionActive(connectingPhase = false)
                 // Keep FGS up (idempotent if already started at CONNECTING).
                 CarlinkMediaBrowserService.startConnectionForeground(context)
             }
@@ -2523,6 +2549,19 @@ class CarlinkManager(
 
         // Always update playback state (position ticks are the common case)
         mediaSessionManager?.updatePlaybackState(playing = isPlaying, position = position)
+
+        if (BuildConfig.DEBUG) {
+            val songChanged = newSongName != null && newSongName != previousSongName
+            logDebug(
+                "[MEDIA_DATA] " +
+                    (if (songChanged) "[SONG_CHANGE] " else "") +
+                    "title=${newSongName ?: "·"} artist=${newArtist ?: "·"} album=${newAlbum ?: "·"} " +
+                    "app=${newAppName ?: "·"} art=${albumCover?.size ?: 0}B " +
+                    "dur=${duration}ms pos=${position}ms playing=$isPlaying " +
+                    "→ pushedMetadata=$metadataChanged",
+                tag = Logger.Tags.MEDIA,
+            )
+        }
     }
 
     /**

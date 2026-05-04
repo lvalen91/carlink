@@ -73,6 +73,14 @@ object NavigationStateManager {
     /** Burst window: two maneuver messages within this threshold are current + next. */
     private const val BURST_THRESHOLD_MS = 50L
 
+    // Intentionally a literal — DO NOT swap to BuildConfig.CLUSTER_ICON_AUTHORITY for
+    // symmetry with ClusterIconShimProvider. This constant is the probe target for the
+    // runtime guard below, and the probe is meaningful only against the authority
+    // Templates Host actually calls (the GM literal hardcoded in its dex). On the play
+    // flavor our shim is registered under a different (applicationId-suffixed) authority
+    // to satisfy Play Console; templating this would make resolveContentProvider() find
+    // our own shim and incorrectly enable the AA bitmap path when Templates Host's call
+    // still goes nowhere — silent icon failure instead of the documented graceful fallback.
     private const val CLUSTER_ICON_PROVIDER_AUTHORITY =
         "com.google.android.apps.automotive.templates.host.ClusterIconContentProvider"
 

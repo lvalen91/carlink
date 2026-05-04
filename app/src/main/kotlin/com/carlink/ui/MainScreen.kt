@@ -80,15 +80,15 @@ fun MainScreen(
     // Key state on carlinkManager identity — when manager is replaced (display mode reinit),
     // all session-scoped state resets automatically. This prevents stale callbacks, flags,
     // or touch state from the old manager leaking into the new session.
-    var state by remember(carlinkManager) { mutableStateOf(CarlinkManager.State.DISCONNECTED) }
+    var connectionState by remember(carlinkManager) { mutableStateOf(CarlinkManager.State.DISCONNECTED) }
     var statusText by remember(carlinkManager) { mutableStateOf("Connect Adapter") }
     var isResetting by remember(carlinkManager) { mutableStateOf(false) }
     val surfaceState = rememberVideoSurfaceState()
     var isAndroidAuto by remember(carlinkManager) { mutableStateOf(false) }
     var aaCropParams by remember(carlinkManager) { mutableStateOf<CarlinkManager.AaCropParams?>(null) }
 
-    LaunchedEffect(state) {
-        logInfo("[UI_STATE] MainScreen connection state: $state", tag = "UI")
+    LaunchedEffect(connectionState) {
+        logInfo("[UI_STATE] MainScreen connection state: $connectionState", tag = "UI")
     }
 
     var lastTouchTime by remember(carlinkManager) { mutableLongStateOf(0L) }
@@ -129,8 +129,8 @@ fun MainScreen(
                 surfaceHeight = adapterHeight,
                 callback =
                     object : CarlinkManager.Callback {
-                        override fun onStateChanged(newState: CarlinkManager.State) {
-                            state = newState
+                        override fun onStateChanged(state: CarlinkManager.State) {
+                            connectionState = state
                         }
 
                         override fun onStatusTextChanged(text: String) {
@@ -165,7 +165,7 @@ fun MainScreen(
         }
     }
 
-    val isLoading = state != CarlinkManager.State.STREAMING
+    val isLoading = connectionState != CarlinkManager.State.STREAMING
     val colorScheme = MaterialTheme.colorScheme
 
     val baseModifier = Modifier.fillMaxSize().background(Color.Black)
@@ -260,7 +260,7 @@ fun MainScreen(
                     // the pre-computed val `isUserInteractingWithProjection`.
                     // This lambda is captured once in AndroidView's factory block;
                     // a pre-computed val would snapshot DISCONNECTED permanently.
-                    if (state == CarlinkManager.State.STREAMING) {
+                    if (connectionState == CarlinkManager.State.STREAMING) {
                         if (BuildConfig.DEBUG) {
                             val now = System.currentTimeMillis()
                             if (now - lastTouchTime > 1000) {

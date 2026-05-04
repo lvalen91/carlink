@@ -4,12 +4,132 @@
 **Platform:** Intel Apollo Lake (Broxton)
 **Android Version:** 12 (API 32)
 **Research Date:** January 2026
+**Updated:** 2026-05-03 — added cross-platform analysis vs CT5 / AAOS 14 + corrected understanding of maneuver-icon path
+
+---
+
+## ⚠ 2026-05-03 ADDENDUM — Cross-platform finding (CT5 vs Silverado)
+
+**Static decompilation analysis only. NOT yet hardware-verified. Runtime evidence reported by user: CT5 cluster shows GM-internal-style maneuver glyphs regardless of which projection source provides the icon (carlink-internal CarPlay design OR AA passthrough bitmap). Silverado renders the actual app-provided bitmap correctly.**
+
+### Both platforms have an ECU-side glyph library
+
+Verified via `/tmp/gm_extract/decomp/ct5/ClusterService/sources/com/gm/nfsa/Protos$maneuverIconType.java`: the cluster wire proto enumerates 200+ named glyph IDs (`NoManeuver`, `ContinueStraight`, `LeftTurn`, `RightTurn`, `BearLeft`, `BearRight`, `MergeLeft`, `MergeRight`, `Arrow146..Arrow256`, `CWTrafficCircle1stExit..CCWTrafficCircle3rdExit`, `Waypoint1..Waypoint5`, `*Degree*` variants, etc.). The cluster ECU has its own sprite assets keyed by these enum values. The wire format **has no bitmap field at the maneuver layer** — only the enum.
+
+This means: whoever sends data to the cluster ECU tells it which sprite to draw. The ECU never receives a bitmap to display.
+
+### The host-side delta (the smoking gun)
+
+**Silverado** at `/tmp/gm_extract/decomp/silv/VMSPlugin/sources/h/b.java:80-140` — the `b()` method that builds `ActiveRouteData` for the **imminent turn**:
+- Calls `activeRouteData2.setManeuverIcon(uri)` (URI only)
+- DOES NOT call `setManeuverType(...)` — `mManeuverType` stays `TurnType.UNKNOWN`
+
+**CT5** at `/tmp/gm_extract/decomp/ct5/VMSPlugin/sources/com/gm/vmsplugin/navstate/NavigationStateProtoUtils.java:554-562`:
+- Calls BOTH `setManeuverIcon(maneuverIconUri)` AND `setManeuverType(ManeuverTypeToTurnType(getType(), getTypeV2()))`
+
+CT5 added a `setManeuverType()` call (with `TypeV2` support) that Silverado's equivalent code lacks.
+
+### What actually crosses the wire to the ECU
+
+Despite VMSPlugin populating `mManeuverIcon: Uri` in `ActiveRouteData`, the cluster wire proto `Protos$ManeuverDataUpdate_status.maneuverIcon_` is **enum-typed (`Protos$maneuverIconType`)**. No statically-traced code path resolves the URI to bytes and ships those bytes to the ECU. The URI appears to die at the proto-build boundary inside the GMRHMIService listener fan-out (heavily obfuscated `a2/a.java`, `b2/c2/d2` packages).
+
+**The cluster ECU verifiably receives:**
+- Maneuver type enum (`Protos$maneuverIconType` value, including `NoManeuver` for absent/unknown)
+- Distance to maneuver (int + units)
+- Road names (text)
+- Lane guidance (enum array)
+
+**The cluster ECU does NOT verifiably receive a bitmap for the maneuver icon.** The ECU draws its own glyph from its sprite library.
+
+### Why each platform behaves differently
+
+**CT5 (GM-style icons appear):**
+- VMSPlugin sets BOTH URI AND TurnType enum → cluster ECU has an authoritative enum value → renders matching GM glyph from its sprite library → app-provided bitmap (whether from carlink or any other 3P including potentially Google Maps) is masked.
+
+**Silverado (app-provided bitmap appears):**
+- VMSPlugin sets ONLY the URI for the imminent turn (no enum forwarded for this specific widget)
+- Without an enum to substitute, something downstream resolves the URI to PNG bytes and pushes them via a parallel channel (most plausibly an OnStar TBT side-channel that calls `ContentResolver.openFile()` on the URI host-side and ships the bytes via a separate FSA functionId) — exact mechanism not statically traceable
+- The ClusterIconShimProvider in carlink_native captures the orphaned `<TemplatesHostPkg>.ClusterIconContentProvider` authority; when the parallel channel resolves the URI, it lands on the shim's openFile and gets the cached bitmap
+
+### Why the carlink_native ClusterIconShimProvider was added (historical context)
+
+Early `revisions.txt` entries show the troubleshooting that led to the shim:
+
+- **[71]** Testing GM Cluster Nav Metadata integration. AOSP/Vanilla AOSP works fine, but not GM AAOS.
+- **[72]** Stale Nav Icons and Name fix test
+- **[81]** New Nav Icons
+- **[92]** Android Auto Cluster Maneuver Icon correction tests. Trying to Match the known CP Manuver indicators to the Android Auto movements.
+- **[94]** Android Auto navigation icons. NAVI_IMAGE(201) data found, only AA provides navigation icons via adapter forwarding. Used for AA active navigation instead of app's internal vector graphics (designed for CarPlay).
+- **[95]** AA maneuver icon and Template Host fixes. Will not set maneuver to 'UNKNOWN', uses provided maneuver enum regardless. Uses provided IMAGE if available, falls back to vector graphic if not. Testing 'metheos' detection code to check if Template Host ContentProvider is available to claim.
+
+The shim approach was **correct for Silverado**. Without it, the orphaned `<TemplatesHostPkg>.ClusterIconContentProvider` authority went unresolved, the parallel URI-resolution channel had nothing to fetch, and the cluster widget showed road name + distance but no icon — exactly the symptom that drove revisions [71]-[95].
+
+The shim approach is **futile on CT5** for changing the rendered icon. The CT5 cluster ECU draws its own GM-style glyph based on `setManeuverType()` regardless of whether a URI is also present. carlink-side adjustments cannot override the ECU's sprite choice without changes to the host-side code outside the 3P scope (specifically: prevent VMSPlugin's `setManeuverType()` call, which is in a system app).
+
+### What about Google Maps on the cluster?
+
+`MapsCarPrebuilt.apk` (`com.google.android.apps.maps`) holds `CAR_DISPLAY_IN_CLUSTER` + `CAR_NAVIGATION_MANAGER` + `VMS_PUBLISHER`/`SUBSCRIBER` permissions and integrates with the cluster on both platforms. Static analysis suggests Google Maps maneuver icons go through the same VMSPlugin path:
+
+- **On CT5**: Google Maps icons would also be substituted by GM-internal glyphs (because VMSPlugin's enum-forwarding applies to all callers of NavigationManager.updateTrip)
+- **On Silverado**: Google Maps icons would land on the same orphaned `ClusterIconContentProvider` authority — meaning if carlink_native is NOT installed, Google Maps maneuver icons would also have the URI-resolution problem on the imminent-turn widget (UNKNOWN whether Google Maps has an alternate in-process resolution path that bypasses ContentResolver)
+
+This is consistent with: GM's design intent is uniform cluster appearance regardless of nav source. CT5's `setManeuverType()` addition enforces this uniformity at the host-side. Silverado's older path still allows the bitmap channel to dominate.
+
+### Implications for carlink_native
+
+1. **The shim was correct work for Silverado** — without it, the cluster widget would show no icon regardless of what carlink computed.
+2. **The shim is dead-weight on CT5** — even with a perfect bitmap, the ECU substitutes its own glyph. Cannot be fixed from 3P scope.
+3. **The most carlink can do on CT5** to control the rendered glyph is ensure `Maneuver.TYPE_*` mapping in `ManeuverMapper.kt` produces the most precise matching enum so the GM glyph chosen is at least correct for the maneuver. Mapping accuracy translates 1:1 to the cluster sprite chosen by the ECU.
+4. **Workaround experiment** (UNVERIFIED): set `Maneuver.TYPE_UNKNOWN` unconditionally on CT5 to observe whether the ECU falls back to URI rendering or draws a generic "unknown" sprite. Risk-free runtime test.
+
+### Cross-platform summary table
+
+| Property | Silverado AAOS 12 | CT5 AAOS 14 |
+|---|---|---|
+| Cluster ECU has glyph library | YES (per Protos$maneuverIconType wire format) | YES (same enum schema) |
+| VMSPlugin forwards URI on imminent turn | YES | YES |
+| VMSPlugin forwards TurnType enum on imminent turn | NO | YES (`setManeuverType()` at NavigationStateProtoUtils:562) |
+| ECU renders app-provided bitmap | YES (parallel URI-resolution channel, mechanism unverified) | NO (enum-driven sprite preferred) |
+| ECU renders own glyph from enum | Only for upcoming-step preview list (`gm.navigation.models.Maneuver` list path) | YES, for imminent turn |
+| Was carlink's ClusterIconShimProvider needed | YES (without it, no icon at all) | NO (futile; bitmap is masked) |
+
+### Unknowns (require hardware verification)
+
+1. **The CT5 cluster ECU's behavior when `TurnType=UNKNOWN`** — does it fall back to URI rendering, or render a generic "unknown" glyph? Critical for evaluating the workaround.
+2. **The exact Silverado URI-resolution mechanism** — there must be a parallel channel (OnStar TBT? a separate FSA functionId carrying inline PNG bytes?) but no statically-traceable code path was found writing the URI's bytes to a wire proto.
+3. **Whether `mManeuverByteArray` (defined on `ActiveRouteData` on both platforms but unpopulated by VMSPlugin in static trace) gets filled by `gm.navigation.GMNavigationManager` downstream** — this would be the simplest plausible mechanism if it exists.
+4. **`tcpdump` on the SoC's Automotive Ethernet interface (192.168.118.0/24) during a maneuver event** — would definitively show what bytes leave the SoC for the cluster ECU on each platform. Easiest hardware experiment.
+
+### Key file references
+
+CT5 host-side delta:
+- `/tmp/gm_extract/decomp/ct5/VMSPlugin/sources/com/gm/vmsplugin/navstate/NavigationStateProtoUtils.java:345,554,561,562,622-626`
+- `/tmp/gm_extract/decomp/ct5/VMSPlugin/sources/gm/navigation/models/ActiveRouteData.java:29,250`
+
+Silverado host-side:
+- `/tmp/gm_extract/decomp/silv/VMSPlugin/sources/h/b.java:80-140` (imminent turn — URI only, no enum)
+- `/tmp/gm_extract/decomp/silv/VMSPlugin/sources/h/b.java:166-330` (preview-list path — enum only, no URI)
+- `/tmp/gm_extract/decomp/silv/GMSXM/sources/gm/navigation/models/ActiveRouteData.java:13,200`
+
+Cluster wire format (CT5; Silv likely similar but lower file count):
+- `/tmp/gm_extract/decomp/ct5/ClusterService/sources/com/gm/nfsa/Protos$ManeuverDataUpdate_status.java:151,308-310,568-569`
+- `/tmp/gm_extract/decomp/ct5/ClusterService/sources/com/gm/nfsa/Protos$maneuverIconType.java` (200+ glyph enum)
+
+Templates Host (identical Silv + CT5):
+- `/tmp/gm_extract/decomp/{silv,ct5}/GoogleTemplatesHost/sources/com/android/car/libraries/templates/host/navigation/NavigationStateConverterImpl.java:298-309`
+- `/tmp/gm_extract/decomp/{silv,ct5}/GoogleTemplatesHost/sources/com/android/car/libraries/templates/host/navigation/ClusterIconContentProvider.java:179-181`
+
+mempalace cross-references:
+- `gminfo37/projection/drawer_gminfo37_projection_6fcb0bc8369266b42fc97dee` — initial finding (CT5 vs Silv divergence)
+- `carlink_native/architecture/drawer_carlink_native_architecture_92ce1e0f483ffbe8312a7821` — IClusterHmi wire-format spec for cluster
 
 ---
 
 ## Overview
 
 This document describes how navigation turn-by-turn data flows from projection sources (CarPlay, Android Auto) and built-in navigation (Google Maps) to the vehicle instrument cluster display. The cluster shows basic directions including turn arrows, street names, and distance to the next turn.
+
+> **2026-05-03 NOTE on the original Silverado-only architecture below:** The pipeline diagrams and component map below describe Silverado AAOS 12 specifically. CT5 and other AAOS 14 GM platforms use the same upstream (carlink → Templates Host → AAOS framework) but diverge inside `VMSPlugin` (system app) where CT5 added enum forwarding alongside the URI. See addendum above for the corrected understanding. The original Silverado architecture below remains accurate for AAOS 12 / Info 3.7.
 
 ---
 

@@ -160,9 +160,14 @@ class AlbumArtCache(
     private fun pruneIfOver(maxFiles: Int) {
         val files = dir.listFiles() ?: return
         if (files.size <= maxFiles) return
+        val toDelete = files.size - maxFiles
+        var deleted = 0
         files.sortedBy { it.lastModified() }
-            .take(files.size - maxFiles)
-            .forEach { it.delete() }
+            .take(toDelete)
+            .forEach { if (it.delete()) deleted++ }
+        if (BuildConfig.DEBUG) {
+            Log.d(TAG, "pruneIfOver: removed $deleted/$toDelete oldest entries (had=${files.size}, target=$maxFiles)")
+        }
     }
 
     private fun sha1(b: ByteArray): String {

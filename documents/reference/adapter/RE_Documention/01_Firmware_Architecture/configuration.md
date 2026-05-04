@@ -755,12 +755,14 @@ echo 1 >/sys/class/gpio/gpio7/value   # Slow mode (default)
 
 **Purpose:** Controls instrument cluster / navigation video (CarPlay Dashboard) and NaviScreen view area negotiation.
 
-| Value | Global Flag Set | Feature |
-|-------|-----------------|---------|
-| 0 (default) | none | Navigation video only via `naviScreenInfo` in BoxSettings (bypass path). NaviScreen ViewArea/SafeArea disabled. |
-| 1 | `g_bSupportNaviScreen` | Navigation video stream (Type 0x2C AltVideoFrame) + NaviScreen ViewArea/SafeArea (legacy activation path) |
+| Value | Effect |
+|-------|--------|
+| 0 (default) | Used at runtime, navigation video flows via `naviScreenInfo` (Path A) — but **only if** the adapter has previously had this flag set to 1 (see "Persistent Unlock" below). On a virgin adapter, no 0x2C frames are emitted. |
+| 1 | Activates the legacy navigation-video path (Path B) and, on first use, creates the persistent unlock file. Sets `g_bSupportNaviScreen` and enables NaviScreen ViewArea/SafeArea negotiation. |
 
-**IMPORTANT (Testing Verified Feb 2026):** `AdvancedFeatures=1` is **NOT required** for navigation video when the host sends `naviScreenInfo` in BoxSettings. The firmware's JSON parser at `0x16e5c` checks for `naviScreenInfo` FIRST — if found, it branches directly to `HU_SCREEN_INFO` at `0x170d6`, completely bypassing the `AdvancedFeatures` check. Simply including `naviScreenInfo` in BoxSettings is the confirmed, tested activation mechanism.
+**Activation requires a one-time persistent unlock.** Setting `AdvancedFeatures=1` at least once in the device's lifetime causes ARMadb to write `/etc/RiddleBoxData/HU_NAVISCREEN_INFO`, which AppleCarPlay reads at session-init to set `g_bSupportNaviScreen`. The file persists across reboots and across reverting `AdvancedFeatures=0`. Without it, `_AltScreenSetup` is never called and no Type 0x2C frames flow — even when the host sends `naviScreenInfo` (the JSON parser bypass at `0x16e64` only clears the parser-side gate, not the session-init gate).
+
+The persistent-unlock behavior was originally observed and documented during the Jan 2026 discovery of navigation video. See "Navigation Video Activation" / "Persistent Unlock" sections below for the full activation matrix and binary trace.
 
 **CORRECTION (2026-02-18, r2 + live verified):** Earlier documentation incorrectly described this as a bitmask (0-3) with bit 1 controlling `g_bSupportViewarea`. This is **wrong**:
 - `riddleBoxCfg` enforces max=1 (`AdvancedFeatures:0 ~ 1`). Values 2+ are rejected.
@@ -1008,30 +1010,31 @@ If `naviScreenInfo` is NOT provided in BoxSettings:
 
 **Activation Matrix:**
 
-| naviScreenInfo in BoxSettings | AdvancedFeatures | Result |
-|------------------------------|------------------|--------|
-| Yes (any resolution) | 0 | ✅ **WORKS** (HU_SCREEN_INFO path) |
-| Yes (any resolution) | 1 | ✅ Works (same HU_SCREEN_INFO path) |
-| No | 1 | ✅ Works (HU_NAVISCREEN_INFO path) |
-| No | 0 | ❌ Rejected ("Not support NaviScreenInfo") |
+| `naviScreenInfo` in BoxSettings | `AdvancedFeatures` (current) | Persistent unlock present (`/etc/RiddleBoxData/HU_NAVISCREEN_INFO` exists) | Result |
+|---|---|---|---|
+| Yes | Either | Yes | ✅ Works (Path A — HU_SCREEN_INFO) |
+| Yes | Either | **No** (virgin adapter) | ❌ No 0x2C — JSON parser bypasses, but `g_bSupportNaviScreen=0` blocks `_AltScreenSetup` |
+| No | 1 | Yes | ✅ Works (Path B — HU_NAVISCREEN_INFO legacy) |
+| No | 0 | Either | ❌ Rejected (`"Not support NaviScreenInfo"`) |
 
-**Key Insight:** The `bne.w 0x170d6` at 0x16e64 is the critical branch that **bypasses** the AdvancedFeatures check entirely when naviScreenInfo is present.
+**Key Insight:** The `bne.w 0x170d6` branch at `0x16e64` only bypasses the **parser-side** `AdvancedFeatures` check. A **second, persistent gate** lives at the AppleCarPlay session-init layer: it reads `g_bSupportNaviScreen` from the file `/etc/RiddleBoxData/HU_NAVISCREEN_INFO`. ARMadb writes that file the first time it processes `AdvancedFeatures=1`, and the file survives reboots and reverting the flag to 0. Path A works regardless of the current `AdvancedFeatures` value, but **only after** `AdvancedFeatures=1` has been set at least once in the device's lifetime to create the unlock file.
 
 ---
 
-### AdvancedFeatures One-Time Activation (Legacy Behavior)
+### Persistent Unlock (Originally Documented Jan 2026)
 
-When using AdvancedFeatures (Path B), there is a one-time activation quirk:
+Coverage of this behavior was lost during a doc-folder reorganization and a subsequent Feb 2026 binary-RE pass that introduced (and over-generalized) the parser-bypass finding. Restored here.
 
-| Scenario | Navigation Video | Notes |
-|----------|------------------|-------|
-| Fresh adapter, AdvancedFeatures=0 (never set to 1) | **NOT working** | Feature locked (if no naviScreenInfo sent) |
-| Set AdvancedFeatures=1, connect phone | **Working** | Feature activated |
-| Set back to AdvancedFeatures=0 | **STILL working** | Feature remains unlocked |
+| Scenario | Navigation Video | Mechanism |
+|----------|------------------|-----------|
+| Virgin adapter (`AdvancedFeatures=1` never run), no `naviScreenInfo` | ❌ Not working | Both gates fail |
+| Virgin adapter, `naviScreenInfo` sent | ❌ Not working | Parser bypasses, but `g_bSupportNaviScreen=0` |
+| Run `riddleBoxCfg -s AdvancedFeatures 1 && --upConfig` once | ✅ Activated | ARMadb writes `/etc/RiddleBoxData/HU_NAVISCREEN_INFO` |
+| Then set `AdvancedFeatures=0`, send `naviScreenInfo` (Path A) | ✅ Still working | Unlock file persists |
+| Then set `AdvancedFeatures=0`, omit `naviScreenInfo` (Path B) | ❌ Not working | Legacy path requires runtime `=1` |
+| Manually delete `AdvancedFeatures` line from `riddle.conf` | (re-emitted on next config sync) | `riddleBoxCfg` re-injects from default schema; unlock state lives in `/etc/RiddleBoxData/`, not `riddle.conf` |
 
-This suggests a persistent unlock flag is set on first activation.
-
-**Note:** This quirk does NOT apply when using Path A (naviScreenInfo in BoxSettings) - that path works regardless of AdvancedFeatures history.
+**Practical guidance:** A host app cannot rely on `naviScreenInfo` alone if it might run against a virgin adapter. Options: (a) require a one-time SSH unlock by the user, or (b) ship the unlock as a first-run setup step if the host has shell access to the adapter.
 
 ### naviScreenWidth
 **Type:** Number (0-4096) | **Default:** 480
@@ -1069,11 +1072,12 @@ Host applications configure navigation video via BoxSettings JSON:
 ```
 
 **Requirements (when using naviScreenInfo Path A):**
-1. Host must send `naviScreenInfo` in BoxSettings (0x19) JSON — **this is the only confirmed requirement**
-2. Host must handle NaviVideoData (Type 0x2C) messages
-3. Command 508 handshake: recommended to echo 508 back if received, but **testing was inconclusive** on whether this is strictly required
+1. The adapter must have had `AdvancedFeatures=1` set at least once in its lifetime — the file `/etc/RiddleBoxData/HU_NAVISCREEN_INFO` must exist (persistent unlock — see above). On a virgin adapter, run `riddleBoxCfg -s AdvancedFeatures 1 && riddleBoxCfg --upConfig` once via SSH. After that, `AdvancedFeatures` can be left at 0 and Path A continues to work.
+2. Host must send `naviScreenInfo` in BoxSettings (0x19) JSON.
+3. Host must handle NaviVideoData (Type 0x2C) messages.
+4. Command 508 handshake: recommended to echo 508 back if received, but testing was inconclusive on whether this is strictly required.
 
-**Note:** When `naviScreenInfo` is present in BoxSettings, it **bypasses** the AdvancedFeatures check entirely. The firmware branches directly to the HU_SCREEN_INFO path. See "Navigation Video Activation" section above for the binary-verified control flow.
+**Note:** `naviScreenInfo` bypasses the `AdvancedFeatures` check **only in the JSON parser** (firmware branch at `0x16e64` → HU_SCREEN_INFO path). It does NOT bypass the AppleCarPlay session-init check on `g_bSupportNaviScreen`, which reads the persistent `/etc/RiddleBoxData/HU_NAVISCREEN_INFO` file. See "Persistent Unlock" above.
 
 ---
 
@@ -1141,7 +1145,7 @@ Host applications configure navigation video via BoxSettings JSON:
 | `productType` | - | string | Product type (e.g., "A15W") |
 | `lightType` | - | int | LED indicator type |
 
-**Navigation Video (activated by sending `naviScreenInfo` — AdvancedFeatures NOT required):**
+**Navigation Video (sent via `naviScreenInfo` — requires one-time `AdvancedFeatures=1` unlock; see "Persistent Unlock"):**
 
 | JSON Field | Type | Description |
 |------------|------|-------------|
@@ -2038,19 +2042,19 @@ See `usb_protocol.md` → "Bluetooth PIN Message Types" for detailed flow.
 
 ### Critical Note: Navigation Video Configuration
 
-There are **two independent paths** to enable navigation video (see "Navigation Video Activation" section for binary-verified details):
+There are **two activation paths** for navigation video at runtime, but **both require a one-time `AdvancedFeatures=1` unlock** (originally documented during the Jan 2026 navigation-video discovery). See "Navigation Video Activation" / "Persistent Unlock" sections above for binary-verified details.
 
 **Path A: naviScreenInfo in BoxSettings (Host App Controlled)**
 - Host sends `naviScreenInfo: {width, height, fps}` in BoxSettings JSON
-- Firmware at 0x16e64 detects naviScreenInfo and **bypasses** the AdvancedFeatures check
-- Uses HU_SCREEN_INFO D-Bus path
-- ✅ **Works without AdvancedFeatures=1**
+- Firmware at `0x16e64` detects `naviScreenInfo` and bypasses the **parser-side** `AdvancedFeatures` check (HU_SCREEN_INFO D-Bus path)
+- ⚠️ Still requires the persistent unlock file `/etc/RiddleBoxData/HU_NAVISCREEN_INFO`, created the first time `AdvancedFeatures=1` is processed
+- ✅ Works with `AdvancedFeatures=0` at runtime, **provided** the adapter has had `AdvancedFeatures=1` set at least once in its lifetime
 
-**Path B: AdvancedFeatures=1 (Legacy, Direct Access Only)**
+**Path B: AdvancedFeatures=1 at runtime (Legacy, Direct Access Only)**
 - Set via `riddleBoxCfg -s AdvancedFeatures 1` (SSH/terminal only)
 - Uses HU_NAVISCREEN_INFO D-Bus path
-- Uses naviScreenWidth/naviScreenHeight/naviScreenFPS from riddle.conf
-- Required only if host does NOT send naviScreenInfo in BoxSettings
+- Uses `naviScreenWidth` / `naviScreenHeight` / `naviScreenFPS` from `riddle.conf`
+- Required only if host does NOT send `naviScreenInfo` in BoxSettings
 
 **AdvancedFeatures Effects (when set to 1):**
 - Sets `g_bSupportNaviScreen=1` in AppleCarPlay

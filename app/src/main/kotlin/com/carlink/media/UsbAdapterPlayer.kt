@@ -2,6 +2,7 @@ package com.carlink.media
 
 import android.os.Handler
 import android.os.Looper
+import android.util.Log
 import androidx.media3.common.C
 import androidx.media3.common.MediaItem
 import androidx.media3.common.MediaMetadata
@@ -11,6 +12,8 @@ import androidx.media3.common.util.UnstableApi
 import com.carlink.BuildConfig
 import com.google.common.util.concurrent.Futures
 import com.google.common.util.concurrent.ListenableFuture
+
+private const val TAG = "CARLINK_PLAYER"
 
 /**
  * Media3 [Player] that mirrors phone playback state coming from the Carlinkit USB adapter.
@@ -82,45 +85,51 @@ class UsbAdapterPlayer(
     //   STATE_BUFFERING — connecting / waiting for data
     //   STATE_READY     — has source, can play (AAOS marks session "active")
     //   STATE_ENDED     — playback finished
-    // In Media3 there is no explicit MediaSession.setActive — AAOS / Media Center
-    // derive the session's active-for-switcher state from this field, so it must
-    // be set accurately for CONNECTING / STREAMING / DISCONNECTED transitions.
+    // Media3 has no public API named MediaSession.setActive. Based on Media3 1.10.0
+    // source observed on 2026-05-03, the platform-side
+    // android.media.session.MediaSession.isActive flag appears to be set true once at
+    // session start and to stay true until release (see CORRECTION block below for the
+    // observation details). AAOS observers in the firmware tested as of 2026-05-03
+    // appeared to gate switcher visibility on metadata + timeline content driven by this
+    // field, so it must be set accurately for CONNECTING / STREAMING / DISCONNECTED
+    // transitions on those observed builds. Both behaviors are point-in-time observations
+    // and should be re-verified if Media3 or the AAOS host firmware is upgraded.
     private var playbackState: Int = Player.STATE_IDLE
     private var isPlaying: Boolean = false
     private var positionMs: Long = 0L
     private var durationMs: Long = C.TIME_UNSET
     private var mediaMetadata: MediaMetadata = MediaMetadata.EMPTY
 
-    // Projection-state gate. When false, [getState] returns an EMPTY playlist with
-    // STATE_IDLE — this flips the platform android.media.session.MediaSession's
-    // `isActive` bit to false (Media3 derives active from `!timeline.isEmpty() ||
-    // playbackState != STATE_IDLE`), which means AAOS consumers (CarMediaService,
-    // CarLauncher Media card, ClusterMediaActivity) treat Carlink as NOT a valid
-    // playback-eligible source. When true, [getState] returns the current 1-item
-    // playlist reflecting live metadata + playback state.
+    // Projection-state gate. Selects which MediaMetadata getState() reports — placeholder
+    // ("Carlink"/"Not connected") when false, live phone metadata when true. The session
+    // ALWAYS reports a non-empty playlist + STATE_READY regardless of this flag (v99-
+    // equivalent contract restored 2026-05-03 to address an observed post-Media3 GM cluster
+    // Media-card regression on the firmware/build tested at that date).
     //
-    // Starts false — at process start / cold launch / adapter-only-no-phone, we do
-    // not claim primary-media-source eligibility. Becomes true only on PLUGGED event
-    // (phone attached to adapter = projection imminent). Returns to false on
-    // UNPLUGGED / DISCONNECTED / app force-stop-recovery.
+    // CORRECTION (audit follow-up, 2026-05-03): an earlier comment in this file claimed
+    // that Media3 derives platform android.media.session.MediaSession.isActive from
+    // `!timeline.isEmpty() || playbackState != IDLE`, and that the placeholder branch
+    // existed to keep that flag true. That claim was not corroborated by the Media3 1.10.0
+    // source as read on 2026-05-03 — the observed implementation around
+    // MediaSessionLegacyStub.start() calls `sessionCompat.setActive(true)` unconditionally,
+    // and a grep of the same file did not surface a `setActive(false)` call before
+    // `release()`. Within the constraints of that observation, the platform isActive flag
+    // appears to stay true for the entire session lifetime regardless of [Player.State] or
+    // timeline emptiness. This may change in a newer Media3 release; re-verify if upgrading.
     //
-    // This replaces the earlier design of keeping session "always active with
-    // placeholder metadata" which had the side effect of permanently occupying
-    // CarMediaService's playback-primary slot, blocking other sources from
-    // promoting and blocking CarLauncher's PlaybackViewModel from re-evaluating
-    // its MediaController on session-token rotation (e.g., after force-stop).
+    // Re-attribution of the cluster regression cause (as of 2026-05-03 audit): the
+    // empty-timeline + STATE_IDLE branch correlated with the cluster Media-card dropping
+    // Carlink, but the proximate cause appears to be downstream consumer behavior
+    // (GMCarMediaService / cluster's own metadata-bundle visibility evaluation drops
+    // sources with no playable identity in the firmware tested), not platform isActive
+    // flipping. The placeholder branch is still load-bearing on observed firmware — it
+    // gives controllers a stable, non-empty source identity to bind to during GM's
+    // ~88-second lazy-bind window — but the rationale we currently rely on is "expose
+    // visible metadata," not "keep platform isActive=true." Treat both the cause analysis
+    // and the firmware behavior as point-in-time observations subject to change.
     //
-    // LIMITATION: toggling this field does NOT recover CarLauncher's stale Media
-    // card after a force-stop. This is an AAOS platform bug, not specific to this
-    // app — reproduced 2026-04-21 on Apple Music 5.2.1 (a first-party vendor app)
-    // with identical symptoms. CarLauncher's PlaybackViewModel retains the
-    // destroyed-session MediaController reference and never rebinds to the new
-    // session token on the next ACTIVE transition. Only full package uninstall +
-    // reinstall + emulator restart clears it. The toggle below remains because
-    // it is architecturally correct (session should not squat as playback-primary
-    // when the adapter has no phone attached), but it is not a fix for the
-    // stale-card bug — that requires a patch inside AAOS itself. See
-    // MediaSessionManager class KDoc "KNOWN OS DEFICIENCY" for the full write-up.
+    // Starts false. Becomes true on PLUGGED event via [setSessionActive]. Returns to
+    // false on UNPLUGGED / DISCONNECTED.
     private var isSessionActive: Boolean = false
 
     // COMMAND_SET_MEDIA_ITEM is intentionally NOT advertised. Per SimpleBasePlayer docs a
@@ -177,6 +186,12 @@ class UsbAdapterPlayer(
                 this.durationMs = if (durationMs > 0) durationMs else C.TIME_UNSET
             }
             invalidateState()
+            if (BuildConfig.DEBUG) {
+                Log.d(
+                    TAG,
+                    "[PLAYER] state=$playbackState playing=$playing pos=${positionMs}ms dur=${durationMs}ms invalidated",
+                )
+            }
         }
     }
 
@@ -194,16 +209,30 @@ class UsbAdapterPlayer(
                 this.mediaMetadata = metadata
             }
             invalidateState()
+            if (BuildConfig.DEBUG) {
+                Log.d(
+                    TAG,
+                    "[PLAYER] metadata title=${metadata.title} artist=${metadata.artist} " +
+                        "album=${metadata.albumTitle} artBytes=${metadata.artworkData?.size ?: 0} " +
+                        "artUri=${metadata.artworkUri} invalidated",
+                )
+            }
         }
     }
 
     /**
      * Toggle projection-state gate. Safe to call from any thread.
      *
-     * @param active true when a phone is attached and projecting (session becomes a
-     *   valid playback-eligible source for AAOS consumers); false when no projection
-     *   is running (session reports empty timeline + STATE_IDLE, platform
-     *   MediaSession.isActive → false, AAOS can promote other sources freely).
+     * @param active true when a phone is attached and projecting (live phone metadata
+     *   surfaced via [getState]); false when no projection is running ([getState] returns
+     *   the placeholder branch — single placeholder MediaItem at STATE_READY +
+     *   playWhenReady=false). Based on Media3 1.10.0 source observed on 2026-05-03, the
+     *   platform android.media.session.MediaSession.isActive flag is not expected to be
+     *   toggled by changes to this player's reported state — Media3 appeared to keep it
+     *   true throughout the session lifetime in the observed source. AAOS observers
+     *   detect "no projection" via the placeholder metadata payload in the firmware
+     *   tested. Both the Media3 internal behavior and the AAOS observer behavior are
+     *   point-in-time observations; re-verify before relying on either across upgrades.
      */
     fun setSessionActive(active: Boolean) {
         postToMain {
@@ -214,6 +243,7 @@ class UsbAdapterPlayer(
                 this.isSessionActive = active
             }
             invalidateState()
+            if (BuildConfig.DEBUG) Log.d(TAG, "[PLAYER] sessionActive=$active invalidated")
         }
     }
 
@@ -229,16 +259,32 @@ class UsbAdapterPlayer(
         val snapshot = synchronized(stateLock) {
             StateSnapshot(playbackState, isPlaying, positionMs, durationMs, mediaMetadata, isSessionActive)
         }
-        // INACTIVE path: empty playlist + STATE_IDLE → platform MediaSession.isActive=false.
-        // AAOS CarMediaService then treats Carlink as not-a-valid-playback-source and other
-        // media apps are free to promote themselves into the playback-primary slot.
-        // Media3 derives active state from `!timeline.isEmpty() || playbackState != IDLE`,
-        // so both conditions must be inactive to flip the bit off (see MediaSessionImpl).
+        // INACTIVE path: single placeholder MediaItem at STATE_READY + playWhenReady=false.
+        // Per Media3 1.10.0 source observations on 2026-05-03 (around
+        // MediaSessionLegacyStub.start()), Media3 appears to set platform
+        // android.media.session.MediaSession.isActive=true once at session start with no
+        // observed setActive(false) call before release(). On that basis the branch's
+        // purpose is NOT to keep platform isActive=true (that appears to be free) — it is
+        // to expose a visible, named source so AAOS observers (GM CarMediaService,
+        // CarLauncher Media card, ClusterMediaActivity) keep listing Carlink as a
+        // present, ready-but-paused candidate even before a phone is plugged in. The
+        // v99-equivalent always-visible contract appears to rely on metadata presence,
+        // not on the platform active flag — re-verify if Media3 internals change.
         if (!snapshot.isActive) {
+            val placeholderItem = MediaItem.Builder()
+                .setMediaId(PLACEHOLDER_ITEM_ID)
+                .setMediaMetadata(PLACEHOLDER_METADATA)
+                .build()
+            val placeholderItemData = MediaItemData.Builder(PLACEHOLDER_ITEM_ID)
+                .setMediaItem(placeholderItem)
+                .setMediaMetadata(PLACEHOLDER_METADATA)
+                .setDurationUs(C.TIME_UNSET)
+                .build()
             return State.Builder()
-                .setAvailableCommands(Player.Commands.EMPTY)
-                .setPlaylist(emptyList())
-                .setPlaybackState(Player.STATE_IDLE)
+                .setAvailableCommands(availableCommands)
+                .setPlaylist(listOf(placeholderItemData))
+                .setCurrentMediaItemIndex(0)
+                .setPlaybackState(Player.STATE_READY)
                 .setPlayWhenReady(false, Player.PLAY_WHEN_READY_CHANGE_REASON_REMOTE)
                 .setIsLoading(false)
                 .build()
@@ -301,11 +347,13 @@ class UsbAdapterPlayer(
     }
 
     override fun handleSetPlayWhenReady(playWhenReady: Boolean): ListenableFuture<*> {
+        if (BuildConfig.DEBUG) Log.d(TAG, "[PLAYER] handleSetPlayWhenReady($playWhenReady)")
         if (playWhenReady) callback.onPlay() else callback.onPause()
         return Futures.immediateVoidFuture()
     }
 
     override fun handleStop(): ListenableFuture<*> {
+        if (BuildConfig.DEBUG) Log.d(TAG, "[PLAYER] handleStop")
         callback.onStop()
         return Futures.immediateVoidFuture()
     }
@@ -315,6 +363,9 @@ class UsbAdapterPlayer(
         positionMs: Long,
         @Player.Command seekCommand: Int,
     ): ListenableFuture<*> {
+        if (BuildConfig.DEBUG) {
+            Log.d(TAG, "[PLAYER] handleSeek index=$mediaItemIndex pos=${positionMs}ms cmd=$seekCommand")
+        }
         when (seekCommand) {
             Player.COMMAND_SEEK_TO_NEXT, Player.COMMAND_SEEK_TO_NEXT_MEDIA_ITEM ->
                 callback.onSkipToNext()
@@ -330,7 +381,10 @@ class UsbAdapterPlayer(
     // handleSetMediaItems is intentionally NOT overridden: COMMAND_SET_MEDIA_ITEM is not
     // advertised (see availableCommands), so SimpleBasePlayer never invokes it.
 
-    override fun handlePrepare(): ListenableFuture<*> = Futures.immediateVoidFuture()
+    override fun handlePrepare(): ListenableFuture<*> {
+        if (BuildConfig.DEBUG) Log.d(TAG, "[PLAYER] handlePrepare")
+        return Futures.immediateVoidFuture()
+    }
 
     private data class StateSnapshot(
         val playbackState: Int,
@@ -346,5 +400,15 @@ class UsbAdapterPlayer(
         // Real items derive their uid from metadata content via [itemUidFor] so the uid
         // rotates on track change and drives Player.Listener.onMediaItemTransition.
         private const val PLACEHOLDER_ITEM_ID = "carlink-placeholder"
+
+        // Placeholder metadata served while the session is INACTIVE (no phone projecting).
+        // Non-null title/artist is a visibility contract — some AAOS OEMs drop sessions
+        // with null/empty metadata from the source switcher (v99-era field-verified).
+        private val PLACEHOLDER_METADATA: MediaMetadata = MediaMetadata.Builder()
+            .setTitle("Carlink")
+            .setArtist("Not connected")
+            .setDisplayTitle("Carlink")
+            .setSubtitle("Carlink")
+            .build()
     }
 }
