@@ -334,8 +334,12 @@ private fun ControlTabContent(
     val isDeviceConnected = carlinkManager.state != CarlinkManager.State.DISCONNECTED
 
     val displayModePreference = remember { DisplayModePreference.getInstance(context) }
+    // Initial value is the platform-aware default (gminfo37 + AAOS emulator →
+    // FULLSCREEN_IMMERSIVE; else SYSTEM_UI_VISIBLE). Flow will overwrite with any
+    // persisted user choice on the first emission.
+    val displayModeInitial = remember { DisplayMode.platformDefault(context) }
     val currentDisplayMode by displayModePreference.displayModeFlow.collectAsStateWithLifecycle(
-        initialValue = DisplayMode.SYSTEM_UI_VISIBLE,
+        initialValue = displayModeInitial,
     )
     var showDisplayModeDialog by remember { mutableStateOf(false) }
 

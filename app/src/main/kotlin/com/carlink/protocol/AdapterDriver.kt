@@ -286,6 +286,28 @@ class AdapterDriver(
     }
 
     /**
+     * Write an arbitrary file to the connected adapter via USB SendFile (0x99).
+     *
+     * The adapter's ARMadb-driver handler stages the upload through
+     * /tmp/uploadFileTmp before atomically moving it to [adapterPath]. Path is
+     * not validated server-side — any absolute path the adapter root can write
+     * is reachable (see adapter RE_Documention §3 vulnerabilities.md). Used here
+     * only for /tmp/ paths (e.g. /tmp/aa_gps_fix.sh) for in-session host-pushed
+     * helpers. Naming a file `*Update.img` auto-triggers OTA on the adapter side
+     * — caller must avoid that suffix unless OTA is intended.
+     *
+     * @param adapterPath Absolute destination path on the adapter (e.g. "/tmp/aa_gps_fix.sh")
+     * @param content     Raw file bytes to write
+     */
+    fun sendFile(
+        adapterPath: String,
+        content: ByteArray,
+    ): Boolean {
+        log("[SEND] SendFile: $adapterPath (${content.size} bytes)")
+        return send(MessageSerializer.serializeFile(adapterPath, content))
+    }
+
+    /**
      * Cancel the pending wifiConnect auto-connect timer and send a targeted
      * AutoConnect_By_BluetoothAddress instead. Called when the user explicitly
      * selects a device to connect to during a restart cycle.

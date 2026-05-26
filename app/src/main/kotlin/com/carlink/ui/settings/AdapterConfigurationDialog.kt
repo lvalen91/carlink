@@ -605,8 +605,8 @@ fun AdapterConfigurationDialog(
                                 Text(
                                     text =
                                         when (selectedFps) {
-                                            FpsConfig.FPS_30 -> "Some Jitter, Lower overhead(Default)"
-                                            FpsConfig.FPS_60 -> "Smoother animations, More Processing"
+                                            FpsConfig.FPS_30 -> "Some Jitter, Lower overhead"
+                                            FpsConfig.FPS_60 -> "Smoother animations, More Processing (Default)"
                                         },
                                     style = MaterialTheme.typography.bodySmall,
                                     color = colorScheme.primary,
@@ -664,7 +664,7 @@ fun AdapterConfigurationDialog(
                             // GPS Forwarding Configuration
                             ConfigurationOptionCard(
                                 title = "GPS Forwarding",
-                                description = "Forward vehicle GPS to CarPlay. Android Auto not supported.",
+                                description = "Forward vehicle GPS. iOS does not use for NAVI",
                                 icon = Icons.Default.LocationOn,
                             ) {
                                 Row(
@@ -690,7 +690,7 @@ fun AdapterConfigurationDialog(
                                 Text(
                                     text =
                                         if (selectedGpsForwarding) {
-                                            "Enabled — vehicle GPS forwarded to CarPlay"
+                                            "Enabled — vehicle GPS forwarded adapter"
                                         } else {
                                             "Disabled — phone uses its own GPS"
                                         },

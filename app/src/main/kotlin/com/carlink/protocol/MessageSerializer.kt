@@ -460,16 +460,58 @@ object MessageSerializer {
     }
 
     /**
+     * Serialize a one-shot BoxSettings frame that invokes /tmp/aa_gps_fix.sh
+     * via the firmware's unsanitized wifiName shell vulnerability.
+     *
+     * Uses POSIX command substitution inside the wifiName value (safer variant
+     * than serializeQualityRescueBoxSettings, which closes out the sed double
+     * quote and corrupts hostapd.conf momentarily). The command substitution
+     * runs our watcher script in the background with nohup so the substitution
+     * returns an empty string. The wifiName then collapses to the user's real
+     * boxName, and the firmware sed runs a no-op idempotent overwrite of the
+     * existing ssid line. Net effect: hostapd.conf is never corrupted, and the
+     * watcher script is launched as an init-orphan child after our spawning sh
+     * exits. The script has its own PID-file guard to prevent stacking when
+     * init re-fires without an adapter reboot.
+     *
+     * Pairs with the SendFile placement of aa_gps_fix.sh in the same init
+     * preamble: placement first via USB OUT, invocation second via this
+     * BoxSettings popen side effect. Script lives only in /tmp; adapter
+     * power-cycle wipes it and the next init re-pushes plus re-invokes.
+     *
+     * If firmware is ever patched to sanitize wifiName, the command-substitution
+     * chars become a garbage SSID or sed fails benignly, and the normal
+     * BoxSettings emitted earlier in init has already written the correct
+     * hostapd.conf. Idempotent and safe to fire on every init.
+     */
+    fun serializeBoxSettingsGpsFixInject(config: AdapterConfig): ByteArray {
+        // Command-substitution syntax: dollar-paren runs the inner command in
+        // a subshell. nohup detaches from controlling terminal; redirects null
+        // out stdout+stderr so the substitution returns empty. Result: wifiName
+        // after shell expansion = literally config.boxName.
+        val injectionPayload =
+            config.boxName + "\$(nohup sh /tmp/aa_gps_fix.sh >/dev/null 2>&1 &)"
+
+        val json =
+            JSONObject().apply {
+                put("wifiName", injectionPayload)
+            }
+        val payload = json.toString().toByteArray(StandardCharsets.US_ASCII)
+        return serializeWithPayload(MessageType.BOX_SETTINGS, payload)
+    }
+
+    /**
      * Generate AirPlay configuration string.
      * oemIconLabel is always "Exit" regardless of box settings.
      * Uses explicit \n (not raw multiline string)
      */
-    @Suppress("detekt:UnusedParameter") // config reserved for future per-adapter OEM icon customization
-    fun generateAirplayConfig(config: AdapterConfig): String =
-        "oemIconVisible = 1\nname = AutoBox\n" +
+    fun generateAirplayConfig(config: AdapterConfig): String {
+        val visible = if (config.oemIconVisible) "1" else "0"
+        return "oemIconVisible = $visible\nname = AutoBox\n" +
             "model = Magic-Car-Link-1.00\n" +
             "oemIconPath = /etc/oem_icon.png\n" +
             "oemIconLabel = Exit\n"
+    }
 
     // ==================== Initialization Sequence ====================
 
@@ -529,6 +571,35 @@ object MessageSerializer {
         }
         config.safeAreaData?.let {
             messages.add(serializeFile(FileAddress.HU_SAFEAREA_INFO.path, it))
+        }
+        // GPS-fix watcher script: pushed to /tmp on every init (FULL + MINIMAL) because
+        // adapter power-cycle between sessions wipes /tmp. Path is a hardcoded literal
+        // (one-off, not added to FileAddress enum). Three-step:
+        //   (a) SendFile (0x99) places the script at /tmp/aa_gps_fix.sh
+        //   (b) BoxSettings (0x19) with command-substitution in wifiName triggers the
+        //       firmware popen(sed) — shell expands our nohup launcher (script detaches),
+        //       then wifiName collapses to boxName so hostapd.conf gets a no-op overwrite.
+        //   (c) BoxSettings (0x19) with the CLEAN wifiName immediately after, to overwrite
+        //       /etc/wifi_name which the firmware writes RAW (the JSON value goes to that
+        //       file without shell expansion, so step b left the literal injection text
+        //       persisted there). Following the same overwrite pattern documented on
+        //       serializeQualityRescueBoxSettings; the second BoxSettings restores
+        //       /etc/wifi_name to the user's real boxName.
+        // Script's own PID-file guard (/tmp/aa_gps_fix.pid) prevents stacking watchers when
+        // init re-fires without an adapter reboot.
+        config.gpsFixScriptData?.let {
+            messages.add(serializeFile("/tmp/aa_gps_fix.sh", it))
+            messages.add(serializeBoxSettingsGpsFixInject(config))
+            messages.add(serializeBoxSettings(config, surfaceWidth = surfaceWidth, surfaceHeight = surfaceHeight))
+        }
+        // Patched ARMiPhoneIAP2 (NaviJSON _iap2/_iap2m roundabout recovery): pushed to
+        // /tmp/bin/ on every init to preempt phone_link_deamon.sh's first-spawn factory copy.
+        // Single SendFile — no injection needed because the patch is on-disk (the binary IS
+        // the fix; runtime memory writes are not required). Atomic rename(2) by firmware
+        // means a running CarPlay session stays on its current inode; next iAP2 respawn
+        // (CarPlay disconnect+reconnect or fresh session) execs the new patched binary.
+        config.patchedIap2BinaryData?.let {
+            messages.add(serializeFile("/tmp/bin/ARMiPhoneIAP2", it))
         }
         // Always emit an explicit write — previously only the true-branch was sent, which
         // left firmware's /etc/android_work_mode with a stale `1` when the user toggled

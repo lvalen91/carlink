@@ -90,6 +90,22 @@ object PlatformDetector {
         fun isGmInfo37(): Boolean = device.equals("gminfo37", ignoreCase = true)
 
         /**
+         * Returns true if running on Google's AAOS reference emulator
+         * (product=sdk_gcar_arm64 / sdk_gcar_x86 / sdk_gcar_*). Used as a stand-in for
+         * gminfo37 during local development — same 3P-app constraints, and the only way
+         * to validate gminfo37-specific defaults without the Silverado hardware.
+         */
+        fun isAaosEmulator(): Boolean = product.startsWith("sdk_gcar", ignoreCase = true)
+
+        /**
+         * Composite: device should receive "gminfo37-like" UI defaults
+         * (fullscreen-immersive, OEM icon hidden, etc.). True on gminfo37 itself and
+         * on the AAOS emulator (for development parity). False elsewhere — preserves
+         * existing factory defaults for non-GM 3P targets.
+         */
+        fun requiresImmersiveDefaults(): Boolean = isGmInfo37() || isAaosEmulator()
+
+        /**
          * Returns true if Intel-specific MediaCodec fixes should be applied.
          * Requires BOTH Intel architecture AND Intel codec presence.
          * ARM-based GM AAOS devices will return false.

@@ -56,6 +56,12 @@ Buffers create corruption. Queues create lies.
 Audio is a continuous time signal that must never stall.
 Video may drop. Audio may buffer. Neither may block the other
 
+> [!IMPORTANT]
+> Adapter-SIde Binaries were patched to correct to problems and require use of custom firmware on the adapter itself.
+> 1. Carlinkit Stripped away rich iAP2 navigation data rcvd from iPhone, that has been corrected in custom firmware. Full iAP2 route information is now forwarded and rcvd.
+> 2. Carlinkit AndroidAuto incorrectly parsed rcvd Vehicle GPS NMEA when app forwarded to Phone. That is now patched so correct and accura NMEA is rcvd by Android Phone.
+>
+> Custom adapter firmware for complete/correct Carplay Route information and Correct GPS-Forwarding support on Android Auto. While not necessary to have, it provides a better and closer to stock experience if you do load.
 
 ```
 Video:

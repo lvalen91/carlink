@@ -44,6 +44,7 @@ import com.carlink.logging.LogPreset
 import com.carlink.logging.Logger
 import com.carlink.logging.LoggingPreferences
 import com.carlink.logging.apply
+import com.carlink.logging.logWarn
 import com.carlink.logging.logInfo
 import com.carlink.logging.logWarn
 import com.carlink.media.MediaSessionManager
@@ -466,6 +467,36 @@ class MainActivity : ComponentActivity() {
         val (icon120, icon180, icon256) = IconAssets.loadIcons(this)
         val iconsLoaded = icon120 != null && icon180 != null && icon256 != null
 
+        // Load bundled aa_gps_fix.sh — pushed to adapter /tmp on every init (full + minimal).
+        // Inline single-asset load; no dedicated util warranted for one file.
+        val gpsFixScriptBytes =
+            try {
+                this.assets.open("aa_gps_fix.sh").use { it.readBytes() }
+            } catch (e: java.io.IOException) {
+                logWarn("[GPS_FIX] Failed to load aa_gps_fix.sh asset: ${e.message}")
+                null
+            }
+
+        // Load bundled patched ARMiPhoneIAP2 — pushed to adapter /tmp/bin on every init to
+        // preempt phone_link_deamon's first-spawn factory copy. 233 KiB, single SendFile.
+        val patchedIap2BinaryBytes =
+            try {
+                this.assets.open("ARMiPhoneIAP2.patched").use { it.readBytes() }
+            } catch (e: java.io.IOException) {
+                logWarn("[IAP2_PATCH] Failed to load ARMiPhoneIAP2.patched asset: ${e.message}")
+                null
+            }
+
+        // Platform-specific overrides. PlatformDetector.detect is cheap (Build props + one
+        // MediaCodecList scan); CarlinkManager.initialize re-detects but that's idempotent.
+        // gminfo37 (and the AAOS emulator for development parity): hide the CarPlay OEM
+        // "Exit" icon — GM AAOS has its own back-nav; the OEM tile collides visually.
+        // Other platforms keep the OEM icon visible (existing factory behavior). Wired into
+        // /etc/airplay.conf via AdapterConfig.oemIconVisible which generateAirplayConfig now
+        // honors.
+        val platformInfo = com.carlink.platform.PlatformDetector.detect(this)
+        val oemIconVisibleForPlatform = !platformInfo.requiresImmersiveDefaults()
+
         // Load user-configured adapter settings from sync cache (instant, no I/O blocking)
         // These are optional - only configured settings are sent to the adapter
         val userConfig = AdapterConfigPreference.getInstance(this).getUserConfigSync()
@@ -528,6 +559,9 @@ class MainActivity : ComponentActivity() {
                 icon120Data = icon120,
                 icon180Data = icon180,
                 icon256Data = icon256,
+                gpsFixScriptData = gpsFixScriptBytes,
+                patchedIap2BinaryData = patchedIap2BinaryBytes,
+                oemIconVisible = oemIconVisibleForPlatform,
                 // User-configured audio transfer mode (false=adapter, true=bluetooth)
                 audioTransferMode = userConfig.audioTransferMode,
                 // Hardcoded to 48kHz - professional quality audio for GM AAOS

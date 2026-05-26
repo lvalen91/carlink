@@ -2363,6 +2363,23 @@ class CarlinkManager(
     private fun processMediaMetadata(message: MediaDataMessage) {
         // Route NaviJSON to NavigationStateManager for cluster display (only if enabled)
         if (message.type == MediaType.NAVI_JSON) {
+            // DEBUG: log full NaviJSON receipt so we can confirm the patched ARMiPhoneIAP2
+            // is emitting `_iap2` / `_iap2m` recovery fields. Logs all keys; truncates `_iap2*`
+            // string values (which are hex-encoded raw iAP2 bytes ~100-400 chars) to keep the
+            // line manageable but visible. Strip before production-grade release.
+            val keys = message.payload.keys.sorted()
+            val iap2 = (message.payload["_iap2"] as? String)?.let {
+                "_iap2[${it.length}ch]=${it.take(64)}${if (it.length > 64) "…" else ""}"
+            }
+            val iap2m = (message.payload["_iap2m"] as? String)?.let {
+                "_iap2m[${it.length}ch]=${it.take(64)}${if (it.length > 64) "…" else ""}"
+            }
+            logInfo(
+                "[NAVI_JSON_RX] keys=$keys" +
+                    (iap2?.let { " $it" } ?: "") +
+                    (iap2m?.let { " $it" } ?: ""),
+                tag = Logger.Tags.NAVI,
+            )
             // NOTE: getClusterNavigationSync() is read at message time, NOT cached —
             // a user toggling cluster navigation in AdapterConfigurationDialog takes effect
             // on the next NAVI_* message, no restart needed.

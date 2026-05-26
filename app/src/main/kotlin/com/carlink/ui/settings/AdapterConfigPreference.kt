@@ -172,7 +172,7 @@ enum class FpsConfig(
     ;
 
     companion object {
-        val DEFAULT = FPS_30
+        val DEFAULT = FPS_60
     }
 }
 

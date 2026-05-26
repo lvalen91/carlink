@@ -57,6 +57,20 @@ enum class DisplayMode(
          * Returns SYSTEM_UI_VISIBLE for unknown values (safe default).
          */
         fun fromValue(value: Int): DisplayMode = entries.find { it.value == value } ?: SYSTEM_UI_VISIBLE
+
+        /**
+         * Platform-aware default display mode (used when no user preference is
+         * persisted). gminfo37 and the AAOS emulator default to FULLSCREEN_IMMERSIVE
+         * for maximum projection area; every other platform keeps the legacy
+         * SYSTEM_UI_VISIBLE default. User can still override via the settings dialog;
+         * this only affects the "no preference set yet" first-run / cleared-data path.
+         */
+        fun platformDefault(context: android.content.Context): DisplayMode =
+            if (com.carlink.platform.PlatformDetector.detect(context).requiresImmersiveDefaults()) {
+                FULLSCREEN_IMMERSIVE
+            } else {
+                SYSTEM_UI_VISIBLE
+            }
     }
 }
 
@@ -181,10 +195,12 @@ class DisplayModePreference private constructor(
                 tag = "DisplayModePreference",
             )
         } else {
-            // No old preference, just mark as migrated with default
+            // No old preference: mark migrated using the platform-aware default
+            // (gminfo37 + AAOS emulator → FULLSCREEN_IMMERSIVE; everything else →
+            // SYSTEM_UI_VISIBLE legacy default).
             syncCache
                 .edit()
-                .putInt(SYNC_CACHE_KEY_DISPLAY_MODE, DisplayMode.SYSTEM_UI_VISIBLE.value)
+                .putInt(SYNC_CACHE_KEY_DISPLAY_MODE, DisplayMode.platformDefault(appContext).value)
                 .putBoolean(SYNC_CACHE_KEY_MIGRATED, true)
                 .apply()
         }
@@ -201,7 +217,7 @@ class DisplayModePreference private constructor(
                 ?: preferences[KEY_IMMERSIVE_MODE_ENABLED_LEGACY]?.let { wasImmersive ->
                     if (wasImmersive) DisplayMode.FULLSCREEN_IMMERSIVE else DisplayMode.SYSTEM_UI_VISIBLE
                 }
-                ?: DisplayMode.SYSTEM_UI_VISIBLE
+                ?: DisplayMode.platformDefault(appContext)
         }
 
     /**
@@ -215,7 +231,7 @@ class DisplayModePreference private constructor(
      */
     fun getDisplayModeSync(): DisplayMode =
         DisplayMode.fromValue(
-            syncCache.getInt(SYNC_CACHE_KEY_DISPLAY_MODE, DisplayMode.SYSTEM_UI_VISIBLE.value),
+            syncCache.getInt(SYNC_CACHE_KEY_DISPLAY_MODE, DisplayMode.platformDefault(appContext).value),
         )
 
     /**

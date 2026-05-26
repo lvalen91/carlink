@@ -510,3 +510,15 @@
    - Affected: app/build.gradle.kts, WindowMetricsCompat.kt (new), MainActivity.kt, PlatformDetector.kt, AdapterConfigurationDialog.kt, UsbDeviceWrapper.kt.
 
 [132] :: Removed command injection from MessageSerializer.kt
+
+[133] :: Adapter binary patches — CarPlay nav metadata recovery and Android Auto NMEA GPS fix. 60FPS default. Platform-conditional GM defaults.
+   - ARMiPhoneIAP2 on adapter strips/nulls rich navigation iAP2 messages — persistent on-disk patch restores full forwarding.
+   - Patch recovers 0x5201 RouteGuidance and 0x5202 maneuver burst, forwarded to App as NaviJSON _iap2/_iap2m fields.
+   - ARMAndroidAuto factory binary has 4-byte NMEA divisor bug — uses 600000.0 instead of 60.0, snapping GPS to ~1.85km grid.
+   - aa_gps_fix.sh watcher patches the binary in-memory via /proc/PID/mem at vaddr 0x55f04 on each new AA PID.
+   - Watcher auto-launched via /etc/init.d/rcS hook so fix survives reboot, USB removal, and AA respawns.
+   - Debug APK now logs the full navigation JSON received so the patched iAP2 binary can be verified end-to-end.
+   - Set 60FPS as the default video frame rate, replacing prior 30FPS default.
+   - DisplayMode default is now platform-conditional via PlatformDetector.requiresImmersiveDefaults() (gminfo37 + AAOS emulator → FULLSCREEN_IMMERSIVE; all other platforms → SYSTEM_UI_VISIBLE as before). User's prior persisted choice still wins; only first-install / post-uninstall defaults change.
+   - oemIcon hidden by default on the same platform set — MessageSerializer.generateAirplayConfig now honors AdapterConfig.oemIconVisible (was a constant "1"); MainActivity sets it to !requiresImmersiveDefaults().
+   - Platform check for gminfo3.7 hides CarPlay OEMicon and defaults DisplayMode to Fullscreen on that platform.
