@@ -546,14 +546,73 @@
    - Affected: Iap2StateParser.kt (new), NavigationStateManager.kt, CarlinkManager.kt, IconBitmapRenderer.kt.
 
 [137] :: Roundabout icons solved + cursor-stuck fix + finer (36-way) continuous arrows with real-arm spokes.
-   - Root cause: AppleManeuverPaths.roundaboutMap was corrupt — 144 cells but only 7 distinct arrow strings, with the bucket index uncorrelated with exit direction (bucket 8 / "straight" drew a sharp-right). Verified 3/3 independent agents + 5 parsers; old table had 362/1080 direction inversions, straight in 0/9 groups.
-   - Apple RE MapKit: MKJunction getRoundaboutArrowPath: SNAPS the exit to 8 cardinal 45° slots (entry pinned at bottom, drawn endAngle = slot*45-90); the core primitive roundaboutArrowWithSize:metrics:outerRadius:endAngle:pivot: draws ANY continuous angle (measured bearing = 90 - endAngle°). Apple ships no static roundabout assets — all runtime vector.
-   - iAP2 angle convention live-verified (3-agent, captured _iap2m): 0x000b JunctionElementExitAngle = signed int16 driver-relative degrees (0=straight, +90=right, -90=left, ±180=back); 0x000a JunctionElementAngle = the other arms in the same frame. Refutes the adapter-doc "-90=right / relative-to-entry" claim and the prior "subtract the entry arm" hypothesis — the wire angle is fed straight in.
-   - CarPlay's own card also snaps: measured from iPhone screenshots, exits -6/-13/-3 all drew an identical straight-up arrow. Per user preference the cluster is intentionally rendered FINER than Apple's card.
-   - Regenerated roundaboutMap from genuine MapKit output, then went finer: 36-way (10°) buckets, white exit arrow = continuous core-primitive render (AppleManeuverPaths.kt, 324 cells). roundaboutPaths() bucket math changed 22.5°/16 → 10°/36.
-   - Ring + spokes now drawn at RUNTIME from the REAL junction arms (ManeuverComposer.buildRingAndSpokes consumes iAP2 entryAngles) instead of a generic snapped schematic; the white arrow shows entry (stem) + exit (head), so no grey exit-stub diverges from the fine arrow.
-   - AA-seam fix: ring donut + spoke quads overlapped, and IconBitmapRenderer fills the background as one anti-aliased drawPath, leaving a notch where the ring's outer edge crossed each spoke; Path.op(UNION) merges ring+spokes into a single outline (no internal edges, no seam).
-   - Cursor-stuck fix (Bug A on len-2 routes): Iap2StateParser assigned a length-2 0x000d value to nextManeuverIdx, leaving currentManeuverIdx null → v6.1 gate failed → cluster stranded on a stuck Tier C fallback. Live data proved the len-2 single value IS the current maneuver index (0x000d=6 matched CarPlay's current idx6 @1.4mi; monotonic 3→10; depart=len-4 [0,1], arrival=len-2 [last]). Fixed to currentManeuverIdx; 3/3 verified, len-4 path byte-identical, never out of bounds across 961 frames.
-   - Live-validated on Carmel routes (Veterans Way / Arbor Dr through City Center, S Guilford, W Carmel, E Main / E 116th, Hazel Dell roundabouts): correct exit directions, fine 10° arrows, real-arm grey spokes, and the cursor now tracks CarPlay through every roundabout (V6_FIRED cursor 3→4→5→6→7).
-   - Caveat: iAP2 frequently sends an INCOMPLETE arm list (cp29/30 often report 1-2 arms for 3-4-arm junctions), so spokes show only the arms present on the wire.
-   - Affected: AppleManeuverPaths.kt (regenerated table + 36-way bucket math), ManeuverComposer.kt (runtime ring/spokes from real arms + Path.op union), Iap2StateParser.kt (len-2 0x000d = current), NavigationStateManager.kt (gate comment), ManeuverComposerTest.kt (real-arm render test).
+   - Root cause: AppleManeuverPaths.roundaboutMap was corrupt — 144 cells but only 7 distinct arrow strings.
+   - Bucket index was uncorrelated with exit direction — bucket 8 / "straight" drew a sharp-right.
+   - Verified 3/3 independent agents + 5 parsers; old table had 362/1080 direction inversions, straight in 0/9 groups.
+   - Apple RE MapKit: MKJunction getRoundaboutArrowPath: SNAPS the exit to 8 cardinal 45° slots.
+   - Entry pinned at bottom, drawn endAngle = slot*45-90.
+   - Core primitive roundaboutArrowWithSize:metrics:outerRadius:endAngle:pivot: draws ANY continuous angle (measured bearing = 90 - endAngle°).
+   - Apple ships no static roundabout assets — all runtime vector.
+   - iAP2 angle convention live-verified (3-agent, captured _iap2m).
+   - 0x000b JunctionElementExitAngle = signed int16 driver-relative degrees (0=straight, +90=right, -90=left, ±180=back).
+   - 0x000a JunctionElementAngle = the other arms in the same frame.
+   - Refutes the adapter-doc "-90=right / relative-to-entry" claim and the prior "subtract the entry arm" hypothesis.
+   - The wire angle is fed straight in.
+   - CarPlay's own card also snaps: measured from iPhone screenshots, exits -6/-13/-3 all drew an identical straight-up arrow.
+   - Per user preference the cluster is intentionally rendered FINER than Apple's card.
+   - Regenerated roundaboutMap from genuine MapKit output, then went finer: 36-way (10°) buckets.
+   - White exit arrow = continuous core-primitive render (AppleManeuverPaths.kt, 324 cells).
+   - roundaboutPaths() bucket math changed 22.5°/16 → 10°/36.
+   - Ring + spokes now drawn at RUNTIME from the REAL junction arms, not a generic snapped schematic.
+   - ManeuverComposer.buildRingAndSpokes consumes iAP2 entryAngles.
+   - The white arrow shows entry (stem) + exit (head), so no grey exit-stub diverges from the fine arrow.
+   - AA-seam fix: ring donut + spoke quads overlapped.
+   - IconBitmapRenderer fills the background as one anti-aliased drawPath, leaving a notch where the ring's outer edge crossed each spoke.
+   - Path.op(UNION) merges ring+spokes into a single outline (no internal edges, no seam).
+   - Cursor-stuck fix (Bug A on len-2 routes): Iap2StateParser assigned a length-2 0x000d value to nextManeuverIdx.
+   - Leaving currentManeuverIdx null → v6.1 gate failed → cluster stranded on a stuck Tier C fallback.
+   - Live data proved the len-2 single value IS the current maneuver index.
+   - 0x000d=6 matched CarPlay's current idx6 @1.4mi; monotonic 3→10; depart=len-4 [0,1], arrival=len-2 [last].
+   - Fixed to currentManeuverIdx; 3/3 verified, len-4 path byte-identical, never out of bounds across 961 frames.
+   - Live-validated on Carmel routes: Veterans Way / Arbor Dr through City Center, S Guilford, W Carmel.
+   - Also E Main / E 116th and Hazel Dell roundabouts.
+   - Correct exit directions, fine 10° arrows, real-arm grey spokes.
+   - Cursor now tracks CarPlay through every roundabout (V6_FIRED cursor 3→4→5→6→7).
+   - Caveat: iAP2 frequently sends an INCOMPLETE arm list (cp29/30 often report 1-2 arms for 3-4-arm junctions).
+   - So spokes show only the arms present on the wire.
+   - Affected: AppleManeuverPaths.kt (regenerated table + 36-way bucket math), ManeuverComposer.kt (runtime ring/spokes from real arms + Path.op union).
+   - Also Iap2StateParser.kt (len-2 0x000d = current), NavigationStateManager.kt (gate comment), ManeuverComposerTest.kt (real-arm render test).
+
+[138] :: Video pipeline cleanup — removed dead AA frame-cache replay, allocation-free input buffers, IDR-aware pool-drain drop. Analysis-driven.
+   - Deep video-code analysis surfaced six findings; verified by 30 agents (five per finding), all CONFIRMED 5/5.
+   - Finding A: AA frame-cache replay was dead code — start() clears cache before reset()/resume() ever call replayFrameCache().
+   - replayFrameCache() always hit its frameCacheCount==0 early-return; per-frame cacheFrame() arraycopy and ~15MB allocation did nothing.
+   - Real AA recovery is the adapter-side FRAME keyframe request (Intel decoder reset) at session start and background return.
+   - Removed entire subsystem: 7 fields, 4 methods (init/clear/cache/replayFrameCache), 5 call sites, stale docs. File 1202→1036 lines.
+   - findNalOffset retained — still used by extractAndCacheCsd; first-frame skip, scaling mode, keyframe-callback recovery all left intact.
+   - Finding C: decodeFrame() hot path switched deprecated getInputBuffers()[index] to allocation-free getInputBuffer(index) (API 21+, minSdk 29).
+   - Finding D: feedDirect() pool-drain drop (wf==null) was silent and IDR-blind versus the queue-full path.
+   - Now symmetric: increments stagingDropCount, sets stagingOverwriteDetected, reads NAL from source data, counts and logs IDR drops.
+   - Reads getNalType(data, offset, length) from source params — wf is null, so no NPE; fires cooldown-bounded reactive keyframe.
+   - Each of the three modifications confirmed by 3 independent agents (control-flow, adversarial/NPE, syntax) — all CORRECT, 9/9.
+   - Whole-file brace balance verified 172/172; zero dangling frame-cache references; no other methods altered.
+   - Finding B left as-is: AA FRAME at session start and resume is intended preventive Intel decoder reset.
+   - Residual: watchdog-triggered mid-session reset still sends FRAME for AA; rare by design, not addressed this cycle.
+   - Affected: H264Renderer.java.
+
+[139] :: Off-thread CarPlay nav-icon composition — fixes USB-read-thread blocking that corrupted video on gminfo37 at navigation start.
+   - Root cause (logcat + code verified, 3/3 agents): ComposedIconStore.populateFromIap2m composed every maneuver's 512×512 bitmap synchronously on the USB read thread.
+   - That thread also reads video frames; while composing it stops reading, so frames back up and overflow staging on resume.
+   - Per-maneuver render: ~5.7ms on emulator, ~80ms on the saturated Intel Atom (14.1× slower) — measured from four route loads.
+   - Each compose burst blocked video reads ~2s (28 maneuvers); processVideoDirect showed a zero-frame gap, then STAGE[drop] + corruption.
+   - Live-measured Key West→Prudhoe Bay route = 183 maneuvers in one burst → ~14.6s gminfo37 block, past the adapter's ~14s watchdog.
+   - Fix: parse stays inline on read thread (publishes routeData synchronously for onNaviJson); compose+render dispatched to a background worker.
+   - New single daemon thread "IconComposer" at THREAD_PRIORITY_BACKGROUND — yields to video/audio; not parallelized (would starve the saturated Atom worse).
+   - iconByKey cleared on populate so lookup() can't return a stale route's bitmap; worker re-publishes once the new route's icons finish.
+   - lookup() falls back to the static AVD while the background fill is in progress — routeData-based Tier-C state unaffected.
+   - Dedup BEFORE render (was after): work is now O(unique) not O(total) — 183→118 (−35%), 28→15 (−47%).
+   - Supersede via composeGeneration (AtomicLong) under publishLock: a re-route or clear() aborts the in-flight compose and recycles partial bitmaps.
+   - Net on gminfo37: the ~14.6s read-thread block becomes 0; video never stalls regardless of route length.
+   - Roundabout icons unchanged in correctness (same first-wins key); they benefit most as the heaviest renders move off the read thread.
+   - Graphics ops were already off-main-thread; single worker = zero compose concurrency, all Path/Paint function-local. Builds clean, installed versionCode 139.
+   - Affected: ComposedIconStore.kt (parse-inline + background worker + dedup + supersede), CarlinkManager.kt (call-site comment + log text).

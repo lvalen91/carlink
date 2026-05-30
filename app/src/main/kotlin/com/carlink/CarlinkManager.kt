@@ -2524,15 +2524,16 @@ class CarlinkManager(
             }
             (message.payload["_iap2m"] as? String)?.let { iap2m ->
                 logIap2Field("_iap2m", iap2m)
-                // Populate the runtime icon composer cache. Parses the burst into a
-                // List<ManeuverData> and pre-composes every maneuver's bitmap up front;
-                // per-step events later call ComposedIconStore.lookup with zero compose
-                // latency. Gated by ComposedIconStore.enabled — when off, lookup returns
-                // null and the existing static-XML / AA-bitmap paths handle the cluster
-                // icon. See app/src/main/kotlin/com/carlink/navigation/compose/.
-                val composed = com.carlink.navigation.compose.ComposedIconStore.populateFromIap2m(iap2m)
-                if (composed != null) {
-                    logInfo("[NAVI_JSON_RX] Composer populated $composed maneuver icons", tag = Logger.Tags.NAVI)
+                // Populate the runtime icon composer cache. Parses the burst synchronously
+                // (cheap) on this USB read thread, then dispatches the per-maneuver
+                // compose+render to a background worker so it never blocks video reads.
+                // Per-step events later call ComposedIconStore.lookup (static fallback until
+                // the background fill completes). Gated by ComposedIconStore.enabled — when
+                // off, lookup returns null and the static-XML / AA-bitmap paths handle the
+                // cluster icon. See app/src/main/kotlin/com/carlink/navigation/compose/.
+                val dispatched = com.carlink.navigation.compose.ComposedIconStore.populateFromIap2m(iap2m)
+                if (dispatched != null) {
+                    logInfo("[NAVI_JSON_RX] Composer dispatched $dispatched maneuvers for background compose", tag = Logger.Tags.NAVI)
                 }
             }
             // NOTE: getClusterNavigationSync() is read at message time, NOT cached —
