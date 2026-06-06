@@ -284,6 +284,34 @@ object ManeuverMapper {
         return exitNumber
     }
 
+    /**
+     * Convert a driver-relative iAP2/AA exit angle into the androidx swept-angle convention
+     * expected by [Maneuver.Builder.setRoundaboutExitAngle].
+     *
+     * Source angle (iAP2 `0x000b JunctionElementExitAngle`, or AA `NaviTurnAngle`) is
+     * driver-relative signed degrees: 0=straight, +90=right, −90=left, ±180=back. Templates
+     * Host buckets the SWEPT angle instead (≈180=straight, ≈0/360=u-turn). Per
+     * `documents/reference/gminfo/projection/cluster_maneuver_mapping.md` §3:
+     *   - CCW (right-side driving, e.g. US): androidx = (180 − iap2) mod 360
+     *   - CW  (left-side driving,  e.g. UK): androidx = (180 + iap2) mod 360
+     *   - a result of 0 maps to 360 (Builder accepts [1,360]).
+     *
+     * [derived — validate on-vehicle]. CW vs CCW is picked from drive side exactly as
+     * [mapManeuverType] picks the roundabout rotation (isLeftDrive ⇒ CW).
+     */
+    fun roundaboutExitAngleAndroidx(
+        exitAngle: Int,
+        isLeftDrive: Boolean,
+    ): Int {
+        val swept =
+            if (isLeftDrive) {
+                Math.floorMod(180 + exitAngle, 360)
+            } else {
+                Math.floorMod(180 - exitAngle, 360)
+            }
+        return if (swept == 0) 360 else swept
+    }
+
     /** Evict maneuver cache on disconnect or icon change. */
     fun clearCache() {
         maneuverCache.clear()
@@ -313,9 +341,10 @@ object ManeuverMapper {
                 turnSide = state.turnSide,
                 context = context,
                 composedIcon = composed,
+                exitAngle = state.exitAngle,
             )
         }
-        return buildManeuverForType(state.maneuverType, state.turnSide, context)
+        return buildManeuverForType(state.maneuverType, state.turnSide, context, exitAngle = state.exitAngle)
     }
 
     /**
@@ -323,12 +352,19 @@ object ManeuverMapper {
      *
      * Used by [TripBuilder] for the next-step maneuver where the fields come from
      * [NavigationState.nextManeuverType] rather than the current state.
+     *
+     * @param exitAngle optional driver-relative roundabout exit angle (iAP2 `0x000b` for
+     *   CarPlay, `NaviTurnAngle` for AA). When present on an ENTER_AND_EXIT roundabout it
+     *   upgrades the Maneuver to the directional `..._WITH_ANGLE` type so Templates Host can
+     *   bucket a directional roundabout glyph on VCUNH1 (see [roundaboutExitAngleAndroidx] and
+     *   the mapping doc §3/§5). Null ⇒ existing plain ENTER_AND_EXIT + exit number (no change).
      */
     fun buildManeuverForType(
         cpType: Int,
         turnSide: Int,
         context: Context,
         composedIcon: android.graphics.Bitmap? = null,
+        exitAngle: Int? = null,
     ): Maneuver {
         // Priority: composed (D16, CarPlay+composer enabled) > AA pre-rendered (Android Auto)
         //         > static VectorDrawable (everything else).
@@ -337,10 +373,30 @@ object ManeuverMapper {
                 ?: NavigationStateManager.currentManeuverIcon
                     ?.takeIf { NavigationStateManager.canUseAaManeuverIcon() }
         val aaIconHash = aaIcon?.let { System.identityHashCode(it) } ?: 0
+
+        // Roundabout WITH_ANGLE refinement (mapping doc §3/§5): when an ENTER_AND_EXIT
+        // roundabout (cpType 28-46, the same range [mapManeuverType] maps to ENTER_AND_EXIT)
+        // carries an exit angle, convert it to the androidx swept angle and (below) upgrade the
+        // Maneuver TYPE to the directional `..._WITH_ANGLE` variant. Computed here (not just at
+        // build time) because the same cpType can resolve to different angles across roundabouts,
+        // so the swept angle MUST be part of the cache key or a stale non-angle / wrong-angle
+        // Maneuver could be returned. Non-roundabout maneuvers and angle-less roundabouts leave
+        // this null → unchanged behavior. Range test mirrors [mapManeuverType] so the early
+        // mapManeuverType() call (and its log side-effects) stays on the cache-miss path only.
+        val androidxAngle =
+            if (cpType in 28..46 && exitAngle != null) {
+                roundaboutExitAngleAndroidx(exitAngle, isLeftDrive = turnSide == 1)
+            } else {
+                null
+            }
+
         // Composed bitmaps participate in the same cacheKey scheme so the maneuver cache
         // doesn't return a stale Maneuver built from the wrong icon source.
         val composedFlag = if (composedIcon != null) 2 else 0
-        val cacheKey = (cpType shl 16) or (turnSide shl 8) or (if (aaIcon != null) 1 else 0) or composedFlag
+        // androidxAngle (1..360) occupies the high bits; cpType (0-53) bits 16-21; turnSide
+        // bit 8; icon-source flags bits 0-1. 360 shl 22 stays within Int range.
+        val angleKey = (androidxAngle ?: 0) shl 22
+        val cacheKey = angleKey or (cpType shl 16) or (turnSide shl 8) or (if (aaIcon != null) 1 else 0) or composedFlag
 
         maneuverCache[cacheKey]?.let { cached ->
             if (aaIcon == null || aaIconHash == lastCachedAaIconHash) {
@@ -356,11 +412,27 @@ object ManeuverMapper {
         // Icon source depends on protocol (see class KDoc for the full rationale):
         //   AA      -> adapter-forwarded NAVI_IMAGE bitmap (Google Maps pre-rendered)
         //   CarPlay -> static VectorDrawable resource icons (stable IPC hashing)
-        val type = mapManeuverType(cpType, turnSide)
+        val baseType = mapManeuverType(cpType, turnSide)
+        // Upgrade to the directional `..._WITH_ANGLE` type only when we resolved a swept angle
+        // for an ENTER_AND_EXIT roundabout; otherwise keep the base type unchanged.
+        val type =
+            when {
+                androidxAngle == null -> baseType
+                baseType == Maneuver.TYPE_ROUNDABOUT_ENTER_AND_EXIT_CW ->
+                    Maneuver.TYPE_ROUNDABOUT_ENTER_AND_EXIT_CW_WITH_ANGLE
+                else -> Maneuver.TYPE_ROUNDABOUT_ENTER_AND_EXIT_CCW_WITH_ANGLE
+            }
         val builder = Maneuver.Builder(type)
 
+        // Exit number stays for the gminfo3.7 bitmap/compose path; it remains valid on the
+        // WITH_ANGLE types too (androidx allows both number and angle there).
         getRoundaboutExitNumber(cpType)?.let {
             builder.setRoundaboutExitNumber(it)
+        }
+        // setRoundaboutExitAngle is REQUIRED by the Builder for `..._WITH_ANGLE` types, and
+        // androidxAngle is non-null exactly when [type] is a WITH_ANGLE variant.
+        androidxAngle?.let {
+            builder.setRoundaboutExitAngle(it)
         }
 
         val icon: CarIcon

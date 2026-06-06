@@ -19,6 +19,8 @@ This directory documents the phone projection systems on GM Info 3.7: native Car
 
 - **[cpc200_integration.md](cpc200_integration.md)** -- CPC200-CCPA wireless CarPlay/Android Auto adapter integration with GM Info 3.7. USB protocol, video/audio pipeline, device enumeration, session lifecycle, and adapter-specific behavior.
 
+- **[cluster_maneuver_mapping.md](cluster_maneuver_mapping.md)** -- End-to-end maneuver-icon mapping table: iAP2/AA cpManeuverType (+ exit angle) → carlink `Maneuver.TYPE_*` → Templates Host `NavigationState.Type` (incl. WITH_ANGLE roundabout buckets) → VMSPlugin `TurnType` → GM cluster glyph. Covers gminfo3.7 (bitmap via shim) vs VCUNH1 (enum-only, QNX Altia sprite), the iAP2→androidx angle conversion, and the directional-only roundabout ceiling.
+
 ---
 
 ## Quick Comparison

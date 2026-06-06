@@ -37,6 +37,11 @@ data class NavigationState(
     val turnSide: Int = 0, // 0=right-hand driving, 1=left-hand driving
     val junctionType: Int = 0, // 0=intersection, 1=roundabout
     val roundaboutExit: Int = 0, // NaviRoundaboutExit (1-19, 0=not roundabout)
+    // Driver-relative roundabout exit angle (iAP2 0x000b for CarPlay, NaviTurnAngle for AA),
+    // signed degrees. Null when unavailable — drives the directional `..._WITH_ANGLE` Maneuver
+    // for the VCUNH1 cluster (see ManeuverMapper.roundaboutExitAngleAndroidx). Distinct from
+    // [turnAngle]: nullable so "absent" is not confused with a genuine 0° (straight) exit.
+    val exitAngle: Int? = null,
     // Next-step fields — from firmware double-maneuver burst
     val nextManeuverType: Int? = null,
     val nextOrderType: Int? = null,
@@ -44,6 +49,7 @@ data class NavigationState(
     val nextTurnAngle: Int? = null,
     val nextJunctionType: Int? = null,
     val nextRoundaboutExit: Int? = null,
+    val nextExitAngle: Int? = null,
 ) {
     val isActive: Boolean get() = status == 1
     val isIdle: Boolean get() = status == 0
@@ -151,6 +157,16 @@ object NavigationStateManager {
     private var isClusterIconProviderAvailable: Boolean? = null
 
     /**
+     * True on the GM VCU/VCUNH1 (CT5, AAOS 14) cluster, where the QNX safety-domain VM renders a
+     * native Altia sprite from the Maneuver enum and MASKS the app bitmap/URI. When set, the
+     * AA-bitmap cluster-icon path is dead, so [canUseAaManeuverIcon] returns false and any pending
+     * icon is dropped. Set once from [com.carlink.CarlinkManager] init via [setClusterEnumOnly].
+     * BEST-EFFORT / UNTESTED — keyed on [com.carlink.platform.PlatformDetector.PlatformInfo.isVcuCluster].
+     */
+    @Volatile
+    private var clusterEnumOnly: Boolean = false
+
+    /**
      * Resolve whether Templates Host's ClusterIconContentProvider authority is actually
      * available to this app. Play builds cannot ship our shim with that authority, so AA
      * bitmap icons must be disabled when the authority cannot be resolved at runtime.
@@ -199,8 +215,18 @@ object NavigationStateManager {
         }
     }
 
-    /** True unless we have explicitly confirmed the provider is unavailable. */
-    fun canUseAaManeuverIcon(): Boolean = isClusterIconProviderAvailable != false
+    /**
+     * Declare whether this is an enum-only cluster (VCU/VCUNH1) where app maneuver bitmaps are
+     * masked. Called once from [com.carlink.CarlinkManager] init. Drops any current icon so the
+     * dead AA-bitmap path goes inert immediately.
+     */
+    fun setClusterEnumOnly(value: Boolean) {
+        clusterEnumOnly = value
+        if (value) dropCurrentManeuverIcon()
+    }
+
+    /** True unless this is an enum-only cluster OR we confirmed the provider is unavailable. */
+    fun canUseAaManeuverIcon(): Boolean = !clusterEnumOnly && isClusterIconProviderAvailable != false
 
     private fun dropCurrentManeuverIcon() {
         val hadIcon = currentManeuverIcon != null || currentIconHash != 0
@@ -334,6 +360,8 @@ object NavigationStateManager {
                     nextTurnAngle = (payload["NaviTurnAngle"] as? Number)?.toInt(),
                     nextJunctionType = (payload["NaviJunctionType"] as? Number)?.toInt(),
                     nextRoundaboutExit = (payload["NaviRoundaboutExit"] as? Number)?.toInt(),
+                    // AA roundabout exit angle for the previewed next maneuver (NaviTurnAngle).
+                    nextExitAngle = (payload["NaviTurnAngle"] as? Number)?.toInt(),
                 )
 
             logInfo(
@@ -406,12 +434,15 @@ object NavigationStateManager {
                 turnSide = (payload["NaviTurnSide"] as? Number)?.toInt() ?: current.turnSide,
                 junctionType = (payload["NaviJunctionType"] as? Number)?.toInt() ?: current.junctionType,
                 roundaboutExit = (payload["NaviRoundaboutExit"] as? Number)?.toInt() ?: current.roundaboutExit,
+                // CarPlay roundabout exit angle straight from the route plan's iAP2 0x000b field.
+                exitAngle = routeStep.exitAngle,
                 nextManeuverType = nextStep?.cpManeuverType,
                 nextOrderType = null,
                 nextRoadName = nextStep?.instructionText?.takeIf { it.isNotEmpty() } ?: nextStep?.postManeuverRoadName,
                 nextTurnAngle = null,
                 nextJunctionType = null,
                 nextRoundaboutExit = null,
+                nextExitAngle = nextStep?.exitAngle,
             )
             logNavi {
                 "[NAVI] V6_FIRED cursor=$localCursor/${routeV6.maneuvers.size}, maneuver=${mergedV6.maneuverType}, " +
@@ -535,12 +566,15 @@ object NavigationStateManager {
                     turnSide = (payload["NaviTurnSide"] as? Number)?.toInt() ?: current.turnSide,
                     junctionType = (payload["NaviJunctionType"] as? Number)?.toInt() ?: current.junctionType,
                     roundaboutExit = (payload["NaviRoundaboutExit"] as? Number)?.toInt() ?: current.roundaboutExit,
+                    // CarPlay roundabout exit angle straight from the route plan's iAP2 0x000b field.
+                    exitAngle = routeStep.exitAngle,
                     nextManeuverType = nextStep?.cpManeuverType,
                     nextOrderType = null,
                     nextRoadName = nextStep?.instructionText?.takeIf { it.isNotEmpty() } ?: nextStep?.postManeuverRoadName,
                     nextTurnAngle = null,
                     nextJunctionType = null,
                     nextRoundaboutExit = null,
+                    nextExitAngle = nextStep?.exitAngle,
                 )
                 logNavi {
                     "[NAVI] Tier C state: cursor=$localCursor, maneuver=${mergedTierC.maneuverType}, road=${mergedTierC.roadName}, " +
@@ -572,6 +606,9 @@ object NavigationStateManager {
                 turnSide = (payload["NaviTurnSide"] as? Number)?.toInt() ?: current.turnSide,
                 junctionType = (payload["NaviJunctionType"] as? Number)?.toInt() ?: current.junctionType,
                 roundaboutExit = (payload["NaviRoundaboutExit"] as? Number)?.toInt() ?: current.roundaboutExit,
+                // AA / non-route path: roundabout exit angle is NaviTurnAngle when present (same
+                // driver-relative convention). Nullable so absent ≠ a genuine 0° (straight) exit.
+                exitAngle = (payload["NaviTurnAngle"] as? Number)?.toInt() ?: current.exitAngle,
                 // Clear next-step on normal maneuver transition — previous preview is stale.
                 // Distance-only updates (no NaviManeuverType) preserve existing next-step.
                 nextManeuverType = if (isManeuverMessage) null else current.nextManeuverType,
@@ -580,6 +617,7 @@ object NavigationStateManager {
                 nextTurnAngle = if (isManeuverMessage) null else current.nextTurnAngle,
                 nextJunctionType = if (isManeuverMessage) null else current.nextJunctionType,
                 nextRoundaboutExit = if (isManeuverMessage) null else current.nextRoundaboutExit,
+                nextExitAngle = if (isManeuverMessage) null else current.nextExitAngle,
             )
 
         if (isManeuverMessage && current.hasNextStep) {

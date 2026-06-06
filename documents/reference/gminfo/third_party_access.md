@@ -436,6 +436,48 @@ Third-party apps are sandboxed as `untrusted_app` and can only access:
 
 ---
 
+## Exported Components & Open Content-Provider Hooks (firmware-verified 2026-06-06)
+
+Enumerated by extracting all 259 system+product APK manifests from Silverado Y181 (module
+86331654=system, 86331636=product) and cross-checked against CT5/AAOS 14 (`Radio-IVE-86384258`).
+These are reachable by an unprivileged third-party app. Two classes: **orphaned authorities**
+(referenced-but-unregistered → a 3P app can *claim* them) and **exported-no-permission**
+components (a 3P app can *bind/read/write/spoof* them).
+
+### Orphaned / claimable ContentProvider authority
+
+| Authority | Owner (references it) | State | Notes |
+|---|---|---|---|
+| `com.google.android.apps.automotive.templates.host.ClusterIconContentProvider` | GoogleTemplatesHost (`com.google.android.apps.automotive.templates.host`) | **Referenced in code, registered in NO manifest** (both gminfo37 AND CT5) | Authority computed as `getPackageName()+".ClusterIconContentProvider"`; the host's prebuilt omits the `<provider>`. Any 3P app may declare it. On gminfo37 this delivers cluster maneuver icons (carlink's `ClusterIconShimProvider`); on CT5 it is open but bypassed by VMSPlugin enum forcing (see `projection/cluster_navigation.md`). Bidirectional risk: exfiltrate maneuver-icon bitmaps passed to `insert()`, or inject images via `query→contentUri→openFile`. |
+
+No other referenced-but-unregistered authority surfaced.
+
+### Exported `<provider>` with no/weak permission (registered, so NOT claimable — but readable/writable)
+
+| Provider | Package | Authority | Notes |
+|---|---|---|---|
+| `MapsContentProvider` | `com.gm.vmsplugin` (system uid, priv-app) | `google_maps_settings;google_maps_assisted_driving` (CT5 also `google_maps_vehicle_profile`) | **Highest interest** — system-uid, exported, fully unprotected; exposes the Maps↔cluster settings / assisted-driving bridge. |
+| `NavStateImageProvider` | `com.google.android.apps.maps` | `com.google.android.apps.maps.car` | Google's own nav-state image provider, exported/no-perm. |
+| `FavoritesContentProvider` | `com.gm.favoritesprovider` | `com.gm.favoritesprovider` | Destinations/favorites store. |
+| `DbContentProvider` | `com.gm.hmianalytics` | analytics DB | |
+| `DeviceConnectionProvider` | `com.gm.ddb_contentprovider` | device-connection state | |
+| `RseProvider` | `com.gm.rsicc` | `com.lge.rseprovider` | |
+
+**NOT open:** `com.gm.gtbt.maneuver.provider` (`ManeuversContentProvider`) and `com.gm.tbt.commonprovider` declare no `android:exported` → default `false` (closed).
+
+### Exported `<service>` / `<receiver>` with no permission (nav / cluster / OnStar / media)
+
+- **`NavigationClusterService`** (`com.gm.domain.server.delayed`, `DelayedWKSApp`) — exported, no perm; directly named cluster-nav service, bindable by any app. Its `ServiceReadyBroadcastReceiver` is also exported/no-perm.
+- **GMRHMIService** (`com.gm.rhmi`): `PhoneClusterPresentationService`, `AudioClusterPresentationService`, `ClusterPresentationBroadCastReceiver` — exported/no-perm; cluster presentation surface bindable/spoofable.
+- **`com.gm.onstar.RESUME`** broadcast → `PauseResumeReceiver` in GMOnStarTBT (`com.gm.hmi.onstar`) — exported/no-perm; any app can pause/resume turn-by-turn guidance.
+- **GMOnStar** (`com.gm.hmi.onstarui`): `OnStarMessageReceiver`/`ButtonReceiver`/`OnStarCallReceiver`/etc. + `OnStarCallService`/`AIFService` — exported/no-perm; OnStar call/button events injectable.
+- **Media browser services, exported (by design) with no permission gate:** `com.gm.gmaudio.server` (`AudioMediaBrowserService`, `MediaSourceBrowserService`, …), `com.gm.domain.server.delayed` (`GmCarMediaService`, `LocalMediaBrowserService`, `CarPlayMediaService`, …), AOSP `CarMediaApp.MediaConnectorService`, Bluetooth `BluetoothMediaBrowserService`.
+- **`com.onstar.vttproxyserver`**: `VehicleServerService` + `WebServerService` — exported/no-perm in-vehicle web/vehicle proxy (notable attack surface).
+
+> CT5/AAOS 14 mirrors the same `ClusterIconContentProvider` orphan and the same `MapsContentProvider` / `NavStateImageProvider` exposure. See `projection/cluster_navigation.md` (2026-06-06 firmware-verified block). Extraction artifacts: `/Users/zeno/Downloads/misc/GM_research/gm_aaos/_cluster_authority_analysis/`.
+
+---
+
 ## Data Sources
 
 **SELinux Policy Analysis:**

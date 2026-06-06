@@ -57,6 +57,8 @@ object PlatformDetector {
      * @property manufacturer Device manufacturer string
      * @property product Device product string
      * @property device Device name string
+     * @property buildId Build fingerprint id (Build.ID). On the GM VCU/VCUNH1 platform this
+     *   carries the "VCU" family prefix (CT5 firmware: "VCUUM-371.5"); used by [isVcuCluster].
      * @property isBroxton True if Build.BOARD/HARDWARE/PRODUCT contains "broxton".
      *   EMPIRICALLY FALSE on gminfo37 (POTATO 2026-04-20 "Broxton platform: false" despite
      *   gminfo37 being Apollo Lake — GM does not publish the SoC codename at Build level).
@@ -77,6 +79,7 @@ object PlatformDetector {
         val manufacturer: String,
         val product: String,
         val device: String,
+        val buildId: String = "",
         val isBroxton: Boolean = false,
         val displayWidth: Int = 0,
         val displayHeight: Int = 0,
@@ -106,6 +109,31 @@ object PlatformDetector {
         fun requiresImmersiveDefaults(): Boolean = isGmInfo37() || isAaosEmulator()
 
         /**
+         * Returns true on the GM VCU / VCUNH1 (Bosch, AAOS 14) platform — e.g. the 2026 CT5.
+         *
+         * On VCUNH1 the instrument cluster is driven by a separate QNX safety-domain VM that
+         * renders a native GM Altia sprite chosen from the `Maneuver.TYPE_*` enum; the app-side
+         * maneuver bitmap / CarIcon URI is MASKED and never reaches the cluster (see
+         * `documents/reference/gminfo/projection/cluster_maneuver_mapping.md` §0/§4). So on this
+         * platform the per-maneuver bitmap compose ([com.carlink.navigation.compose.ComposedIconStore] /
+         * IconBitmapRenderer) and the AA-bitmap cluster-icon shim are pure wasted work — callers
+         * use this to skip them while keeping the enum/angle lever (the only thing that matters here).
+         *
+         * Detection signature (BEST-EFFORT / UNTESTED — no VCUNH1 hardware on hand) derived from the
+         * CT5 `Radio-IVE-86384258-AAOS14-UQBM` build.prop:
+         *   ro.product.{system,vendor}.device = "burmese"
+         *   ro.product.{system,vendor}.name   = "burmese_orange"
+         *   ro.build.id / ro.vendor.build.id  = "VCUUM-371.5"   (the "VCU" family prefix)
+         *   ro.product.board / ro.board.platform = "msmnile"     (shared SoC — NOT keyed on)
+         * gminfo37 (Silverado) reports device="gminfo37" / product="full_gminfo37_gb" and Build.ID
+         * without the VCU prefix, so it does NOT match here — gminfo3.7 behavior is unaffected.
+         */
+        fun isVcuCluster(): Boolean =
+            device.equals("burmese", ignoreCase = true) ||
+                product.contains("burmese", ignoreCase = true) ||
+                buildId.startsWith("VCU", ignoreCase = true)
+
+        /**
          * Returns true if Intel-specific MediaCodec fixes should be applied.
          * Requires BOTH Intel architecture AND Intel codec presence.
          * ARM-based GM AAOS devices will return false.
@@ -122,7 +150,8 @@ object PlatformDetector {
         override fun toString(): String =
             "PlatformInfo(arch=$cpuArch, intel=$isIntel, gm=$isGmAaos, " +
                 "hwDecoder=${hardwareH264DecoderName ?: "software"}, " +
-                "nativeRate=${nativeSampleRate}Hz, mfr=$manufacturer, product=$product, device=$device)"
+                "nativeRate=${nativeSampleRate}Hz, mfr=$manufacturer, product=$product, device=$device, " +
+                "buildId=$buildId, vcu=${isVcuCluster()})"
     }
 
     /**
@@ -140,6 +169,7 @@ object PlatformDetector {
         val device = Build.DEVICE ?: ""
         val board = Build.BOARD ?: ""
         val hardware = Build.HARDWARE ?: ""
+        val buildId = Build.ID ?: ""
 
         val isGmAaos = detectGmAaos(manufacturer, product, device)
         val (_, hardwareH264DecoderName) = detectHardwareH264Decoder()
@@ -167,6 +197,7 @@ object PlatformDetector {
                 manufacturer = manufacturer,
                 product = product,
                 device = device,
+                buildId = buildId,
                 isBroxton = isBroxton,
                 displayWidth = displayWidth,
                 displayHeight = displayHeight,

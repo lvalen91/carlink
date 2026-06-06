@@ -62,6 +62,7 @@ object TripBuilder {
                     state.nextManeuverType!!,
                     state.turnSide,
                     context,
+                    exitAngle = state.nextExitAngle,
                 )
             val nextStepBuilder = Step.Builder()
             nextStepBuilder.setManeuver(nextManeuver)

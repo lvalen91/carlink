@@ -629,3 +629,15 @@
    - Now tier=1080x1920 aaSize=1080x1440 cropTop=240; surface oversized 1440x2560, clipped to fill display at correct AR.
    - Horizontal-crop (cropLeft) path implemented but not yet hardware-validated; needs a portrait display taller than 9:16.
    - Affected: MessageSerializer.kt, CarlinkManager.kt, MainScreen.kt.
+
+[141] :: Cluster maneuver mapping — WITH_ANGLE roundabouts, VCU platform-gate for dead bitmap work, firmware-verified CT5 cluster pipeline.
+   - ManeuverMapper roundabouts now use TYPE_ROUNDABOUT_ENTER_AND_EXIT_*_WITH_ANGLE + setRoundaboutExitAngle from iAP2 0x000b / AA NaviTurnAngle.
+   - iAP2 driver-relative exit angle converted to androidx swept-angle: CCW=(180-a)mod360, CW=(180+a)mod360, 0 maps to 360.
+   - PlatformDetector.isVcuCluster() detects VCU (device burmese / Build.ID prefix VCU); best-effort, untested, no VCUNH1 hardware.
+   - On VCU, ComposedIconStore bitmap compose and the AA cluster-icon shim are skipped; both are masked there anyway.
+   - Firmware-verified (4-agent OS-image sweep): CT5 cluster rendered by QNX HMIC (Altia GMModel), Android blind to pixels.
+   - Handoff is enum-only over inter-VM Automotive Ethernet (NFSA/FSA); no bitmap/URI consumer exists on the CT5 cluster path.
+   - CT5 Altia atlas lacks directional roundabout glyphs, so WITH_ANGLE has no visible CT5 effect; kept for gminfo37-neutral correctness.
+   - Non-roundabout maneuvers already render correct GM glyphs; rich-iAP2 cluster improvement is gminfo3.7-only.
+   - gminfo3.7 behavior unchanged; assembleSideloadDebug and ktlintCheck pass.
+   - Affected: ManeuverMapper.kt, NavigationStateManager.kt, TripBuilder.kt, PlatformDetector.kt, ComposedIconStore.kt, CarlinkManager.kt.

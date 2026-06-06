@@ -9,15 +9,22 @@ android {
     namespace = "com.carlink"
     compileSdk = 36
 
+    // Owner identity for the cluster icon ContentProvider hook (issue #6).
+    // A FORK changes ONLY ownerApplicationId below — applicationId and the play-flavor
+    // cluster icon authority both follow it automatically.
+    val ownerApplicationId = "zeno.carlink"
+    val gmClusterIconAuthority =
+        "com.google.android.apps.automotive.templates.host.ClusterIconContentProvider"
+
 //###############################################
 //###############################################
 //###############################################
 
     defaultConfig {
-        applicationId = "zeno.carlink"
+        applicationId = ownerApplicationId
         minSdk = 29
         targetSdk = 36
-        versionCode = 140
+        versionCode = 141
         versionName = "1.0.0"
 
 //###############################################
@@ -41,37 +48,53 @@ android {
         }
     }
 
-    // Distribution split:
-    //   sideload → APK only (Play Console rejects apps that claim Templates Host's
-    //              ClusterIconContentProvider authority globally). Shim claims the
-    //              GM authority so Templates Host icon delivery works on-device.
-    //   play     → AAB upload to Play Store. Shim is registered under an
-    //              applicationId-suffixed authority to avoid the Play Console
-    //              "content provider authority in use by other developers" rejection
-    //              (issue #6). Templates Host's calls to the GM authority go nowhere
-    //              on Play installs; NavigationStateManager.initialize() detects this
-    //              at runtime and falls back to type-based maneuver icons.
+    // Distribution split (cluster icon ContentProvider authority — issue #6):
+    //   NOTE: this hook only renders icons on the gminfo3.7 platform (Info 3.7, AAOS 12).
+    //   The authority is orphaned/claimable on the GM VCU platform too (Bosch VCUNH1, EV/newer-ICE
+    //   on AAOS 14 — same unmodified Google Templates Host, firmware-verified), but there it is
+    //   BYPASSED: GM's VMSPlugin force-renders the cluster glyph from a maneuver-type enum
+    //   (setManeuverType), so the app bitmap is masked regardless — the shim is futile on VCUNH1.
+    //   See documents/reference/gminfo/projection/cluster_navigation.md (2026-06-06 firmware-verified).
+    //   sideload → APK, installed directly on the head unit and never uploaded to Play,
+    //              so the Play Console authority-uniqueness check never applies. Always
+    //              claims GM's Templates Host ClusterIconContentProvider authority, so the
+    //              GM hook works on-device for anyone (owner or fork).
+    //   play     → AAB for the Play Store. The OWNER (first publisher to claim the GM
+    //              authority) keeps the GM literal — Google accepts it, and GM AAOS, which
+    //              only ever calls that authority, delivers the maneuver bitmaps to the
+    //              cluster. A FORK (any other applicationId) automatically falls back to an
+    //              applicationId-derived authority so its bundle passes the Play Console
+    //              "authority in use by other developers" check. GM never calls that
+    //              derived authority, so a fork's Play build gets no maneuver icons in the
+    //              cluster — it shows text navigation only. The GM hook is permanently
+    //              fork-unavailable on Play; only the first claimant can own it.
+    //              NavigationStateManager.initialize() probes the GM literal at runtime and,
+    //              when it isn't claimable, the cluster falls back to text-only navigation
+    //              (no icons) — so the probe must stay the GM literal, NOT this per-flavor value.
     flavorDimensions += "distribution"
 
     productFlavors {
         create("sideload") {
             dimension = "distribution"
-            manifestPlaceholders["clusterIconAuthority"] =
-                "com.google.android.apps.automotive.templates.host.ClusterIconContentProvider"
+            manifestPlaceholders["clusterIconAuthority"] = gmClusterIconAuthority
             buildConfigField(
                 "String",
                 "CLUSTER_ICON_AUTHORITY",
-                "\"com.google.android.apps.automotive.templates.host.ClusterIconContentProvider\""
+                "\"$gmClusterIconAuthority\""
             )
         }
         create("play") {
             dimension = "distribution"
-            manifestPlaceholders["clusterIconAuthority"] =
-                "zeno.carlink.ClusterIconContentProvider"
+            // Owner → GM literal (icons render on the owner's Play app). Fork → its own
+            // applicationId-derived authority (uploads, but renders type-based icons).
+            val playClusterIconAuthority =
+                if (ownerApplicationId == "zeno.carlink") gmClusterIconAuthority
+                else "$ownerApplicationId.ClusterIconContentProvider"
+            manifestPlaceholders["clusterIconAuthority"] = playClusterIconAuthority
             buildConfigField(
                 "String",
                 "CLUSTER_ICON_AUTHORITY",
-                "\"zeno.carlink.ClusterIconContentProvider\""
+                "\"$playClusterIconAuthority\""
             )
         }
     }

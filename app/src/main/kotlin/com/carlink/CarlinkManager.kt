@@ -123,6 +123,18 @@ class CarlinkManager(
         // override pipeline. Validation pathway: PNGs written by ManeuverIconDebugDumper
         // continue regardless of this flag.
         com.carlink.navigation.compose.ComposedIconStore.setEnabled(true)
+
+        // VCU/VCUNH1 (CT5, AAOS 14) enum-only cluster gate. There the cluster is a separate QNX
+        // safety-domain VM that renders a native Altia sprite from the Maneuver enum and MASKS the
+        // app bitmap/URI (see documents/reference/gminfo/projection/cluster_maneuver_mapping.md §0/§4).
+        // The roundabout WITH_ANGLE refinement (ManeuverMapper) still feeds that enum, but the
+        // per-maneuver bitmap compose and the AA-bitmap shim are dead work there — skip both.
+        // BEST-EFFORT / UNTESTED detection (no VCUNH1 hardware); harmless elsewhere (default off).
+        val clusterIsEnumOnly = PlatformDetector.detect(context).isVcuCluster()
+        if (clusterIsEnumOnly) {
+            com.carlink.navigation.compose.ComposedIconStore.setBitmapComposeEnabled(false)
+            NavigationStateManager.setClusterEnumOnly(true)
+        }
     }
 
     // Config can be updated when actual surface dimensions are known

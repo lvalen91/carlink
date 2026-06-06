@@ -77,6 +77,24 @@ object ComposedIconStore {
         }
     }
 
+    /**
+     * When false, [populateFromIap2m] still parses + publishes [routeData] (the Tier C cursor in
+     * NavigationStateManager needs [currentRoute]) but SKIPS the expensive per-maneuver
+     * compose+render. Set false on the GM VCU/VCUNH1 enum-only cluster, where the cluster renders a
+     * native Altia sprite from the Maneuver enum and the app bitmap is masked — so building bitmaps
+     * is pure wasted CPU there. Default true (gminfo3.7 + everything else keep the bitmap path).
+     */
+    @Volatile
+    var bitmapComposeEnabled: Boolean = true
+        private set
+
+    fun setBitmapComposeEnabled(value: Boolean) {
+        if (bitmapComposeEnabled != value) {
+            bitmapComposeEnabled = value
+            logInfo("[COMPOSER] bitmapComposeEnabled=$value", tag = Logger.Tags.NAVI)
+        }
+    }
+
     /** Optional sink for writing each composed bitmap to disk as a debug PNG. */
     @Volatile
     var debugSink: ((Iap2ManeuverData, Bitmap) -> Unit)? = null
@@ -145,6 +163,18 @@ object ComposedIconStore {
             routeData = parsed
             iconByKey = emptyMap()
             cursorIndex = 0
+        }
+
+        // Skip the per-maneuver bitmap compose+render on enum-only clusters (VCU/VCUNH1) — the
+        // route is still published above for the Tier C cursor, but no bitmap would ever reach the
+        // masked cluster, so the render is wasted work there.
+        if (!bitmapComposeEnabled) {
+            logInfo(
+                "[COMPOSER] Parsed ${parsed.maneuvers.size} maneuvers; bitmap compose SKIPPED " +
+                    "(enum-only cluster, gen=$gen)",
+                tag = Logger.Tags.NAVI,
+            )
+            return parsed.maneuvers.size
         }
 
         val sink = debugSink
