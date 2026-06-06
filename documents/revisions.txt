@@ -15,7 +15,7 @@
 // END EXAMPLE
 //
 // Major changes or discoveries. The appropriate .MD in Project:/Documentation/ should be updated/corrected or created with more technical information.
-//
+//w
 
 [1] :: Initial Release
 [2] :: Permission Prompt not shown, fixed. Ktlint issues corrected. PUSHED:
@@ -616,3 +616,16 @@
    - Roundabout icons unchanged in correctness (same first-wins key); they benefit most as the heaviest renders move off the read thread.
    - Graphics ops were already off-main-thread; single worker = zero compose concurrency, all Path/Paint function-local. Builds clean, installed versionCode 139.
    - Affected: ComposedIconStore.kt (parse-inline + background worker + dedup + supersede), CarlinkManager.kt (call-site comment + log text).
+
+[140] :: Android Auto portrait + any-AR support — two-way aspect-fit fills every display at native AR, no crop or stretch.
+   - Root: AA tier table was landscape-only; portrait or narrow displays collapsed to a wrong 16:9 tier, cropping content.
+   - Ported AutoKit C0797c0.m6106c two-way fit (macOS client reference): rendered content AR always equals display AR.
+   - The non-binding tier edge shrinks; phone bakes black bars on that axis, host oversizes/clips to remove them.
+   - MessageSerializer.kt: orientation-aware tiers (portrait 480x800, 720x1280, 1080x1920) plus two-way emit binding the constrained edge.
+   - CarlinkManager.kt getAaCropParams now axis-aware: AaCropParams gains contentWidth/cropLeft for left/right bars on tall displays.
+   - MainScreen.kt oversizes width or height by crop axis; touch normalization adds a symmetric cropLeftX offset.
+   - Landscape and CarPlay unchanged: displayAR>=tierAR path identical; CarPlay still uses serializeOpen, untouched.
+   - Live AAOS emulator 1440x1920 portrait with phone: was tier=1280x720 aaSize=1280x720 crop=null (stretched).
+   - Now tier=1080x1920 aaSize=1080x1440 cropTop=240; surface oversized 1440x2560, clipped to fill display at correct AR.
+   - Horizontal-crop (cropLeft) path implemented but not yet hardware-validated; needs a portrait display taller than 9:16.
+   - Affected: MessageSerializer.kt, CarlinkManager.kt, MainScreen.kt.

@@ -383,10 +383,15 @@ object MessageSerializer {
         val actualSyncTime = syncTime ?: (System.currentTimeMillis() / 1000)
 
         // Android Auto H.264 stream resolution selection.
-        // Google AA only supports 3 fixed H.264 resolutions: 800x480, 1280x720, 1920x1080.
-        // androidAutoSizeW = tier width, androidAutoSizeH = content height within the frame.
-        // The phone renders content in a centered band, with black bars filling the rest.
-        // The host SurfaceView is oversized to the tier AR and clipped to remove the bars.
+        // AA supports 3 fixed tiers in BOTH orientations (Google caps at 1080p; AutoKit's
+        // 1440 tier is a non-functional stub). Landscape: 800x480, 1280x720, 1920x1080.
+        // Portrait:  480x800, 720x1280, 1080x1920. Select orientation from the display, then
+        // pick the tier by width.
+        //
+        // Two-way aspect-fit (AutoKit C0797c0.m6106c): the content the phone renders ALWAYS
+        // matches the display AR, so the host fills any display without distortion or content
+        // crop. The non-binding tier edge is reduced and the phone bakes black bars on THAT
+        // axis; the host oversizes/clips that axis to remove them (see getAaCropParams).
         //
         // Use actual surface dims for AR calculation. On AAOS, WindowMetrics (config) may subtract
         // dock/nav insets that Compose's WindowInsets.systemBars doesn't, causing a mismatch.
@@ -396,13 +401,31 @@ object MessageSerializer {
         val displayAR = w.toFloat() / h.toFloat()
 
         val (tierWidth, tierHeight) =
-            when {
-                w >= 1920 -> Pair(1920, 1080)
-                w >= 1280 -> Pair(1280, 720)
-                else -> Pair(800, 480)
+            if (h > w) {
+                when {
+                    w >= 1080 -> Pair(1080, 1920)
+                    w >= 720 -> Pair(720, 1280)
+                    else -> Pair(480, 800)
+                }
+            } else {
+                when {
+                    w >= 1920 -> Pair(1920, 1080)
+                    w >= 1280 -> Pair(1280, 720)
+                    else -> Pair(800, 480)
+                }
             }
-        val aaWidth = tierWidth
-        val aaHeight = ((tierWidth.toFloat() / displayAR).toInt() and 0xFFFE).coerceAtMost(tierHeight)
+        val tierAR = tierWidth.toFloat() / tierHeight.toFloat()
+        val aaWidth: Int
+        val aaHeight: Int
+        if (displayAR >= tierAR) {
+            // Display equal/wider than tier → full tier width, reduced height (bars top/bottom).
+            aaWidth = tierWidth
+            aaHeight = ((tierWidth.toFloat() / displayAR).toInt() and 0xFFFE).coerceAtMost(tierHeight)
+        } else {
+            // Display narrower/taller than tier → full tier height, reduced width (bars left/right).
+            aaHeight = tierHeight
+            aaWidth = ((tierHeight.toFloat() * displayAR).toInt() and 0xFFFE).coerceAtMost(tierWidth)
+        }
         com.carlink.logging.logInfo(
             "[AA_BOXSETTINGS] surface=${w}x$h config=${config.width}x${config.height} " +
                 "displayAR=${"%.3f".format(displayAR)} tier=${tierWidth}x$tierHeight aaSize=${aaWidth}x$aaHeight",

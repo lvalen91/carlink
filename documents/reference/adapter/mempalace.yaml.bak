@@ -1,0 +1,10 @@
+wing: adapter
+rooms:
+- name: re_documention
+  description: Files from RE_Documention/
+  keywords:
+  - re_documention
+  - re_documention
+- name: general
+  description: Files that don't fit other rooms
+  keywords: []

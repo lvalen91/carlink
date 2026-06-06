@@ -278,7 +278,9 @@ class CarlinkManager(
     data class AaCropParams(
         val tierWidth: Int,
         val tierHeight: Int,
+        val contentWidth: Int,
         val contentHeight: Int,
+        val cropLeft: Int,
         val cropTop: Int,
     )
 
@@ -1409,16 +1411,32 @@ class CarlinkManager(
         if (surfW <= 0 || surfH <= 0) return null
 
         val (tierWidth, tierHeight) =
-            when {
-                surfW >= 1920 -> Pair(1920, 1080)
-                surfW >= 1280 -> Pair(1280, 720)
-                else -> Pair(800, 480)
+            if (surfH > surfW) {
+                when {
+                    surfW >= 1080 -> Pair(1080, 1920)
+                    surfW >= 720 -> Pair(720, 1280)
+                    else -> Pair(480, 800)
+                }
+            } else {
+                when {
+                    surfW >= 1920 -> Pair(1920, 1080)
+                    surfW >= 1280 -> Pair(1280, 720)
+                    else -> Pair(800, 480)
+                }
             }
         val displayAR = surfW.toFloat() / surfH.toFloat()
-        val contentHeight = ((tierWidth.toFloat() / displayAR).toInt() and 0xFFFE).coerceAtMost(tierHeight)
-        if (contentHeight >= tierHeight) return null // 16:9 or narrower — no crop needed
-        val cropTop = (tierHeight - contentHeight) / 2
-        return AaCropParams(tierWidth, tierHeight, contentHeight, cropTop)
+        val tierAR = tierWidth.toFloat() / tierHeight.toFloat()
+        // Two-way fit: baked bars sit on whichever tier axis the display does NOT bind.
+        // displayAR >= tierAR → bars top/bottom (crop vertically); else → bars left/right.
+        return if (displayAR >= tierAR) {
+            val contentHeight = ((tierWidth.toFloat() / displayAR).toInt() and 0xFFFE).coerceAtMost(tierHeight)
+            if (contentHeight >= tierHeight) return null // exact AR match — no crop
+            AaCropParams(tierWidth, tierHeight, tierWidth, contentHeight, 0, (tierHeight - contentHeight) / 2)
+        } else {
+            val contentWidth = ((tierHeight.toFloat() * displayAR).toInt() and 0xFFFE).coerceAtMost(tierWidth)
+            if (contentWidth >= tierWidth) return null // exact AR match — no crop
+            AaCropParams(tierWidth, tierHeight, contentWidth, tierHeight, (tierWidth - contentWidth) / 2, 0)
+        }
     }
 
     /**
