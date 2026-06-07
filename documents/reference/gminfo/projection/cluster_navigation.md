@@ -35,6 +35,47 @@ Verified directly against the shipped firmware (CT5 `Radio-IVE-86384258-AAOS14-U
 
 Net: on CT5 the shim could still legally claim the authority, but it would only intercept the Templates-Host insert/query (data exfil/inject surface) — it cannot change the rendered cluster glyph, which is enum-driven. On Silverado, VMSPlugin forwards URI-only for the imminent turn (no enum), so the claimed-shim bitmap dominates and the cluster shows the app icon.
 
+### ⚠️ UNVERIFIED — FSA/NFSA transport topology & cluster-injection surface (static decompilation only)
+
+> **DO NOT TRUST THIS SECTION AS FACT.** Everything below is inferred from **static decompilation
+> of the Android APKs + carved QNX binaries only** — NO live device, NO packet capture, NO actual
+> socket test, NO runtime tracing. It is **possibly wrong** and **requires external/hardware
+> verification** before any of it is acted on. Two analysis agents partially **disagreed** (see the
+> open question). Treat every claim as a hypothesis to be tested, not a conclusion.
+
+Context: this came from asking whether a non-system 3rd-party app could reach the cluster by speaking
+GM's FSA/NFSA directly (bypassing the Car App Library), to avoid the foreground-flash bootstrap. The
+investigation suggests **no clean method exists**, and inverts the original premise.
+
+**Hypotheses (static-only, unverified):**
+- The `RemoteModuleHMI` FSA **server appears to be the Android `ClusterService`** (binds `192.168.118.1:9002`,
+  the AAOS guest IP); the **QNX `HMIC` appears to be the client** that connects outbound and *receives*
+  widget/nav pushes. So there is no QNX listener to "push nav to" — the renderer consumes, the AAOS app authors.
+- The FSA wire layer appears to have **no authentication** (constant magic `0x5AA5` + length check only; peer
+  identity inferred from source IP). Protobuf schemas are recovered.
+- The inter-VM endpoints (`192.168.118.x`/`172.16.5.x`, ports 9002/6364/6365, multicast `239.192.0.1:3000`)
+  *appear* reachable from an unprivileged `untrusted_app`: global netns, routes in the kernel `local` table,
+  no `nodecon`/`netifcon`/`portcon` SELinux labels found. **NOT confirmed** — rests on documented Android-13+
+  netd local-route precedence; needs a live `ip route get 172.16.5.101` + an actual socket attempt.
+- **Apparent consequence:** an unprivileged app connecting as a *client* would only **receive** the cluster
+  feed (info disclosure) or get an empty per-`DeviceName` stub — it could **not inject** into the real cluster
+  without *being/impersonating* the AAOS RHMI server (port already held by `ClusterService`). Injection would
+  be blocked by **topology**, not by the (absent) auth.
+
+**Open question (agents disagreed, UNRESOLVED):** does HMIC **discover** the RHMI server via multicast
+`FindService`/`OfferService` (spoofable) or **fixed-connect** to `192.168.118.1:9002` (not redirectable)?
+This determines whether even a fragile OfferService-spoof injection is theoretically possible. Not resolved;
+not pursued.
+
+**Security note (also unverified):** IF the "unauthenticated + reachable" hypotheses hold, the cluster FSA
+plane would be an info-disclosure / routing-displacement surface for an unprivileged app — but *not* a clean
+glyph-injection vector. This needs live confirmation (tcpdump on the inter-VM eth, a socket/PoC test) before
+being relied on or reported.
+
+**Conclusion for carlink:** treat the Car App Library + foreground-bootstrap as the only practical cluster
+path. The FSA-direct route is, per this *unverified* analysis, a dead end for an unprivileged app. No code or
+behavior should change based on this section until it is externally verified.
+
 Verified extraction artifacts: `/Users/zeno/Downloads/misc/GM_research/gm_aaos/_cluster_authority_analysis/{ct5_templateshost,ct5_vmsplugin,ct5_openhooks,silverado}/`. The `/tmp/gm_extract/...` paths cited later in this doc are from the original (now-deleted) scratch extraction; the firmware-verified equivalents live under the path above.
 
 ### Both platforms have an ECU-side glyph library

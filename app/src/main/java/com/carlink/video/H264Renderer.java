@@ -157,7 +157,7 @@ public class H264Renderer {
     // overflow, the incoming frame is dropped (queued frames preserved) and a
     // reactive keyframe request is fired so we don't render corrupted P-frames.
     // 6 buffers: 1 write + up to 3 in queue + 1 feeder + 1 pool margin.
-    private static final int STAGED_FRAME_CAPACITY = 512 * 1024;  // 512KB, covers 1080p I-frames
+    private static final int STAGED_FRAME_CAPACITY = 2 * 1024 * 1024;  // 2MB — covers AA 1080p (~1.5MB) and CarPlay up to 2400x960 (~1.7MB) worst-case H.264 frames. NOT enough for CarPlay 4K (~6MB); see resolution-derived sizing if higher tiers are used.
     private static final int STAGED_FRAME_COUNT = 6;               // write + queue(3) + feed + margin
     private static final int STAGING_QUEUE_SLOTS = 4;              // power-of-2, 3 usable slots
 

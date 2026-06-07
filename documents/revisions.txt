@@ -641,3 +641,24 @@
    - Non-roundabout maneuvers already render correct GM glyphs; rich-iAP2 cluster improvement is gminfo3.7-only.
    - gminfo3.7 behavior unchanged; assembleSideloadDebug and ktlintCheck pass.
    - Affected: ManeuverMapper.kt, NavigationStateManager.kt, TripBuilder.kt, PlatformDetector.kt, ComposedIconStore.kt, CarlinkManager.kt.
+
+[142] :: Video staging buffer fix — AA/CarPlay pixelation from oversized-frame drops.
+   - STAGED_FRAME_CAPACITY raised 512KB -> 2MB. Affected: H264Renderer.java.
+   - Root cause: staging slot (512KB) too small for legit 1080p map frames.
+   - Frames hit 690-887KB, rejected by the feedDirect oversized guard.
+   - That drop breaks the H.264 reference chain, so the picture corrupts.
+   - AA sends ~1 IDR per session, so a dropped frame stays pixelated.
+   - Recovery: a lucky natural IDR, or manual navigate-away/back (resumeVideo teardown + FRAME).
+   - Diagnosed via live emulator logcat: oversized-drop count correlated 1:1 with pixelation.
+   - oversized:6/1 -> pixelated; oversized:0 -> clean; self-cleared when a fitting natural IDR arrived.
+   - Fix covers AA 1080p (~1.5MB) and CarPlay up to 2400x960 (~1.7MB).
+   - KNOWN LIMIT: 2MB does NOT cover CarPlay 4K (~3-6MB frames).
+   - Frame size = resolution x content complexity; heavy 4K motion still exceeds 2MB.
+   - Complete fix (future): resolution-derived capacity from negotiated WxH at initCodec.
+   - Plus reactive keyframe on oversized drop, instead of waiting on luck.
+   - Envelope confirmed via AA APK 16.9.666314 decompile plus prior ADB trace.
+   - H.264-only (CPC200 adapter hard limit); AA capped at 1080p; CarPlay up to 4K.
+   - Gearhead VIDEO_1440x2560 / 3840x2160 enums are stubs; never drive the encoder.
+   - Tested AA 1080x1920 and CarPlay 3840x2160: 0 oversized, clean decode (Rx==Dec).
+   - NOT stress-validated: neither session crossed 512KB; peaks 318KB and 147KB.
+   - Emulator c2.goldfish software decoder kept up with 4K under light load.
