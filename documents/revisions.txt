@@ -15,7 +15,7 @@
 // END EXAMPLE
 //
 // Major changes or discoveries. The appropriate .MD in Project:/Documentation/ should be updated/corrected or created with more technical information.
-//w
+//
 
 [1] :: Initial Release
 [2] :: Permission Prompt not shown, fixed. Ktlint issues corrected. PUSHED:
@@ -662,3 +662,16 @@
    - Tested AA 1080x1920 and CarPlay 3840x2160: 0 oversized, clean decode (Rx==Dec).
    - NOT stress-validated: neither session crossed 512KB; peaks 318KB and 147KB.
    - Emulator c2.goldfish software decoder kept up with 4K under light load.
+
+[143] :: Play AAOS compliance Attempt: add templates_host + ACCESS_SURFACE. Cluster Integration auto-on for debug emulator.
+   - Context: Google "Approved with Issues" a Closed-Beta vc140 — Automotive Support + App category not permitted.
+   - Manifest: added uses-feature android.software.car.templates_host required=true; cluster CarAppService depends on Templates Host.
+   - Manifest: added uses-permission androidx.car.app.ACCESS_SURFACE; host provisions a render surface to the CarAppService.
+   - Manifest: usb.host required=false — gminfo37 lacks the feature flag; required=true filtered the truck off AAOS track.
+   - Verified on emulator: host binds CarlinkClusterService, provisions virtual display, ContentProvider authority still claimed.
+   - Not added: APP_MAPS — cluster bound on vc139 and vc142 without it. Carlink projects phone maps.
+   - appCategory="audio" already present; notice example was false. To appeal, not fix.
+   - Kept by design: MainActivity stays distractionOptimized (projection surface); CarAppActivity stays hidden non-launcher binding stub.
+   - AdapterConfigPreference: Cluster Integration defaults ON when BuildConfig.DEBUG and isAaosEmulator(); production and hardware stay OFF.
+   - Clean install verified: component auto-enables, host binds, no manual toggle needed.
+   - Affected: AndroidManifest.xml, ui/settings/AdapterConfigPreference.kt, build.gradle.kts (versionCode 142 to 143).

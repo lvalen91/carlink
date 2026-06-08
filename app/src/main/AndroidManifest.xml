@@ -14,6 +14,11 @@
     <uses-permission android:name="android.permission.WAKE_LOCK" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="androidx.car.app.NAVIGATION_TEMPLATES" />
+    <!-- Cluster CarAppService draws into the host-provided render surface. Verified on
+         the AAOS emulator: the Templates Host provisions a virtual display
+         "virtual:zeno.carlink,<uid>,CarAppService,0" owned by this app. Required by
+         Play AAOS review for navigation apps (developer.android.com/training/cars/apps/library/draw-maps). -->
+    <uses-permission android:name="androidx.car.app.ACCESS_SURFACE" />
 
     <!-- AltVideo (USB 0x2C) IPC permission. Protects NaviVideoSourceService so only
          co-signed priv-apps (ClusterHomeDisplay) can bind and consume the stream.
@@ -25,10 +30,14 @@
         android:protectionLevel="signature|privileged" />
     <uses-permission android:name="com.carlink.permission.NAVI_VIDEO_STREAM" />
 
-    <!-- USB Host Feature (required) -->
+    <!-- USB Host. required=false on purpose: the CPC200 adapter needs USB host at
+         runtime, but GM AAOS (gm/gminfo37) does NOT advertise android.hardware.usb.host
+         in its Play device profile, so required=true filtered the truck out of the AAOS
+         track. required=false stops Play filtering on it; the UsbManager API + the
+         usb_device_filter below are unaffected and still work at runtime. -->
     <uses-feature
         android:name="android.hardware.usb.host"
-        android:required="true" />
+        android:required="false" />
 
     <!-- Optional Features -->
     <uses-feature
@@ -41,6 +50,14 @@
          services have no host. -->
     <uses-feature
         android:name="android.hardware.type.automotive"
+        android:required="true" />
+    <!-- Car App Library Templates Host. The cluster CarAppService is bound and
+         surface-provisioned by com.google.android.apps.automotive.templates.host
+         (live-verified on the AAOS emulator: renderer_service holds an open
+         ConnectionRecord to CarlinkClusterService). Declared required per Play AAOS
+         review; every certified AAOS build — including GM — ships the Templates Host. -->
+    <uses-feature
+        android:name="android.software.car.templates_host"
         android:required="true" />
     <uses-feature
         android:name="android.hardware.location.gps"

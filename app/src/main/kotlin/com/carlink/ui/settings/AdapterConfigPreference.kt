@@ -27,8 +27,10 @@ import androidx.datastore.preferences.core.longPreferencesKey
 import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.core.stringSetPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
+import com.carlink.BuildConfig
 import com.carlink.logging.logError
 import com.carlink.logging.logInfo
+import com.carlink.platform.PlatformDetector
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
@@ -730,15 +732,36 @@ class AdapterConfigPreference private constructor(
         }
     }
 
+    /**
+     * Default for the Cluster Integration toggle when the user has NOT made an explicit choice.
+     *
+     * Dev convenience that mirrors the AltVideo/NavVideo gate (CarlinkManager "[NAVI_GATE]":
+     * BuildConfig.DEBUG && isAaosEmulator()) and the immersive defaults
+     * ([PlatformDetector.PlatformInfo.requiresImmersiveDefaults]): on a DEBUG APK running on the
+     * AAOS emulator, Cluster Integration defaults ON so the Templates Host binding is exercised
+     * without re-toggling it after every reinstall (a fresh install wipes the persisted
+     * component-enable state). Production APKs and all real hardware default OFF — cluster
+     * integration there stays an explicit user opt-in.
+     *
+     * An explicit user choice in EITHER direction is always honored over this default, because
+     * the DataStore key / sync-cache key is only present once a setter has run (no init-time
+     * re-sync writes it). Cached with `lazy` because getClusterNavigationSync() is hot (called
+     * per-NaviJSON on the USB read thread) and platform/build-type never change at runtime.
+     */
+    private val clusterNavigationDefault: Boolean by lazy {
+        BuildConfig.DEBUG && PlatformDetector.detect(appContext).isAaosEmulator()
+    }
+
     val clusterNavigationFlow: Flow<Boolean> =
         dataStore.data.map { preferences ->
-            preferences[KEY_CLUSTER_NAVIGATION] ?: false
+            preferences[KEY_CLUSTER_NAVIGATION] ?: clusterNavigationDefault
         }
 
     /**
      * Get current cluster navigation configuration synchronously.
      */
-    fun getClusterNavigationSync(): Boolean = syncCache.getBoolean(SYNC_CACHE_KEY_CLUSTER_NAVIGATION, false)
+    fun getClusterNavigationSync(): Boolean =
+        syncCache.getBoolean(SYNC_CACHE_KEY_CLUSTER_NAVIGATION, clusterNavigationDefault)
 
     /**
      * Set cluster navigation configuration.
