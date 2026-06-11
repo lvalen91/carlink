@@ -102,11 +102,12 @@ object PlatformDetector {
 
         /**
          * Composite: device should receive "gminfo37-like" UI defaults
-         * (fullscreen-immersive, OEM icon hidden, etc.). True on gminfo37 itself and
-         * on the AAOS emulator (for development parity). False elsewhere — preserves
-         * existing factory defaults for non-GM 3P targets.
+         * (fullscreen-immersive, OEM icon hidden, etc.). True on gminfo37 itself.
+         * False elsewhere — including the AAOS emulator (a DEBUG APK on the emulator
+         * no longer defaults to immersive) — preserves existing factory defaults for
+         * non-GM 3P targets.
          */
-        fun requiresImmersiveDefaults(): Boolean = isGmInfo37() || isAaosEmulator()
+        fun requiresImmersiveDefaults(): Boolean = isGmInfo37()
 
         /**
          * Returns true on the GM VCU / VCUNH1 (Bosch, AAOS 14) platform — e.g. the 2026 CT5.

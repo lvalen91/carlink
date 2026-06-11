@@ -736,8 +736,7 @@ class AdapterConfigPreference private constructor(
      * Default for the Cluster Integration toggle when the user has NOT made an explicit choice.
      *
      * Dev convenience that mirrors the AltVideo/NavVideo gate (CarlinkManager "[NAVI_GATE]":
-     * BuildConfig.DEBUG && isAaosEmulator()) and the immersive defaults
-     * ([PlatformDetector.PlatformInfo.requiresImmersiveDefaults]): on a DEBUG APK running on the
+     * BuildConfig.DEBUG && isAaosEmulator()): on a DEBUG APK running on the
      * AAOS emulator, Cluster Integration defaults ON so the Templates Host binding is exercised
      * without re-toggling it after every reinstall (a fresh install wipes the persisted
      * component-enable state). Production APKs and all real hardware default OFF — cluster

@@ -223,11 +223,16 @@ class MainActivity : ComponentActivity() {
         // other modes use usable area excluding visible system bars
         loadAndApplyDisplayMode()
 
-        // Defer CarlinkManager creation to the next main-looper tick so the WM has
-        // processed the decorFitsSystemWindows + layoutInDisplayCutoutMode flags set
-        // in applyDisplayMode(). currentWindowMetrics.bounds then reflects the
-        // post-clip rect (e.g. 2400x788 in SYSTEM_UI_VISIBLE on a 2400x960 display)
-        // on the very first read, eliminating the cold-start surface-size race.
+        // Defer CarlinkManager creation to the next main-looper tick so the decorView is
+        // attached before initializeCarlinkManager() reads insets. WindowMetricsCompat
+        // .stableWindowInsets requires an attached decorView; otherwise it returns CONSUMED
+        // (all-zero) insets and the resolution mis-computes.
+        // NOTE: currentWindowMetrics.bounds is the FULL display (2400x960) regardless of
+        // decorFitsSystemWindows — verified via dumpsys (mBounds/mAppBounds = 2400x960 in
+        // SYSTEM_UI_VISIBLE). The 788 usable height comes from subtracting the system-bar
+        // insets exactly ONCE in initializeCarlinkManager()'s when-branch, not from a clipped
+        // bounds. (Prior comment claimed bounds reflected a post-clip 2400x788 rect — false;
+        // that would double-count with the inset subtraction and yield 616.)
         // Compose renders `if (manager != null)` while we wait, so the UI boots with
         // the loading overlay and swaps in as soon as the manager is ready.
         window.decorView.post {
@@ -858,9 +863,10 @@ class MainActivity : ComponentActivity() {
 
         when (mode) {
             DisplayMode.SYSTEM_UI_VISIBLE -> {
-                // WM clips window content rect to between-bars region *before* view tree is
-                // inflated. SurfaceView is born at correct geometry; no HWC-plane race.
-                WindowCompat.setDecorFitsSystemWindows(window, true)
+                // Edge-to-edge (window stays full-display); Compose windowInsetsPadding in
+                // MainScreen subtracts the system bars exactly once. Using decorFits=true here
+                // double-counts the bars on warm re-dispatch (788 -> 616). [FIX UNDER TEST]
+                WindowCompat.setDecorFitsSystemWindows(window, false)
                 lp.layoutInDisplayCutoutMode =
                     WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_DEFAULT
                 window.attributes = lp

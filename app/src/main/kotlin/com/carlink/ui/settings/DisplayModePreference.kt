@@ -60,8 +60,8 @@ enum class DisplayMode(
 
         /**
          * Platform-aware default display mode (used when no user preference is
-         * persisted). gminfo37 and the AAOS emulator default to FULLSCREEN_IMMERSIVE
-         * for maximum projection area; every other platform keeps the legacy
+         * persisted). gminfo37 defaults to FULLSCREEN_IMMERSIVE for maximum projection
+         * area; every other platform — including the AAOS emulator — keeps the legacy
          * SYSTEM_UI_VISIBLE default. User can still override via the settings dialog;
          * this only affects the "no preference set yet" first-run / cleared-data path.
          */
@@ -196,8 +196,8 @@ class DisplayModePreference private constructor(
             )
         } else {
             // No old preference: mark migrated using the platform-aware default
-            // (gminfo37 + AAOS emulator → FULLSCREEN_IMMERSIVE; everything else →
-            // SYSTEM_UI_VISIBLE legacy default).
+            // (gminfo37 → FULLSCREEN_IMMERSIVE; everything else, including the AAOS
+            // emulator → SYSTEM_UI_VISIBLE legacy default).
             syncCache
                 .edit()
                 .putInt(SYNC_CACHE_KEY_DISPLAY_MODE, DisplayMode.platformDefault(appContext).value)

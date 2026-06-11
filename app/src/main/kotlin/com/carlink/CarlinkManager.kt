@@ -640,6 +640,25 @@ class CarlinkManager(
                         tag = Logger.Tags.VIDEO,
                     )
 
+                    // Persistent-divergence detector: the codec decodes at the pre-computed
+                    // config (stable WindowMetrics, see L584-586); the surface dims above are the
+                    // live UI area. A mismatch at first-init is an expected startup transient that
+                    // the debounce coalesces away — but if it SURVIVES the debounce and lands here,
+                    // the on-screen area genuinely disagrees with the projection area (visual
+                    // scale/crop mismatch), not a layout artifact. Skip when the user pinned a
+                    // custom resolution (config intentionally != surface then).
+                    if (!config.userSelectedResolution &&
+                        (pendingSurfaceWidth != config.width || pendingSurfaceHeight != config.height)
+                    ) {
+                        logWarn(
+                            "[RES] Surface stabilized at ${pendingSurfaceWidth}x$pendingSurfaceHeight " +
+                                "but codec is ${config.width}x${config.height} — persistent divergence " +
+                                "(UI area != projection area, " +
+                                "Δ=${config.width - pendingSurfaceWidth}x${config.height - pendingSurfaceHeight})",
+                            tag = Logger.Tags.VIDEO,
+                        )
+                    }
+
                     this@CarlinkManager.callback = finalCallback
                     this@CarlinkManager.videoSurface = finalSurface
 
