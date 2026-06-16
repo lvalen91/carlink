@@ -1,6 +1,6 @@
 # Carlink
 
-Carlink is a **native** Kotlin code implementation from the original [Flutter-based](https://github.com/lvalen91/Carlink) app.
+Carlink is a **native** Kotlin code implementation from the original [Flutter-based](https://github.com/lvalen91/carlink_flutter) app.
 I did this app for me and my use, but sharing so others can use it. Don't expect or demand support but I'll help where i can.
 
 ### Requirments
