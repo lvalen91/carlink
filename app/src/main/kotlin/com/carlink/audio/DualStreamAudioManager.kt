@@ -1416,7 +1416,12 @@ class DualStreamAudioManager(
                         }
                     }
 
-                    if (!didWork) sleep(5)
+                    // Pace every pass, not just idle ones. Each pass can already stage up
+                    // to ~100ms/slot (tempBuffer) into a 750ms ring + the AudioTrack buffer,
+                    // so a fixed 5ms cadence cannot underfeed at 1x realtime — it removes the
+                    // active-playback busy-spin (previously this only slept when fully idle).
+                    // NOTE: `didWork` is now vestigial (assigned but unread) — harmless.
+                    sleep(5)
 
                     // 30s aggregate stats (gated by AUDIO_PERF tag)
                     val now = System.currentTimeMillis()

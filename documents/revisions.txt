@@ -693,3 +693,16 @@
    - Side effect: OEM Exit icon now visible on emulator; gminfo37 immersive + hidden-icon defaults unchanged.
    - Corrected false comments: currentWindowMetrics.bounds is full 2400x960, not post-clip 788; decorFits=true not required for surface geometry.
    - Affected: MainActivity.kt, CarlinkManager.kt, PlatformDetector.kt, DisplayModePreference.kt, AdapterConfigPreference.kt
+
+[145] :: CPU: de-spin H264 feeder (park/unpark) and pace the audio playback loop. Verified on live gminfo37.
+   - Video: H264Renderer feederLoop parkNanos(1ms) busy-spin replaced with blocking park(); feedDirect unparks feeder after each stagingOffer.
+   - stopStaging already unparks for shutdown; unpark(null) is a no-op, so the start/stop window stays safe.
+   - park() consumes a permit, so an enqueue racing the park returns immediately — no frame lost.
+   - Measured: H264-Feeder idle-spin removed; 0% idle, ~1.5-3% at full 60fps (feed work only), was ~6%.
+   - Audio: DualStreamAudioManager playback loop now sleeps 5ms every pass, not only when fully idle.
+   - Per-pass capacity ~100ms/slot into 750ms ring plus AudioTrack buffer; 5ms cadence cannot underfeed at 1x.
+   - Removes the active-playback busy-spin; didWork is now vestigial (assigned, unread) — harmless, compiler warning only.
+   - Both threads are downstream consumers; no change to USB read, heartbeat, or session paths.
+   - Live wired CarPlay: Urun:0 across windows, Resets:0, zero frame drops, no regressions.
+   - Wireless churned every ~11s (adapter USB-IN went silent); wired stable — Wi-Fi link, not these changes.
+   - Affected: video/H264Renderer.java, audio/DualStreamAudioManager.kt

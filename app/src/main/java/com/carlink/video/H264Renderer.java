@@ -669,7 +669,11 @@ public class H264Renderer {
                         }
                     }
                 } else {
-                    LockSupport.parkNanos(1_000_000L);  // 1ms — 0.5ms avg added latency
+                    // Block until the USB producer enqueues a frame (feedDirect → unpark)
+                    // or stopStaging() unparks for shutdown. park() consumes a permit, so an
+                    // unpark racing just before this returns immediately and we re-poll — no
+                    // lost frame. Spurious wakeups simply re-loop and re-poll.
+                    LockSupport.park();
                 }
             }
         } catch (Exception e) {
@@ -1012,6 +1016,9 @@ public class H264Renderer {
 
         // FIFO enqueue — feeder thread drains in order
         if (stagingOffer(wf)) {
+            // Wake the (possibly parked) feeder. LockSupport.unpark(null) is a documented
+            // no-op, so the brief start/stop window where feederThread is null is harmless.
+            LockSupport.unpark(feederThread);
             // Frame enqueued — get a fresh buffer from pool for next write
             writeFrame = framePool.poll();
             // writeFrame may be null briefly if feeder hasn't returned buffers yet.
