@@ -723,3 +723,15 @@
    - detekt config detekt.yml was missing and hard-failed; added a minimal stub, restore the tuned config later.
    - Only remaining source deprecation is H264Renderer INFO_OUTPUT_BUFFERS_CHANGED, kept deliberately as a defensive branch.
    - Affected: navigation/compose/*, MessageSerializer.kt, MessageTypes.kt, ui/theme/Theme.kt, MainActivity.kt, media/*, build.gradle.kts (root + app), gradle-wrapper.properties.
+
+[147p] :: Personal CarPlay-only variant (cp-stripped) — feature strip, frosted-glass UI redesign, CarPlay day/night following. Sideload-only, minSdk 32.
+   - Stripped Android Auto projection, AAOS cluster/HUD, Car App Library, 0x2C alt-video, GPS/GNSS, OEM icons, config/display UI, file-logging.
+   - minSdk 29 to 32, sideload-only (dropped play flavor + cluster-icon authority), versionCode 146 to 147, drop-in same package.
+   - OPEN-first uuid-gated init: FULL on first-install/version-bump/new-adapter, else MINIMAL (OPEN + WIFI_ENABLE). Hardcoded immersive, LHD, adapter audio.
+   - Frosted-glass dashboard: rim, sheen, translucent panels, large radii, day/night-adaptive; combined adapter card; centered moderate-size block layout.
+   - Glass device cards with active-state tint; legibility pass (larger fonts, onSurface colors); glass buttons, solid-red destructive accents.
+   - Controls host-UI overlay: PixelCopy frozen frame plus Modifier.blur backdrop (SurfaceView is HWC, cannot GPU-blur live), translucent scrim.
+   - CarPlay follows AAOS day/night via night-mode command 16/17 mid-session, session uninterrupted. Device-verified; previously believed impossible.
+   - OEM host-UI icon label Exit to Controls (airplay.conf, FULL-init only). Removed ARMiPhoneIAP2.patched and aa_gps_fix.sh app assets.
+   - Own README. Renamed code/docs "Liquid Glass" to "frosted glass" (accurate: blur, no refraction). Removed dead naviScreenInfo whitelist key.
+   - Affected: MainScreen, PhonesTab, FrostedGlass.kt, CarlinkManager, MessageSerializer, AdapterDriver, MainActivity, build.gradle, manifest, README; removed navigation/cluster/gnss/ipc.
