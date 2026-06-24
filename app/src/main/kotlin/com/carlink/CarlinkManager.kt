@@ -1731,7 +1731,7 @@ class CarlinkManager(
                     "MDModel", "btMacAddr", "buildModel", "iOSVer", "linkType",
                     "boxName", "wifiName", "btName", "oemIconLabel", "wifiPasswd",
                     "androidWorkMode", "phoneMode", "DashboardInfo",
-                    "AndroidAutoSizeW", "AndroidAutoSizeH", "naviScreenInfo",
+                    "AndroidAutoSizeW", "AndroidAutoSizeH",
                     "AdvancedFeatures", "GNSSCapability", "callQuality",
                     "HiCar", "supportFeatures", "CusCode", "ChannelList",
                     "MDLinkType", "MDOSVersion", "MDLinkVersion", "cpuTemp",

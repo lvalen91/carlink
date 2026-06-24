@@ -286,11 +286,11 @@ class AdapterDriver(
      * /tmp/uploadFileTmp before atomically moving it to [adapterPath]. Path is
      * not validated server-side — any absolute path the adapter root can write
      * is reachable (see adapter RE_Documention §3 vulnerabilities.md). Used here
-     * only for /tmp/ paths (e.g. /tmp/aa_gps_fix.sh) for in-session host-pushed
-     * helpers. Naming a file `*Update.img` auto-triggers OTA on the adapter side
+     * for /tmp/ and /etc/ config paths (e.g. ScreenDPI, ViewArea, airplay.conf).
+     * Naming a file `*Update.img` auto-triggers OTA on the adapter side
      * — caller must avoid that suffix unless OTA is intended.
      *
-     * @param adapterPath Absolute destination path on the adapter (e.g. "/tmp/aa_gps_fix.sh")
+     * @param adapterPath Absolute destination path on the adapter (e.g. "/tmp/screen_dpi")
      * @param content     Raw file bytes to write
      */
     fun sendFile(

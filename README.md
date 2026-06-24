@@ -31,9 +31,23 @@ This is the **`cp-stripped`** branch/variant of the main Carlink Android app. It
 - **"Controls" host-UI button.** The CarPlay OEM/exit icon is labeled **Controls** and opens the dashboard *as a frosted overlay over the live session* — with a frozen, blurred snapshot of the CarPlay feed behind the cards (iOS-style), and a **Return to CarPlay** button to dismiss.
 - **CarPlay follows day/night.** When AAOS switches light/dark, the app sends the CarPlay night-mode command (16/17) mid-session, so CarPlay's own UI follows the head unit — without dropping the session.
 
+## Screenshots
+
+The **Controls** dashboard — the host-UI overlay — as Liquid Glass over the live CarPlay feed, following the head unit's day/night theme:
+
+| Night | Day |
+| --- | --- |
+| ![Controls dashboard — night](/screenshots/dark_ctrl.png) | ![Controls dashboard — day](/screenshots/light_ctrl.png) |
+
+CarPlay itself follows the AAOS day/night switch — the night-mode command is forwarded mid-session, session uninterrupted:
+
+| Night | Day |
+| --- | --- |
+| ![CarPlay home — night](/screenshots/dark_hs.png) | ![CarPlay home — day](/screenshots/light_hs.png) |
+
 ## Adapter firmware
 
-Like the main app, this is tuned for **custom CCPA adapter firmware** (restores full iAP2 CarPlay route data and corrects GPS-NMEA forwarding). It's not required to run, but gives a closer-to-stock experience. See the main Carlink repo / the `CPC200-CCPA` documentation for details.
+Unlike the main app, this variant does **not** ship or push the adapter-side patches. The iAP2 route-data restore existed for cluster navigation and the NMEA correction for Android Auto GPS forwarding — both removed here — so neither `ARMiPhoneIAP2.patched` nor `aa_gps_fix.sh` is included. It runs against **stock adapter firmware**. (If your CPC200-CCPA happens to be running custom firmware from the main project, that lives on the adapter and is independent of this app.)
 
 ## Build & install
 
