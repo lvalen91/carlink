@@ -54,7 +54,7 @@ import com.carlink.R
 import com.carlink.protocol.PhoneType
 import com.carlink.ui.theme.AutomotiveDimens
 import com.carlink.ui.theme.GlassShapes
-import com.carlink.ui.theme.liquidGlass
+import com.carlink.ui.theme.frostedGlass
 import kotlinx.coroutines.delay
 
 /**
@@ -242,7 +242,7 @@ private fun UsbDeviceCard(
     val textColor = if (isConnected) Color.White else colorScheme.onSurface.copy(alpha = alpha)
 
     Box(
-        modifier = modifier.liquidGlass(GlassShapes.Inner, tint = tint),
+        modifier = modifier.frostedGlass(GlassShapes.Inner, tint = tint),
     ) {
         Column(
             modifier = Modifier.padding(24.dp).fillMaxWidth().fillMaxHeight(),
@@ -346,7 +346,7 @@ private fun WirelessDeviceCard(
     Box(
         modifier =
             modifier
-                .liquidGlass(GlassShapes.Inner, tint = tint)
+                .frostedGlass(GlassShapes.Inner, tint = tint)
                 .clip(GlassShapes.Inner)
                 .clickable(enabled = enabled, onClick = onTap),
     ) {
@@ -444,7 +444,7 @@ private fun EmptyDeviceCard(modifier: Modifier = Modifier) {
     val colorScheme = MaterialTheme.colorScheme
 
     Box(
-        modifier = modifier.liquidGlass(GlassShapes.Inner),
+        modifier = modifier.frostedGlass(GlassShapes.Inner),
     ) {
         Column(
             modifier =

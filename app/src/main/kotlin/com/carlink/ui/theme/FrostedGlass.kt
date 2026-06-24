@@ -23,9 +23,9 @@ import androidx.compose.ui.graphics.luminance
 import androidx.compose.ui.unit.dp
 
 /**
- * Liquid-Glass surface primitives (day/night aware).
+ * Frosted-Glass surface primitives (day/night aware).
  *
- * The "glass" look is built from four layers stacked by [liquidGlass]:
+ * The "glass" look is built from four layers stacked by [frostedGlass]:
  *  1. a soft drop shadow (lift),
  *  2. a translucent fill (tinted by the theme surface — lighter in day, darker at night),
  *  3. a top-down specular sheen,
@@ -72,19 +72,19 @@ fun glassColors(strong: Boolean = false): GlassColors {
 }
 
 /**
- * Apply the Liquid-Glass treatment to a surface: translucent fill → optional state [tint] →
+ * Apply the Frosted-Glass treatment to a surface: translucent fill → optional state [tint] →
  * specular sheen → bright rim. Caller supplies the [shape] (use [GlassShapes]).
  *
  * No elevation shadow is used: Android casts elevation shadows from an element's *opaque* outline,
  * but a glass fill is translucent, so `Modifier.shadow` falls back toward the rectangular layer
  * bounds — producing a boxy halo behind the rounded shape that is visible over a bright/blurred
- * backdrop. Depth here comes from the rim + sheen (which is how Liquid Glass reads anyway).
+ * backdrop. Depth here comes from the rim + sheen (which is how frosted glass reads anyway).
  *
  * @param tint optional state color drawn over the fill (e.g. active CarPlay/AA card), under the
  *   sheen + rim so the glass edges stay intact.
  */
 @Composable
-fun Modifier.liquidGlass(
+fun Modifier.frostedGlass(
     shape: Shape = GlassShapes.Card,
     strong: Boolean = false,
     tint: Color? = null,
@@ -99,7 +99,7 @@ fun Modifier.liquidGlass(
 }
 
 /**
- * A Liquid-Glass pill button (translucent + rim) for non-destructive actions. Content color is
+ * A Frosted-Glass pill button (translucent + rim) for non-destructive actions. Content color is
  * supplied via [contentColor] (defaults to onSurface) and flows to Icon/Text through
  * LocalContentColor; disabled state dims it. Destructive actions stay solid (use a filled Button).
  */
@@ -115,7 +115,7 @@ fun GlassButton(
     Row(
         modifier =
             modifier
-                .liquidGlass(GlassShapes.Button, strong = true)
+                .frostedGlass(GlassShapes.Button, strong = true)
                 .clip(GlassShapes.Button)
                 .clickable(enabled = enabled, onClick = onClick)
                 .padding(horizontal = 24.dp, vertical = 16.dp),

@@ -27,13 +27,13 @@ This is the **`cp-stripped`** branch/variant of the main Carlink Android app. It
 
 ## What's new here
 
-- **Liquid Glass UI.** The idle/host-UI dashboard is a frosted-glass design (specular rim, sheen, translucent panels, large radii) that follows the **AAOS day/night theme** automatically.
+- **Frosted Glass UI.** The idle/host-UI dashboard is a frosted-glass design (specular rim, sheen, translucent panels, large radii) that follows the **AAOS day/night theme** automatically.
 - **"Controls" host-UI button.** The CarPlay OEM/exit icon is labeled **Controls** and opens the dashboard *as a frosted overlay over the live session* — with a frozen, blurred snapshot of the CarPlay feed behind the cards (iOS-style), and a **Return to CarPlay** button to dismiss.
 - **CarPlay follows day/night.** When AAOS switches light/dark, the app sends the CarPlay night-mode command (16/17) mid-session, so CarPlay's own UI follows the head unit — without dropping the session.
 
 ## Screenshots
 
-The **Controls** dashboard — the host-UI overlay — as Liquid Glass over the live CarPlay feed, following the head unit's day/night theme:
+The **Controls** dashboard — the host-UI overlay — as frosted glass over the live CarPlay feed, following the head unit's day/night theme:
 
 | Night | Day |
 | --- | --- |

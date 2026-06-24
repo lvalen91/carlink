@@ -87,7 +87,7 @@ import com.carlink.ui.settings.PhonesTabContent
 import com.carlink.ui.theme.AutomotiveDimens
 import com.carlink.ui.theme.GlassButton
 import com.carlink.ui.theme.GlassShapes
-import com.carlink.ui.theme.liquidGlass
+import com.carlink.ui.theme.frostedGlass
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
@@ -478,7 +478,7 @@ private fun AdapterCard(
     var isProcessing by remember { mutableStateOf(false) }
     var showRebootDialog by remember { mutableStateOf(false) }
 
-    Box(modifier = modifier.liquidGlass(GlassShapes.Card, strong = true)) {
+    Box(modifier = modifier.frostedGlass(GlassShapes.Card, strong = true)) {
         Column(
             modifier = Modifier.padding(20.dp).fillMaxSize(),
             horizontalAlignment = Alignment.CenterHorizontally,
@@ -614,7 +614,7 @@ private fun KnownDevicesCard(
     carlinkManager: CarlinkManager,
     modifier: Modifier = Modifier,
 ) {
-    Box(modifier = modifier.fillMaxWidth().liquidGlass(GlassShapes.Card, strong = true)) {
+    Box(modifier = modifier.fillMaxWidth().frostedGlass(GlassShapes.Card, strong = true)) {
         Column(modifier = Modifier.padding(20.dp).fillMaxSize()) {
             Text(
                 text = "Tap a known device or remove it",
