@@ -1,0 +1,108 @@
+<?xml version="1.0" ?>
+<SmellBaseline>
+  <ManuallySuppressedIssues/>
+  <CurrentIssues>
+    <ID>ComplexCondition:AdapterDriver.kt$AdapterDriver.&lt;no name provided&gt;$type != MessageType.VIDEO_DATA.id &amp;&amp; type != MessageType.AUDIO_DATA.id &amp;&amp; type != MessageType.NAVI_VIDEO_DATA.id &amp;&amp; type != MessageType.HEARTBEAT_ECHO.id</ID>
+    <ID>ComplexCondition:AdapterDriver.kt$AdapterDriver.&lt;no name provided&gt;$type == MessageType.VIDEO_DATA.id &amp;&amp; videoProcessor != null &amp;&amp; (data == null || dataLength == 0)</ID>
+    <ID>ComplexCondition:DualStreamAudioManager.kt$DualStreamAudioManager$data[pos] != 0.toByte() || data[pos + 1] != 0.toByte() || data[pos + 2] != 0.toByte() || data[pos + 3] != 0.toByte()</ID>
+    <ID>ComplexCondition:DualStreamAudioManager.kt$DualStreamAudioManager$data[pos] != 0xFF.toByte() || data[pos + 1] != 0xFF.toByte() || data[pos + 2] != 0xFF.toByte() || data[pos + 3] != 0xFF.toByte()</ID>
+    <ID>ComplexCondition:DualStreamAudioManager.kt$DualStreamAudioManager$state.isPhoneCallActive &amp;&amp; (format.sampleRate == 8000 || format.sampleRate == 16000) &amp;&amp; format.channelCount == 1</ID>
+    <ID>ComplexCondition:MainScreen.kt$surfaceWidth == 0 || surfaceHeight == 0 || containerWidth == 0 || containerHeight == 0</ID>
+    <ID>CyclomaticComplexMethod:CarlinkManager.kt$CarlinkManager$fun initialize( surface: Surface, surfaceWidth: Int, surfaceHeight: Int, callback: Callback, )</ID>
+    <ID>CyclomaticComplexMethod:CarlinkManager.kt$CarlinkManager$private fun handleAudioCommand(command: AudioCommand, messageDecodeType: Int = 5, rawCommandId: Int = command.id)</ID>
+    <ID>CyclomaticComplexMethod:CarlinkManager.kt$CarlinkManager$private fun handleMessage(message: Message)</ID>
+    <ID>CyclomaticComplexMethod:CarlinkManager.kt$CarlinkManager$private fun processMediaMetadata(message: MediaDataMessage)</ID>
+    <ID>CyclomaticComplexMethod:CarlinkManager.kt$CarlinkManager$suspend fun start()</ID>
+    <ID>CyclomaticComplexMethod:DualStreamAudioManager.kt$DualStreamAudioManager$fun onPurposeChanged(purpose: StreamPurpose)</ID>
+    <ID>CyclomaticComplexMethod:DualStreamAudioManager.kt$DualStreamAudioManager$fun writeAudio( data: ByteArray, dataOffset: Int, dataLength: Int, audioType: Int, decodeType: Int, routingState: AudioRoutingState = AudioRoutingState(), ): Int</ID>
+    <ID>CyclomaticComplexMethod:DualStreamAudioManager.kt$DualStreamAudioManager.AudioPlaybackThread$override fun run()</ID>
+    <ID>CyclomaticComplexMethod:MainScreen.kt$@Composable fun MainScreen( carlinkManager: CarlinkManager, onResetConnection: (() -&gt; Unit)? = null, )</ID>
+    <ID>CyclomaticComplexMethod:MainScreen.kt$private fun handleTouchEvent( event: MotionEvent, activeTouches: MutableMap&lt;Int, TouchPoint&gt;, carlinkManager: CarlinkManager, surfaceWidth: Int, surfaceHeight: Int, containerWidth: Int, containerHeight: Int, )</ID>
+    <ID>CyclomaticComplexMethod:MediaSessionManager.kt$MediaSessionManager$fun updateMetadata( title: String?, artist: String?, album: String?, appName: String?, albumArt: ByteArray?, duration: Long = 0L, )</ID>
+    <ID>CyclomaticComplexMethod:MessageParser.kt$MessageParser$fun parseMessage( header: MessageHeader, payload: ByteArray?, ): Message</ID>
+    <ID>CyclomaticComplexMethod:MessageParser.kt$MessageParser$private fun parseMediaData( header: MessageHeader, payload: ByteArray?, ): Message</ID>
+    <ID>CyclomaticComplexMethod:MicrophoneCaptureManager.kt$MicrophoneCaptureManager.MicCaptureThread$override fun run()</ID>
+    <ID>CyclomaticComplexMethod:PhonesTab.kt$@Composable fun PhonesTabContent(carlinkManager: CarlinkManager)</ID>
+    <ID>CyclomaticComplexMethod:UsbDeviceWrapper.kt$UsbDeviceWrapper$fun startReadingLoop( callback: ReadingLoopCallback, timeout: Int = 30000, videoProcessor: VideoDataProcessor? = null, )</ID>
+    <ID>ForbiddenComment:PhonesTab.kt$// TODO: multi-observer ConnectionStateListener / StateFlow on CarlinkManager (would also</ID>
+    <ID>LargeClass:CarlinkManager.kt$CarlinkManager</ID>
+    <ID>LargeClass:DualStreamAudioManager.kt$DualStreamAudioManager</ID>
+    <ID>LongMethod:CarlinkManager.kt$CarlinkManager$fun initialize( surface: Surface, surfaceWidth: Int, surfaceHeight: Int, callback: Callback, )</ID>
+    <ID>LongMethod:CarlinkManager.kt$CarlinkManager$private fun handleAudioCommand(command: AudioCommand, messageDecodeType: Int = 5, rawCommandId: Int = command.id)</ID>
+    <ID>LongMethod:CarlinkManager.kt$CarlinkManager$private fun handleMessage(message: Message)</ID>
+    <ID>LongMethod:CarlinkManager.kt$CarlinkManager$private fun processMediaMetadata(message: MediaDataMessage)</ID>
+    <ID>LongMethod:CarlinkManager.kt$CarlinkManager$suspend fun start()</ID>
+    <ID>LongMethod:DualStreamAudioManager.kt$DualStreamAudioManager$fun writeAudio( data: ByteArray, dataOffset: Int, dataLength: Int, audioType: Int, decodeType: Int, routingState: AudioRoutingState = AudioRoutingState(), ): Int</ID>
+    <ID>LongMethod:DualStreamAudioManager.kt$DualStreamAudioManager.AudioPlaybackThread$override fun run()</ID>
+    <ID>LongMethod:MainScreen.kt$@Composable fun MainScreen( carlinkManager: CarlinkManager, onResetConnection: (() -&gt; Unit)? = null, )</ID>
+    <ID>LongMethod:MainScreen.kt$@Composable private fun AdapterCard( carlinkManager: CarlinkManager, statusText: String, onResetConnection: (() -&gt; Unit)?, modifier: Modifier = Modifier, // When true (landscape, card stretched to full height) the status block takes the slack // above the controls and centers within it. When false (portrait, wrap-content) it packs // at the top as before. stretchStatus: Boolean = false, // Non-null only while the dashboard overlays a live CarPlay session (host-UI/"Exit" action). // When non-null the top "Return to CarPlay" button is enabled and returns to projection; // otherwise the button is shown greyed-out/disabled as a permanent placeholder. onReturnToProjection: (() -&gt; Unit)? = null, )</ID>
+    <ID>LongMethod:MainScreen.kt$@Composable private fun CarlinkDashboard( carlinkManager: CarlinkManager, statusText: String, onResetConnection: (() -&gt; Unit)?, onReturnToProjection: (() -&gt; Unit)? = null, )</ID>
+    <ID>LongMethod:MediaSessionManager.kt$MediaSessionManager$fun updateMetadata( title: String?, artist: String?, album: String?, appName: String?, albumArt: ByteArray?, duration: Long = 0L, )</ID>
+    <ID>LongMethod:MessageParser.kt$MessageParser$private fun parseAudioData( header: MessageHeader, payload: ByteArray?, ): Message</ID>
+    <ID>LongMethod:MessageParser.kt$MessageParser$private fun parseMediaData( header: MessageHeader, payload: ByteArray?, ): Message</ID>
+    <ID>LongMethod:MicrophoneCaptureManager.kt$MicrophoneCaptureManager$fun start(decodeType: Int = 5): Boolean</ID>
+    <ID>LongMethod:PhonesTab.kt$@Composable fun PhonesTabContent(carlinkManager: CarlinkManager)</ID>
+    <ID>LongMethod:PhonesTab.kt$@Composable private fun WirelessDeviceCard( device: CarlinkManager.DeviceInfo, isConnected: Boolean, onTap: () -&gt; Unit, onRemove: () -&gt; Unit, modifier: Modifier = Modifier, enabled: Boolean = true, )</ID>
+    <ID>LongMethod:UsbDeviceWrapper.kt$UsbDeviceWrapper$fun startReadingLoop( callback: ReadingLoopCallback, timeout: Int = 30000, videoProcessor: VideoDataProcessor? = null, )</ID>
+    <ID>LongParameterList:AdapterDriver.kt$AdapterDriver$( private val usbDevice: UsbDeviceWrapper, private val messageHandler: (Message) -&gt; Unit, private val errorHandler: (String) -&gt; Unit, private val logCallback: (String) -&gt; Unit, private val readTimeout: Int = 30000, private val writeTimeout: Int = 1000, private val videoProcessor: UsbDeviceWrapper.VideoDataProcessor? = null, )</ID>
+    <ID>LongParameterList:DualStreamAudioManager.kt$DualStreamAudioManager$( data: ByteArray, dataOffset: Int, dataLength: Int, audioType: Int, decodeType: Int, routingState: AudioRoutingState = AudioRoutingState(), )</ID>
+    <ID>LongParameterList:DualStreamAudioManager.kt$DualStreamAudioManager.PurposeSlot$( var format: AudioFormatConfig, val purpose: StreamPurpose, var track: AudioTrack?, var buffer: AudioRingBuffer, var started: Boolean = false, var pendingPlay: Boolean = false, var residualOffset: Int = 0, var residualCount: Int = 0, var underruns: Int = 0, var tempBuffer: ByteArray, // Stats delta tracking var prevOverflow: Int = 0, var prevUnderruns: Int = 0, // Idle-pause: timestamp when buffer first went empty while playing. // Track paused after idlePauseMs to release AAOS volume context. var idleSince: Long = 0, )</ID>
+    <ID>LongParameterList:MainActivity.kt$MainActivity$( videoW: Int, videoH: Int, insetTop: Int, insetBottom: Int, insetLeft: Int, insetRight: Int, )</ID>
+    <ID>LongParameterList:MainScreen.kt$( carlinkManager: CarlinkManager, statusText: String, onResetConnection: (() -&gt; Unit)?, modifier: Modifier = Modifier, // When true (landscape, card stretched to full height) the status block takes the slack // above the controls and centers within it. When false (portrait, wrap-content) it packs // at the top as before. stretchStatus: Boolean = false, // Non-null only while the dashboard overlays a live CarPlay session (host-UI/"Exit" action). // When non-null the top "Return to CarPlay" button is enabled and returns to projection; // otherwise the button is shown greyed-out/disabled as a permanent placeholder. onReturnToProjection: (() -&gt; Unit)? = null, )</ID>
+    <ID>LongParameterList:MainScreen.kt$( event: MotionEvent, activeTouches: MutableMap&lt;Int, TouchPoint&gt;, carlinkManager: CarlinkManager, surfaceWidth: Int, surfaceHeight: Int, containerWidth: Int, containerHeight: Int, )</ID>
+    <ID>LongParameterList:MainScreen.kt$( label: String, icon: ImageVector, severity: ButtonSeverity, enabled: Boolean, isProcessing: Boolean, onClick: () -&gt; Unit, modifier: Modifier = Modifier, )</ID>
+    <ID>LongParameterList:MediaSessionManager.kt$MediaSessionManager$( player: UsbAdapterPlayer, title: String?, artist: String?, album: String?, appName: String?, duration: Long, artBytes: ByteArray?, artUri: Uri?, )</ID>
+    <ID>LongParameterList:MediaSessionManager.kt$MediaSessionManager$( title: String?, artist: String?, album: String?, appName: String?, albumArt: ByteArray?, duration: Long = 0L, )</ID>
+    <ID>LongParameterList:MessageParser.kt$AudioDataMessage$( header: MessageHeader, val decodeType: Int, val volume: Float, val audioType: Int, val command: AudioCommand?, val data: ByteArray?, val volumeDuration: Float?, val audioDataOffset: Int = 0, val audioDataLength: Int = data?.size ?: 0, /** Raw command byte from wire — preserved even when command maps to UNKNOWN */ val rawCommandId: Int = command?.id ?: -1, )</ID>
+    <ID>LongParameterList:PhonesTab.kt$( device: CarlinkManager.DeviceInfo, isConnected: Boolean, onTap: () -&gt; Unit, onRemove: () -&gt; Unit, modifier: Modifier = Modifier, enabled: Boolean = true, )</ID>
+    <ID>LoopWithTooManyJumpStatements:DualStreamAudioManager.kt$DualStreamAudioManager.AudioPlaybackThread$for</ID>
+    <ID>LoopWithTooManyJumpStatements:DualStreamAudioManager.kt$DualStreamAudioManager.AudioPlaybackThread$while</ID>
+    <ID>LoopWithTooManyJumpStatements:MicrophoneCaptureManager.kt$MicrophoneCaptureManager.MicCaptureThread$while</ID>
+    <ID>LoopWithTooManyJumpStatements:UsbDeviceWrapper.kt$UsbDeviceWrapper$while</ID>
+    <ID>MaxLineLength:AlbumArtCache.kt$AlbumArtCache$if (BuildConfig.DEBUG) Log.w(TAG, "put: decodeDownscaled returned null (format unsupported?), bytes=${bytes.size}B sig=${bytes.take(4).joinToString(",") { "%02X".format(it) }}")</ID>
+    <ID>MaxLineLength:CarlinkManager.kt$CarlinkManager$*</ID>
+    <ID>NestedBlockDepth:CarlinkManager.kt$CarlinkManager$private fun handleMessage(message: Message)</ID>
+    <ID>NestedBlockDepth:DualStreamAudioManager.kt$DualStreamAudioManager$private fun releaseNavTrack()</ID>
+    <ID>NestedBlockDepth:DualStreamAudioManager.kt$DualStreamAudioManager$private fun releaseSlot(slot: PurposeSlot?)</ID>
+    <ID>NestedBlockDepth:DualStreamAudioManager.kt$DualStreamAudioManager.AudioPlaybackThread$override fun run()</ID>
+    <ID>NestedBlockDepth:MainActivity.kt$MainActivity$private fun applyAudioTransferModeToMediaSession(audioTransferMode: Boolean)</ID>
+    <ID>NestedBlockDepth:MainScreen.kt$private fun handleTouchEvent( event: MotionEvent, activeTouches: MutableMap&lt;Int, TouchPoint&gt;, carlinkManager: CarlinkManager, surfaceWidth: Int, surfaceHeight: Int, containerWidth: Int, containerHeight: Int, )</ID>
+    <ID>NestedBlockDepth:MessageParser.kt$MessageParser$private fun parseMediaData( header: MessageHeader, payload: ByteArray?, ): Message</ID>
+    <ID>NestedBlockDepth:MicrophoneCaptureManager.kt$MicrophoneCaptureManager.MicCaptureThread$override fun run()</ID>
+    <ID>NestedBlockDepth:UsbDeviceWrapper.kt$UsbDeviceWrapper$private fun claimBulkInterface(): Boolean</ID>
+    <ID>ReturnCount:DualStreamAudioManager.kt$DualStreamAudioManager$fun writeAudio( data: ByteArray, dataOffset: Int, dataLength: Int, audioType: Int, decodeType: Int, routingState: AudioRoutingState = AudioRoutingState(), ): Int</ID>
+    <ID>ReturnCount:MicrophoneCaptureManager.kt$MicrophoneCaptureManager$fun start(decodeType: Int = 5): Boolean</ID>
+    <ID>SwallowedException:MainScreen.kt$e: Exception</ID>
+    <ID>SwallowedException:MainScreen.kt$e: IllegalArgumentException</ID>
+    <ID>SwallowedException:MediaSessionManager.kt$MediaSessionManager$e: Exception</ID>
+    <ID>ThrowsCount:MessageParser.kt$MessageParser$fun parseHeader(data: ByteArray): MessageHeader</ID>
+    <ID>TooGenericExceptionCaught:AdapterDriver.kt$AdapterDriver$e: Exception</ID>
+    <ID>TooGenericExceptionCaught:AdapterDriver.kt$AdapterDriver.&lt;no name provided&gt;$e: Exception</ID>
+    <ID>TooGenericExceptionCaught:AlbumArtCache.kt$AlbumArtCache$e: Exception</ID>
+    <ID>TooGenericExceptionCaught:CarlinkManager.kt$CarlinkManager$e: Exception</ID>
+    <ID>TooGenericExceptionCaught:CarlinkMediaBrowserService.kt$CarlinkMediaBrowserService$e: Exception</ID>
+    <ID>TooGenericExceptionCaught:DualStreamAudioManager.kt$DualStreamAudioManager$e: Exception</ID>
+    <ID>TooGenericExceptionCaught:DualStreamAudioManager.kt$DualStreamAudioManager.AudioPlaybackThread$e: Exception</ID>
+    <ID>TooGenericExceptionCaught:MainActivity.kt$MainActivity$e: Exception</ID>
+    <ID>TooGenericExceptionCaught:MainScreen.kt$e: Exception</ID>
+    <ID>TooGenericExceptionCaught:MediaSessionManager.kt$MediaSessionManager$e: Exception</ID>
+    <ID>TooGenericExceptionCaught:MicrophoneCaptureManager.kt$MicrophoneCaptureManager$e: Exception</ID>
+    <ID>TooGenericExceptionCaught:MicrophoneCaptureManager.kt$MicrophoneCaptureManager.MicCaptureThread$e: Exception</ID>
+    <ID>TooGenericExceptionCaught:PlatformDetector.kt$PlatformDetector$e: Exception</ID>
+    <ID>TooGenericExceptionCaught:UsbDeviceWrapper.kt$UsbDeviceWrapper$e: Exception</ID>
+    <ID>TooManyFunctions:AdapterDriver.kt$AdapterDriver</ID>
+    <ID>TooManyFunctions:CarlinkManager.kt$CarlinkManager</ID>
+    <ID>TooManyFunctions:DualStreamAudioManager.kt$DualStreamAudioManager</ID>
+    <ID>TooManyFunctions:Logger.kt$Logger</ID>
+    <ID>TooManyFunctions:Logger.kt$com.carlink.logging.Logger.kt</ID>
+    <ID>TooManyFunctions:MainActivity.kt$MainActivity : ComponentActivity</ID>
+    <ID>TooManyFunctions:MediaSessionManager.kt$MediaSessionManager</ID>
+    <ID>TooManyFunctions:MessageParser.kt$MessageParser</ID>
+    <ID>TooManyFunctions:MessageSerializer.kt$MessageSerializer</ID>
+    <ID>TooManyFunctions:MicrophoneCaptureManager.kt$MicrophoneCaptureManager</ID>
+    <ID>TooManyFunctions:UsbDeviceWrapper.kt$UsbDeviceWrapper</ID>
+    <ID>VariableNaming:MessageTypes.kt$MessageType$// Legacy aliases for backwards compatibility @Deprecated("Use PEER_BLUETOOTH_ADDRESS", ReplaceWith("PEER_BLUETOOTH_ADDRESS")) val NETWORK_MAC_ADDRESS get() = PEER_BLUETOOTH_ADDRESS</ID>
+    <ID>VariableNaming:MessageTypes.kt$MessageType$@Deprecated("Use CLOSE_DONGLE", ReplaceWith("CLOSE_DONGLE")) val CLOSE_ADAPTR get() = CLOSE_DONGLE</ID>
+    <ID>VariableNaming:MessageTypes.kt$MessageType$@Deprecated("Use PEER_BLUETOOTH_ADDRESS_ALT", ReplaceWith("PEER_BLUETOOTH_ADDRESS_ALT")) val NETWORK_MAC_ADDRESS_ALT get() = PEER_BLUETOOTH_ADDRESS_ALT</ID>
+  </CurrentIssues>
+</SmellBaseline>

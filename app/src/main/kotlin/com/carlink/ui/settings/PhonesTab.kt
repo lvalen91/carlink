@@ -67,6 +67,9 @@ import kotlinx.coroutines.delay
  */
 private val CARD_WIDTH = 240.dp
 
+/** Safety-net timeout for the connect/disconnect guard if the adapter never reaches a terminal state. */
+private const val PROCESSING_TIMEOUT_MS = 10_000L
+
 /**
  * Phones tab — shows adapter's paired device list as horizontal scrolling cards.
  *
@@ -113,12 +116,17 @@ fun PhonesTabContent(carlinkManager: CarlinkManager) {
         }
     }
 
-    // Guard against rapid button taps launching conflicting operations.
-    // HAZARD: no timeout fallback — if the adapter swallows 0x0F or stays stuck in
-    // CONNECTING/DEVICE_CONNECTED, the LaunchedEffect(managerState) below never fires
-    // the reset and every wireless card's onTap stays disabled indefinitely.
-    // Suggested fix: LaunchedEffect(isProcessing) { if (isProcessing) { delay(10_000); isProcessing = false } }.
+    // Guard against rapid button taps launching conflicting operations. The state-driven reset
+    // below clears this on a normal connect/disconnect; this timeout is the safety net for when
+    // the adapter swallows the command or stalls in CONNECTING — without it the cards would stay
+    // disabled indefinitely (UI deadlock recoverable only by leaving the tab).
     var isProcessing by remember { mutableStateOf(false) }
+    LaunchedEffect(isProcessing) {
+        if (isProcessing) {
+            delay(PROCESSING_TIMEOUT_MS)
+            isProcessing = false
+        }
+    }
 
     // Hoisted remove dialog state to prevent stale device references across recompositions.
     var deviceToRemove by remember { mutableStateOf<CarlinkManager.DeviceInfo?>(null) }
@@ -189,9 +197,13 @@ fun PhonesTabContent(carlinkManager: CarlinkManager) {
         }
     }
 
-    // Reset processing guard when state changes (connection completed or failed)
+    // Reset processing guard when state changes (connection completed or failed). DEVICE_CONNECTED
+    // is a terminal outcome for the tap too: a phone can connect and plateau there without ever
+    // advancing to STREAMING (e.g. CarPlay handshake stalls), so the guard must clear or the card
+    // stays disabled despite a completed connect.
     LaunchedEffect(managerState) {
         if (managerState == CarlinkManager.State.STREAMING ||
+            managerState == CarlinkManager.State.DEVICE_CONNECTED ||
             managerState == CarlinkManager.State.DISCONNECTED
         ) {
             isProcessing = false

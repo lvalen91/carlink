@@ -115,32 +115,6 @@ class CarlinkManager(
         // Surface debouncing - wait for size to stabilize before updating codec
         private const val SURFACE_DEBOUNCE_MS = 150L
 
-        // AA MOVE rate-limit interval (~60 fps budget).
-        //
-        // IMPORTANT — different semantics from AutoKit despite the shared 17 ms number:
-        // AutoKit uses 17 ms as a STATIONARY-FINGER MOVE REPEATER: on DOWN it starts a
-        // periodic timer that keeps re-sending the captured-at-DOWN position every
-        // 17 ms until UP cancels it, so the phone keeps receiving MOVE updates even
-        // when the finger is not moving. AutoKit does NOT rate-limit OS-delivered
-        // MotionEvents — every ACTION_MOVE is sent to USB immediately.
-        //
-        // carlink_native uses 17 ms as the OPPOSITE: a rate-limit on OS-delivered
-        // MOVE events (skip a MOVE send when <17 ms has elapsed since the previous
-        // one). This caps the per-second packet rate but does NOT emit the synthetic
-        // stationary-finger repeats AutoKit does. If AA ever drops projection on
-        // long stationary touches, implementing AutoKit's repeater pattern may be
-        // required.
-        //
-        // Wire-format cross-reference (verified against the AutoKit implementation):
-        // type 0x05 SingleTouch, 16-byte payload, action codes 14/15/16 for
-        // DOWN/MOVE/UP, coordinates normalized to 0-10000, flag word at offset 12
-        // packs encoderType | (offScreen << 16). See [MessageSerializer.serializeSingleTouch].
-        //
-        // Applies only to the AA path (type 0x05 SingleTouch); CarPlay sessions use
-        // 0x17 MultiTouch and do not consult this constant. 2026-04-20 UI_TOUCH traces
-        // (2 CarPlay sessions, ~100min) show pointers=1 on every event; zero multi-touch.
-        private const val AA_TOUCH_THROTTLE_NS = 17_000_000L
-
         // ---------------------------------------------------------------------------------
         // Reconnect-escalation patterns (in-source conventions)
         //
@@ -511,9 +485,6 @@ class CarlinkManager(
         val evenWidth = surfaceWidth and 1.inv()
         val evenHeight = surfaceHeight and 1.inv()
 
-        // Track actual surface dims for AA crop/touch calculations
-        val prevSurfaceWidth = actualSurfaceWidth
-        val prevSurfaceHeight = actualSurfaceHeight
         actualSurfaceWidth = evenWidth
         actualSurfaceHeight = evenHeight
 

@@ -92,9 +92,6 @@ android {
         // use in MediaSessionManager.kt / CarlinkMediaBrowserService.kt. The code is correct
         // and compiles clean; suppress the lint check.
         disable += "UnsafeOptInUsageError"
-        // Baseline captures the remaining accepted warnings (UnusedResources, OldTargetApi,
-        // etc.) so lintSideloadDebug passes and surfaces only NEW issues going forward.
-        baseline = file("lint-baseline.xml")
     }
 }
 
