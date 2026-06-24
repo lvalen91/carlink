@@ -8,7 +8,6 @@ import androidx.core.content.edit
 import com.carlink.BuildConfig
 import com.carlink.audio.DualStreamAudioManager
 import com.carlink.audio.MicrophoneCaptureManager
-import com.carlink.gnss.GnssForwarder
 import com.carlink.logging.Logger
 import com.carlink.logging.logDebug
 import com.carlink.logging.logError
@@ -17,7 +16,6 @@ import com.carlink.logging.logVideoUsb
 import com.carlink.logging.logWarn
 import com.carlink.media.CarlinkMediaBrowserService
 import com.carlink.media.MediaSessionManager
-import com.carlink.navigation.NavigationStateManager
 import com.carlink.platform.AudioConfig
 import com.carlink.platform.PlatformDetector
 import com.carlink.protocol.AdapterConfig
@@ -34,7 +32,6 @@ import com.carlink.protocol.MediaType
 import com.carlink.protocol.Message
 import com.carlink.protocol.MessageSerializer
 import com.carlink.protocol.MultiTouchAction
-import com.carlink.protocol.NaviFocusMessage
 import com.carlink.protocol.PeerBluetoothAddressMessage
 import com.carlink.protocol.PhaseMessage
 import com.carlink.protocol.PhoneType
@@ -47,8 +44,6 @@ import com.carlink.protocol.UnknownMessage
 import com.carlink.protocol.UnpluggedMessage
 import com.carlink.protocol.VideoStreamingSignal
 import com.carlink.ui.settings.AdapterConfigPreference
-import com.carlink.ui.settings.MicSourceConfig
-import com.carlink.ui.settings.WiFiBandConfig
 import com.carlink.usb.UsbDeviceWrapper
 import com.carlink.util.AppExecutors
 import com.carlink.util.LogCallback
@@ -69,29 +64,21 @@ import java.util.concurrent.atomic.AtomicReference
 /**
  * Main Carlink Manager
  *
- * Central orchestrator for the Carlink native application:
+ * Central orchestrator for the CarPlay-only (cp-stripped) app:
  * - USB device lifecycle management
  * - Protocol communication via AdapterDriver
  * - Video rendering via H264Renderer
  * - Audio playback via DualStreamAudioManager
  * - Microphone capture for Siri/calls
- * - MediaSession integration for AAOS
- * - NavigationStateManager bootstrap (see `init { NavigationStateManager.initialize(context.applicationContext) }`)
- *   which enables cluster-navigation routing for NAVI_JSON/NAVI_IMAGE messages.
+ * - MediaSession integration for AAOS (metadata + album art)
  * - CarlinkMediaBrowserService foreground-service lifecycle: CONNECTING/STREAMING start the
  *   FGS via `CarlinkMediaBrowserService.startConnectionForeground`, DISCONNECTED stops it
  *   via `stopConnectionForeground` (see [updateMediaSessionState]).
- * - GnssForwarder start/stop driven by `config.gpsForwarding` — started at STREAMING and
- *   on PLUGGED (START_GNSS_REPORT), stopped in stop()/release()/handleError()
- *   (NOT stopped in rebootAdapter — minor leak; reboot already implies disconnect, so low-impact).
  * - Auto-reconnect with exponential backoff and Pattern A / Pattern B / Pattern C status
  *   escalation (defined inline near the SHORT_SESSION_* constants; see [scheduleReconnect]
  *   and [handleError]).
  * - Device-management surface: DevList merging from BoxSettings, [forgetDevice],
  *   [connectToDevice] (targeted AutoConnect_By_BtAddress), [refreshDeviceList].
- * - Cluster-navigation gating: NAVI_JSON / NAVI_IMAGE are dropped unless
- *   `AdapterConfigPreference.getClusterNavigationSync()` returns true at message time
- *   (read per-message, not cached — see sites in [processMediaMetadata]).
  */
 class CarlinkManager(
     private val context: Context,
@@ -109,36 +96,12 @@ class CarlinkManager(
      */
     injectedMediaSessionManager: MediaSessionManager? = null,
 ) {
-    init {
-        NavigationStateManager.initialize(context.applicationContext)
-        // Enable the composer debug PNG dumper so every composed maneuver bitmap is also
-        // written to /sdcard/Android/data/zeno.carlink/files/composer_test/ for offline
-        // eyeball-check via `adb pull`. The pure compose path is unaffected by the dumper —
-        // it's a pass-through side channel triggered from ComposedIconStore.populateFromIap2m.
-        // Strip together with the [NAVI_JSON_RX] debug logging when this stabilizes.
-        com.carlink.navigation.compose.ManeuverIconDebugDumper.enable(context.applicationContext)
-        // Enable the runtime composer (D16). Without this, lookups return null and the
-        // existing static-XML / AA-bitmap paths handle the cluster icon — same behavior as
-        // before D16. Turning this ON activates the per-route precompose + cluster icon
-        // override pipeline. Validation pathway: PNGs written by ManeuverIconDebugDumper
-        // continue regardless of this flag.
-        com.carlink.navigation.compose.ComposedIconStore.setEnabled(true)
-
-        // VCU/VCUNH1 (CT5, AAOS 14) enum-only cluster gate. There the cluster is a separate QNX
-        // safety-domain VM that renders a native Altia sprite from the Maneuver enum and MASKS the
-        // app bitmap/URI (see documents/reference/gminfo/projection/cluster_maneuver_mapping.md §0/§4).
-        // The roundabout WITH_ANGLE refinement (ManeuverMapper) still feeds that enum, but the
-        // per-maneuver bitmap compose and the AA-bitmap shim are dead work there — skip both.
-        // BEST-EFFORT / UNTESTED detection (no VCUNH1 hardware); harmless elsewhere (default off).
-        val clusterIsEnumOnly = PlatformDetector.detect(context).isVcuCluster()
-        if (clusterIsEnumOnly) {
-            com.carlink.navigation.compose.ComposedIconStore.setBitmapComposeEnabled(false)
-            NavigationStateManager.setClusterEnumOnly(true)
-        }
-    }
 
     // Config can be updated when actual surface dimensions are known
     private var config: AdapterConfig = initialConfig
+
+    /** Configured WiFi/Bluetooth name the adapter advertises (shown on the dashboard). */
+    val adapterName: String get() = config.boxName
 
     companion object {
         private const val USB_WAIT_PERIOD_MS = 3000L
@@ -283,19 +246,6 @@ class CarlinkManager(
         snapshot.forEach { it.onDeviceListChanged(_deviceList) }
     }
 
-    /**
-     * AA center-crop parameters for SurfaceView oversize/clip layout and touch remapping.
-     * Null when not applicable (CarPlay, 16:9 display, or no config yet).
-     */
-    data class AaCropParams(
-        val tierWidth: Int,
-        val tierHeight: Int,
-        val contentWidth: Int,
-        val contentHeight: Int,
-        val cropLeft: Int,
-        val cropTop: Int,
-    )
-
     // Coroutine scope for async operations
     private val scope = CoroutineScope(Dispatchers.Main)
 
@@ -366,17 +316,6 @@ class CarlinkManager(
     private var actualSurfaceWidth = 0
     private var actualSurfaceHeight = 0
 
-    // Video state from adapter header — tracked for AA touch flags (AutoKit packs these in touch payload)
-    // encoderType: 1=H264, 2=H265(default/initial), 4=MJPEG
-    // offScreen: 0=on-screen, 1=off-screen
-    // Concurrency: read by sendMultiTouch on Dispatchers.IO when packing the AA touch-frame
-    // flag word. Multiple writers: videoProcessor on USB read thread (primary), stop() on
-    // main thread, handleError() on the call-site thread. All writes are simple constants
-    // (not RMW), so @Volatile is still sufficient — single-writer claim was incorrect.
-    @Volatile private var videoEncoderType = 2
-
-    @Volatile private var videoOffScreen = 0
-
     // Audio
     private var audioManager: DualStreamAudioManager? = null
     private var audioInitialized = false
@@ -413,8 +352,6 @@ class CarlinkManager(
     @Volatile private var isPhoneCallAudioActive = false
     @Volatile private var isAlertAudioActive = false
 
-    // GNSS
-    private var gnssForwarder: GnssForwarder? = null
 
     // MediaSession
     // App-scope-owned (see constructor KDoc on [injectedMediaSessionManager]). This
@@ -515,7 +452,6 @@ class CarlinkManager(
         lastIsPlaying = true
         _connectedBtMac = null
         currentWifi = null
-        NavigationStateManager.clear()
     }
 
     // Executors
@@ -584,19 +520,11 @@ class CarlinkManager(
         // Config resolution was pre-computed from stable WindowMetrics in MainActivity.
         // Do NOT override with surface dimensions — SurfaceView size oscillates during
         // Compose layout (systemBars insets apply asynchronously on AAOS).
-        if (config.userSelectedResolution) {
-            logInfo(
-                "[RES] Using user-selected resolution ${config.width}x${config.height} " +
-                    "(surface: ${evenWidth}x$evenHeight)",
-                tag = Logger.Tags.VIDEO,
-            )
-        } else {
-            logInfo(
-                "[RES] Using pre-computed resolution ${config.width}x${config.height} " +
-                    "(surface: ${evenWidth}x$evenHeight)",
-                tag = Logger.Tags.VIDEO,
-            )
-        }
+        logInfo(
+            "[RES] Using resolution ${config.width}x${config.height} " +
+                "(surface: ${evenWidth}x$evenHeight)",
+            tag = Logger.Tags.VIDEO,
+        )
 
         // LIFECYCLE FIX: If renderer exists, always update surface via setOutputSurface().
         //
@@ -641,15 +569,11 @@ class CarlinkManager(
                     )
 
                     // Persistent-divergence detector: the codec decodes at the pre-computed
-                    // config (stable WindowMetrics, see L584-586); the surface dims above are the
-                    // live UI area. A mismatch at first-init is an expected startup transient that
-                    // the debounce coalesces away — but if it SURVIVES the debounce and lands here,
-                    // the on-screen area genuinely disagrees with the projection area (visual
-                    // scale/crop mismatch), not a layout artifact. Skip when the user pinned a
-                    // custom resolution (config intentionally != surface then).
-                    if (!config.userSelectedResolution &&
-                        (pendingSurfaceWidth != config.width || pendingSurfaceHeight != config.height)
-                    ) {
+                    // config (stable WindowMetrics); the surface dims above are the live UI area.
+                    // A mismatch at first-init is an expected startup transient that the debounce
+                    // coalesces away — but if it SURVIVES the debounce and lands here, the on-screen
+                    // area genuinely disagrees with the projection area (visual scale/crop mismatch).
+                    if (pendingSurfaceWidth != config.width || pendingSurfaceHeight != config.height) {
                         logWarn(
                             "[RES] Surface stabilized at ${pendingSurfaceWidth}x$pendingSurfaceHeight " +
                                 "but codec is ${config.width}x${config.height} — persistent divergence " +
@@ -661,18 +585,6 @@ class CarlinkManager(
 
                     this@CarlinkManager.callback = finalCallback
                     this@CarlinkManager.videoSurface = finalSurface
-
-                    // If container dimensions changed during an AA session, resend
-                    // BoxSettings so the phone re-renders for the new content area.
-                    // prevSurfaceWidth/Height captured before actualSurface* was overwritten.
-                    val dimsChanged =
-                        prevSurfaceWidth > 0 && prevSurfaceHeight > 0 &&
-                            (prevSurfaceWidth != pendingSurfaceWidth || prevSurfaceHeight != pendingSurfaceHeight)
-                    if (dimsChanged && currentPhoneType == PhoneType.ANDROID_AUTO) {
-                        resendBoxSettings()
-                        // Notify UI so oversized surface recalculates for new crop params
-                        finalCallback.onPhoneTypeChanged(PhoneType.ANDROID_AUTO)
-                    }
 
                     if (codecDeferred && currentPhoneType != null) {
                         // AA resize complete — start codec with the new oversized surface
@@ -774,15 +686,6 @@ class CarlinkManager(
                 logCallback,
             )
 
-        // Initialize GNSS forwarder for GPS → adapter → CarPlay pipeline (only if enabled)
-        if (config.gpsForwarding) {
-            gnssForwarder =
-                GnssForwarder(
-                    context = context,
-                    sendGnssData = { adapterDriver?.sendGnssData(it) ?: false },
-                    logCallback = ::log,
-                )
-        }
 
         // MediaSession lifetime is owned by MainActivity (see constructor KDoc). We only
         // attach our transport-control callback so routed Play/Pause/Skip events reach
@@ -888,30 +791,6 @@ class CarlinkManager(
         usbDevice = device
         setStatusText("Adapter found — opening...")
 
-        // AltVideo (USB 0x2C) gate — evaluated each session start (cheap; PlatformDetector
-        // is not cached). Both checks must pass:
-        //   1. BuildConfig.DEBUG — production APKs are bit-identical to pre-feature behavior.
-        //   2. PlatformDetector.isAaosEmulator() — Build.PRODUCT starts with "sdk_gcar".
-        //      Real GM IHU + Pixel + everything else stays inert. ClusterHomeDisplay
-        //      (the consumer priv-app) currently runs only on the AAOS emulator.
-        // The same boolean is mirrored to MessageSerializer (gates naviScreenInfo JSON
-        // -> adapter never emits 0x2C without it) and to NaviVideoSingleton (gates the
-        // UsbDeviceWrapper demux split — defense in depth).
-        val naviGateEnabled =
-            BuildConfig.DEBUG && PlatformDetector.detect(context).isAaosEmulator()
-        MessageSerializer.includeNaviScreenInfo = naviGateEnabled
-        com.carlink.ipc.NaviVideoSingleton.enabled = naviGateEnabled
-        logInfo(
-            if (naviGateEnabled) {
-                "[NAVI_GATE] AltVideo (0x2C) forwarding ENABLED — debug build on AAOS emulator. " +
-                    "naviScreenInfo will be sent in BoxSettings; 0x2C frames will be forwarded to " +
-                    "zeno.carlink.ipc.NaviVideoSourceService consumers."
-            } else {
-                "[NAVI_GATE] AltVideo (0x2C) forwarding disabled (debug=${BuildConfig.DEBUG}, " +
-                    "emulator=${PlatformDetector.detect(context).isAaosEmulator()})"
-            },
-            tag = Logger.Tags.VIDEO,
-        )
 
         if (!device.openWithPermission()) {
             logError("Failed to open USB device", tag = Logger.Tags.USB)
@@ -953,43 +832,28 @@ class CarlinkManager(
                 videoProcessor = videoProcessor,
             )
 
-        // Determine initialization mode based on first-run state and pending changes
+        // Init mode is decided mid-handshake: AdapterDriver sends OPEN first, waits for the
+        // adapter's boxInfo (uuid), then calls resolveInitMode below to pick FULL vs MINIMAL.
+        // FULL on first install / version bump / a new-or-unrecognized adapter uuid; else MINIMAL.
+        // (Adapter config is hardcoded — no per-session config refresh.)
         val adapterConfigPref = AdapterConfigPreference.getInstance(context)
         val currentVersionCode = context.packageManager.getPackageInfo(context.packageName, 0).longVersionCode
-        val initMode = adapterConfigPref.getInitializationMode(currentVersionCode)
-        val pendingChanges = adapterConfigPref.getPendingChangesSync()
-
-        // Refresh user-configurable settings from preference store before starting
-        // This ensures changes made in Settings screen are applied on next connection
-        // (display settings like width/height are kept from original config)
-        val userConfig = adapterConfigPref.getUserConfigSync()
-        val refreshedConfig =
-            config.copy(
-                audioTransferMode = userConfig.audioTransferMode,
-                // Sample rate is hardcoded to 48kHz - not user configurable
-                sampleRate = 48000,
-                micType =
-                    when (userConfig.micSource) {
-                        MicSourceConfig.APP -> "os"
-                        MicSourceConfig.PHONE -> "box"
-                    },
-                wifiType =
-                    when (userConfig.wifiBand) {
-                        WiFiBandConfig.BAND_5GHZ -> "5ghz"
-                        WiFiBandConfig.BAND_24GHZ -> "24ghz"
-                    },
-                callQuality = userConfig.callQuality.value,
-                fps = userConfig.fps.fps,
-                handDriveMode = userConfig.handDrive.value,
-                gpsForwarding = userConfig.gpsForwarding,
+        var decidedMode: AdapterConfigPreference.InitMode? = null
+        var stagedUuid: String? = null
+        val resolveInitMode: (String?) -> String = { uuid ->
+            stagedUuid = uuid
+            val mode = adapterConfigPref.getInitializationMode(currentVersionCode, uuid)
+            decidedMode = mode
+            logInfo(
+                "[INIT] Mode: ${adapterConfigPref.getInitializationInfo(currentVersionCode, uuid)}",
+                tag = Logger.Tags.ADAPTR,
             )
-        config = refreshedConfig // Update stored config for other uses
+            mode.name
+        }
 
-        log("[INIT] Mode: ${adapterConfigPref.getInitializationInfo(currentVersionCode)}")
-        log("[INIT] Audio mode: ${if (refreshedConfig.audioTransferMode) "BLUETOOTH" else "ADAPTER"}")
-
+        log("[INIT] Audio mode: ${if (config.audioTransferMode) "BLUETOOTH" else "ADAPTER"}")
         setStatusText("Initializing adapter...")
-        val initSuccess = adapterDriver?.start(refreshedConfig, initMode.name, pendingChanges, actualSurfaceWidth, actualSurfaceHeight) ?: false
+        val initSuccess = adapterDriver?.start(config, resolveInitMode) ?: false
 
         // If a targeted connect was requested (user selected a specific device),
         // override the adapter's wifiConnect auto-connect timer with the target MAC.
@@ -1003,23 +867,15 @@ class CarlinkManager(
             setStatusText("Waiting for phone...")
         }
 
-        // Mark first init completed, store version, and clear pending changes
-        // ONLY clear pending changes if all init messages were sent successfully —
-        // otherwise the changes will be retried on next connection attempt.
+        // On a successful FULL init, record first-init + version + the staged adapter uuid so
+        // later sessions with the same adapter take MINIMAL.
         CoroutineScope(Dispatchers.IO).launch {
-            if (initSuccess) {
-                if (initMode == AdapterConfigPreference.InitMode.FULL) {
-                    adapterConfigPref.markFirstInitCompleted()
-                }
+            if (initSuccess && decidedMode == AdapterConfigPreference.InitMode.FULL) {
+                adapterConfigPref.markFirstInitCompleted()
                 adapterConfigPref.updateLastInitVersionCode(currentVersionCode)
-                if (pendingChanges.isNotEmpty()) {
-                    adapterConfigPref.clearPendingChanges()
-                }
-            } else {
-                logWarn(
-                    "[INIT] Init messages failed — pending changes preserved for retry",
-                    tag = Logger.Tags.ADAPTR,
-                )
+                stagedUuid?.let { adapterConfigPref.updateLastStagedUuid(it) }
+            } else if (!initSuccess) {
+                logWarn("[INIT] Init messages failed", tag = Logger.Tags.ADAPTR)
             }
         }
 
@@ -1059,8 +915,6 @@ class CarlinkManager(
         currentWifi = null
         videoPhoneTypeInferred = false
         codecDeferred = true // Reset for next connection
-        videoEncoderType = 2 // Reset to H265/initial
-        videoOffScreen = 0
         callback?.onPhoneTypeChanged(PhoneType.UNKNOWN)
         clearCachedMediaMetadata() // Clear stale metadata to prevent race conditions on reconnect
         activeVoiceMode = VoiceMode.NONE // Reset voice mode on disconnect
@@ -1068,12 +922,6 @@ class CarlinkManager(
         isPhoneCallAudioActive = false
         isAlertAudioActive = false // Reset purpose on disconnect
         stopMicrophoneCapture()
-
-        // Stop GPS forwarding before stopping adapter (only if forwarder was created)
-        if (gnssForwarder != null) {
-            adapterDriver?.sendCommand(CommandMapping.STOP_GNSS_REPORT)
-            gnssForwarder?.stop()
-        }
 
         // Graceful teardown: notify adapter before killing connection.
         // Must happen before adapterDriver?.stop() (send() checks isRunning).
@@ -1107,6 +955,19 @@ class CarlinkManager(
         scope.launch(Dispatchers.IO) {
             adapterDriver?.disconnectPhone()
         }
+    }
+
+    /**
+     * Forward the AAOS day/night state to CarPlay mid-session via the night-mode command
+     * (ENABLE_NIGHT_MODE 16 / DISABLE_NIGHT_MODE 17, H→A→P) so CarPlay's own UI follows the head
+     * unit's theme. Safe to call anytime — a no-op when no adapter session is active (sendCommand
+     * is null-safe). Driven by [com.carlink.ui.MainScreen] off isSystemInDarkTheme(), so it fires
+     * when a session reaches STREAMING and whenever the system theme toggles.
+     */
+    fun setNightMode(night: Boolean) {
+        val cmd = if (night) CommandMapping.ENABLE_NIGHT_MODE else CommandMapping.DISABLE_NIGHT_MODE
+        logInfo("[NIGHT] AAOS night=$night → ${cmd.name}", tag = Logger.Tags.ADAPTR)
+        scope.launch(Dispatchers.IO) { adapterDriver?.sendCommand(cmd) }
     }
 
     // ==================== Device Management ====================
@@ -1196,58 +1057,14 @@ class CarlinkManager(
      */
     private fun sendKey(command: CommandMapping): Boolean = adapterDriver?.sendCommand(command) ?: false
 
-    // AA MOVE rate-limit timestamp. carlink_native skips a MOVE send when <17ms
-    // elapsed since the previous one. See [AA_TOUCH_THROTTLE_NS] for the full
-    // explanation — and the important distinction from AutoKit's use of the same
-    // 17ms number (AutoKit's 17ms is a stationary-finger MOVE repeater, NOT a
-    // rate limit).
-    @Volatile private var lastAaTouchSendTimeNs = 0L
-
     /**
-     * Send a multi-touch event (CarPlay) or single-touch event (Android Auto).
-     * AA uses type 0x05 with 0..10000 ints; CarPlay uses type 0x17 with 0..1 floats.
+     * Send a multi-touch event (CarPlay — type 0x17, 0..1 floats).
      * Dispatched to IO — USB bulkTransfer must never block the UI thread.
-     *
-     * On the AA path, MOVE events are rate-limited to one per [AA_TOUCH_THROTTLE_NS]
-     * window. DOWN and UP are always sent immediately. This is a carlink_native-side
-     * rate limit, NOT an imitation of AutoKit; see the constant's KDoc for details.
      */
     fun sendMultiTouch(touches: List<MessageSerializer.TouchPoint>) {
         val driver = adapterDriver ?: return
-        val isAA = currentPhoneType == PhoneType.ANDROID_AUTO
         scope.launch(Dispatchers.IO) {
-            if (isAA && touches.isNotEmpty()) {
-                // AA: send primary pointer as single-touch (type 0x05, 0..10000 ints)
-                val primary = touches.first()
-
-                // Rate-limit MOVE events to one per [AA_TOUCH_THROTTLE_NS] window.
-                // Not an AutoKit-compatibility behavior — AutoKit sends every MOVE
-                // immediately. See the constant's KDoc for the full comparison.
-                if (primary.action == MultiTouchAction.MOVE) {
-                    val now = System.nanoTime()
-                    if (now - lastAaTouchSendTimeNs < AA_TOUCH_THROTTLE_NS) return@launch
-                    lastAaTouchSendTimeNs = now
-                }
-
-                val xi = (primary.x * 10000).toInt()
-                val yi = (primary.y * 10000).toInt()
-                if (BuildConfig.DEBUG) {
-                    logDebug(
-                        "[AA_TOUCH] type=0x05 action=${primary.action} x=$xi y=$yi" +
-                            " (norm=${primary.x},${primary.y})",
-                        tag = Logger.Tags.TOUCH,
-                    )
-                }
-                driver.sendSingleTouch(
-                    x = xi,
-                    y = yi,
-                    action = primary.action,
-                    encoderType = videoEncoderType,
-                    offScreen = videoOffScreen,
-                )
-            } else {
-                driver.sendMultiTouch(touches)
-            }
+            driver.sendMultiTouch(touches)
         }
     }
 
@@ -1318,9 +1135,6 @@ class CarlinkManager(
 
         microphoneManager?.stop()
         microphoneManager = null
-
-        gnssForwarder?.stop()
-        gnssForwarder = null
 
         // MediaSession is app-scope owned by MainActivity — do NOT release here.
         //
@@ -1430,65 +1244,6 @@ class CarlinkManager(
     }
 
     /**
-     * Compute AA center-crop parameters from the current adapter config.
-     * Returns null for CarPlay, 16:9 displays, or when config has no native dims.
-     * Uses config.width/height (video surface dims) to match serializeBoxSettings AR calc.
-     */
-    fun getAaCropParams(): AaCropParams? {
-        // Use actual surface dims (ground truth from Compose layout), not config dims
-        // (which come from WindowMetrics and may differ due to AAOS dock inset behavior).
-        val surfW = if (actualSurfaceWidth > 0) actualSurfaceWidth else config.width
-        val surfH = if (actualSurfaceHeight > 0) actualSurfaceHeight else config.height
-        if (surfW <= 0 || surfH <= 0) return null
-
-        val (tierWidth, tierHeight) =
-            if (surfH > surfW) {
-                when {
-                    surfW >= 1080 -> Pair(1080, 1920)
-                    surfW >= 720 -> Pair(720, 1280)
-                    else -> Pair(480, 800)
-                }
-            } else {
-                when {
-                    surfW >= 1920 -> Pair(1920, 1080)
-                    surfW >= 1280 -> Pair(1280, 720)
-                    else -> Pair(800, 480)
-                }
-            }
-        val displayAR = surfW.toFloat() / surfH.toFloat()
-        val tierAR = tierWidth.toFloat() / tierHeight.toFloat()
-        // Two-way fit: baked bars sit on whichever tier axis the display does NOT bind.
-        // displayAR >= tierAR → bars top/bottom (crop vertically); else → bars left/right.
-        return if (displayAR >= tierAR) {
-            val contentHeight = ((tierWidth.toFloat() / displayAR).toInt() and 0xFFFE).coerceAtMost(tierHeight)
-            if (contentHeight >= tierHeight) return null // exact AR match — no crop
-            AaCropParams(tierWidth, tierHeight, tierWidth, contentHeight, 0, (tierHeight - contentHeight) / 2)
-        } else {
-            val contentWidth = ((tierHeight.toFloat() * displayAR).toInt() and 0xFFFE).coerceAtMost(tierWidth)
-            if (contentWidth >= tierWidth) return null // exact AR match — no crop
-            AaCropParams(tierWidth, tierHeight, contentWidth, tierHeight, (tierWidth - contentWidth) / 2, 0)
-        }
-    }
-
-    /**
-     * Resend BoxSettings to the adapter with current surface dimensions.
-     * Called when display mode changes during an AA session so the phone
-     * re-renders content for the new container size.
-     */
-    fun resendBoxSettings() {
-        val driver = adapterDriver ?: return
-        val w = actualSurfaceWidth
-        val h = actualSurfaceHeight
-        if (w <= 0 || h <= 0) return
-        logInfo(
-            "[LIFECYCLE] Resending BoxSettings for new surface ${w}x$h",
-            tag = Logger.Tags.VIDEO,
-        )
-        val msg = MessageSerializer.serializeBoxSettings(config, surfaceWidth = w, surfaceHeight = h)
-        scope.launch(Dispatchers.IO) { driver.send(msg) }
-    }
-
-    /**
      * Pause video decoding when app goes to background.
      *
      * On AAOS, when the app is covered by another app (e.g., Maps, Phone), the Surface
@@ -1541,14 +1296,8 @@ class CarlinkManager(
 
         // Request keyframe so video recovers immediately after background
         if (state == State.STREAMING || state == State.DEVICE_CONNECTED) {
-            if (currentPhoneType == PhoneType.ANDROID_AUTO) {
-                // AA: single keyframe request (periodic FRAME commands reset phone UI)
-                val sent = adapterDriver?.sendCommand(CommandMapping.FRAME) ?: false
-                logInfo("[LIFECYCLE] AA resume keyframe sent=$sent", tag = Logger.Tags.VIDEO)
-            } else {
-                // CarPlay: restart the periodic keyframe timer (2.5s initial + 30s periodic)
-                scheduleDelayedKeyframe()
-            }
+            // CarPlay: restart the periodic keyframe timer (2.5s initial + 30s periodic)
+            scheduleDelayedKeyframe()
         }
     }
 
@@ -1683,10 +1432,6 @@ class CarlinkManager(
                 CarlinkMediaBrowserService.startConnectionForeground(context)
                 // Ensure wake lock is held during streaming
                 acquireWakeLock()
-                // Start GPS forwarding to CarPlay (only if enabled in settings)
-                if (config.gpsForwarding) {
-                    gnssForwarder?.start()
-                }
                 // MediaSession is already ACTIVE from the DEVICE_CONNECTED transition.
                 // MEDIA_DATA frames drive metadata/playback-state via
                 // MediaSessionManager.updateMetadata/updatePlaybackState — no explicit
@@ -1831,54 +1576,13 @@ class CarlinkManager(
                     }
                 }
 
-                // Set AA mode on renderer for AA-specific behaviors:
-                // first-frame skip, frame cache replay, crop scaling mode
-                h264Renderer?.setAndroidAutoMode(message.phoneType == PhoneType.ANDROID_AUTO)
-
-                // For CarPlay: start codec now (no surface resize needed).
-                // For AA: onPhoneTypeChanged triggers UI resize → surfaceDestroyed/Created →
-                // debounce path calls startCodecIfDeferred() with the new oversized surface.
-                if (message.phoneType != PhoneType.ANDROID_AUTO) {
-                    startCodecIfDeferred()
-                }
+                // CarPlay: start codec now (no surface resize needed).
+                startCodecIfDeferred()
 
                 callback?.onPhoneTypeChanged(message.phoneType)
 
-                // Enable GPS forwarding for CarPlay navigation (only if enabled in settings)
-                if (config.gpsForwarding) {
-                    adapterDriver?.sendCommand(CommandMapping.START_GNSS_REPORT)
-                }
-
                 setState(State.DEVICE_CONNECTED)
                 setStatusText("Phone connected — starting session...")
-
-                // Proactively kick AltVideo (0x2C) streaming — step 1 of the three-step 508
-                // handshake (see RE_Documention/02_Protocol_Reference/video_protocol.md
-                // "Handshake Sequence"). On wireless CarPlay the adapter never initiates with
-                // 508 — it sends only 506 (audio nav focus) — so without this proactive send
-                // the handshake never starts and _AltScreenSetup is never invoked.
-                // Step 3 (echo the adapter's 508 reply) lives in the CommandMessage handler.
-                // Gated on debug+emulator + CarPlay (AA has no 0x2C path).
-                if (com.carlink.ipc.NaviVideoSingleton.enabled &&
-                    (message.phoneType == PhoneType.CARPLAY ||
-                        message.phoneType == PhoneType.CARPLAY_WIRELESS)
-                ) {
-                    scope.launch {
-                        // Small delay lets the adapter finish its post-PLUGGED handshake
-                        // (REQUEST_VIDEO_FOCUS / REQUEST_NAVI_FOCUS arrive ~3-4s after PLUGGED).
-                        // Send 508 after that so the adapter's session-init has set
-                        // g_bSupportNaviScreen and the iPhone has registered featureAltScreen.
-                        delay(2000)
-                        val sent = adapterDriver?.sendCommand(
-                            CommandMapping.REQUEST_NAVI_SCREEN_FOCUS,
-                        ) ?: false
-                        logInfo(
-                            "[NAVI_FWD] Proactive REQUEST_NAVI_SCREEN_FOCUS (508) sent=$sent " +
-                                "— kicking 0x2C AltVideo streaming",
-                            tag = Logger.Tags.VIDEO,
-                        )
-                    }
-                }
             }
 
             is UnpluggedMessage -> {
@@ -1906,26 +1610,10 @@ class CarlinkManager(
                     setState(State.STREAMING)
                     setStatusText("Streaming")
 
-                    if (currentPhoneType == PhoneType.ANDROID_AUTO) {
-                        // AA needs one keyframe request at session start to stabilize video.
-                        // Unlike CarPlay, AA must NOT receive periodic FRAME commands (resets phone UI).
-                        val sent = adapterDriver?.sendCommand(CommandMapping.FRAME) ?: false
-                        logInfo("[FRAME_INTERVAL] AA one-shot keyframe request sent=$sent", tag = Logger.Tags.VIDEO)
-                    } else {
-                        // CarPlay: delayed keyframe request 2.5s after first video.
-                        // The adapter's natural SPS+PPS+IDR arrives at session start and decodes
-                        // immediately. This delayed request serves as a safety net for cold-start
-                        // decoder poisoning — empirically an Intel/MediaCodec-specific risk:
-                        // - POTATO GM AAOS gminfo37 OMX.Intel.hw_vd.h264: 1-of-3 sessions had
-                        //   Rx=48/Dec=0 zombie reset ~4min in, recovered via 2.5s IDR + 30s periodic.
-                        // - macOS Carlink (VTDecompression/AVFoundation, firmware 2025.10.15.1127CAY):
-                        //   0 resets across 24-minute session with ONLY 1 FRAME cmd at start.
-                        // - AAOS emulator v120 (c2.goldfish.h264.decoder): 30s periodic FRAME
-                        //   confirmed, 0 poisoning events across 3min.
-                        // The 30s periodic is conservative defense for Intel MediaCodec; host-side
-                        // FRAME cadence is policy, not firmware/iPhone requirement.
-                        scheduleDelayedKeyframe()
-                    }
+                    // CarPlay: delayed keyframe request 2.5s after first video — cold-start
+                    // decoder-poisoning safety net (Intel/MediaCodec-specific). 30s periodic
+                    // is conservative defense; host-side FRAME cadence is policy, not required.
+                    scheduleDelayedKeyframe()
                 }
                 // Video data already processed directly by videoProcessor (DIRECT_HANDOFF)
             }
@@ -1967,41 +1655,6 @@ class CarlinkManager(
                 ) {
                     setStatusText("Phone found — connecting...")
                     logDebug("[CMD] ${message.command.name}", tag = Logger.Tags.ADAPTR)
-                } else if (message.command == CommandMapping.REQUEST_NAVI_SCREEN_FOCUS) {
-                    // Step 3 of the three-step 508 handshake: adapter sent 508 back in reply to
-                    // our proactive step-1 send (CommandMessage handler in PluggedMessage at ~L1805).
-                    // Echo another 508 to confirm; the adapter then completes _AltScreenSetup
-                    // and starts emitting Type 0x2C. See RE_Documention/02_Protocol_Reference/
-                    // video_protocol.md "Handshake Sequence" for the wire diagram.
-                    // Gated on NaviVideoSingleton.enabled so production APKs stay inert.
-                    logDebug(
-                        "[CMD] REQUEST_NAVI_SCREEN_FOCUS (id=508) received from adapter",
-                        tag = Logger.Tags.ADAPTR,
-                    )
-                    if (com.carlink.ipc.NaviVideoSingleton.enabled) {
-                        val sent = adapterDriver?.sendCommand(
-                            CommandMapping.REQUEST_NAVI_SCREEN_FOCUS,
-                        ) ?: false
-                        logInfo(
-                            "[NAVI_FWD] Echoed 508 back to adapter sent=$sent — completing focus handshake",
-                            tag = Logger.Tags.VIDEO,
-                        )
-                    }
-                } else if (message.command == CommandMapping.RELEASE_NAVI_SCREEN_FOCUS) {
-                    // Adapter signaled end of nav video. Echo 509 back and notify the
-                    // forwarder so consumer overlays hide deterministically.
-                    logDebug(
-                        "[CMD] RELEASE_NAVI_SCREEN_FOCUS (id=509) received from adapter",
-                        tag = Logger.Tags.ADAPTR,
-                    )
-                    if (com.carlink.ipc.NaviVideoSingleton.enabled) {
-                        adapterDriver?.sendCommand(CommandMapping.RELEASE_NAVI_SCREEN_FOCUS)
-                        com.carlink.ipc.NaviVideoSingleton.forwarder.onStreamStop()
-                        logInfo(
-                            "[NAVI_FWD] Echoed 509 back + stopped forwarder",
-                            tag = Logger.Tags.VIDEO,
-                        )
-                    }
                 } else if (message.command == CommandMapping.INVALID) {
                     unknownCommandCount++
                     unknownCommandIds.add(message.rawId)
@@ -2137,21 +1790,6 @@ class CarlinkManager(
                     logDebug("[PHASE] ${message.phase} (${message.phaseName})", tag = Logger.Tags.ADAPTR)
                 } else {
                     logDebug("[PHASE] ${message.phase} (${message.phaseName})", tag = Logger.Tags.ADAPTR)
-                }
-            }
-
-            // Navigation focus — echo back as recommended precaution (testing inconclusive)
-            is NaviFocusMessage -> {
-                if (message.isRequest) {
-                    logDebug("[NAVI] Navigation video focus requested — echoing 508", tag = Logger.Tags.ADAPTR)
-                    adapterDriver?.sendCommand(CommandMapping.REQUEST_NAVI_SCREEN_FOCUS)
-                } else {
-                    logDebug("[NAVI] Navigation video focus released — echoing 509", tag = Logger.Tags.ADAPTR)
-                    adapterDriver?.sendCommand(CommandMapping.RELEASE_NAVI_SCREEN_FOCUS)
-                    // Tell forwarder to broadcast onStreamEnded to bound consumers. Idempotent
-                    // and safe to call when gate is false (the forwarder no-ops on !streamActive,
-                    // and on prod/non-emulator no sinks are ever registered anyway).
-                    com.carlink.ipc.NaviVideoSingleton.forwarder.onStreamStop()
                 }
             }
 
@@ -2513,122 +2151,7 @@ class CarlinkManager(
         }
     }
 
-    // DEBUG helper: emit a possibly-long iAP2 hex string across multiple log lines so the
-    // full payload survives logcat's per-line ~4000 char cap. Single short strings fit in
-    // one line. Strip together with processMediaMetadata's [NAVI_JSON_RX] block before
-    // production release.
-    private fun logIap2Field(
-        name: String,
-        hex: String,
-    ) {
-        val chunkSize = 3500
-        val total = (hex.length + chunkSize - 1) / chunkSize
-        if (total <= 1) {
-            logInfo("[NAVI_JSON_RX:$name len=${hex.length}] $hex", tag = Logger.Tags.NAVI)
-            return
-        }
-        for (i in 0 until total) {
-            val s = i * chunkSize
-            val e = minOf(s + chunkSize, hex.length)
-            logInfo(
-                "[NAVI_JSON_RX:$name len=${hex.length} chunk=${i + 1}/$total] ${hex.substring(s, e)}",
-                tag = Logger.Tags.NAVI,
-            )
-        }
-    }
-
     private fun processMediaMetadata(message: MediaDataMessage) {
-        // Route NaviJSON to NavigationStateManager for cluster display (only if enabled)
-        if (message.type == MediaType.NAVI_JSON) {
-            // DEBUG: log full NaviJSON receipt so we can confirm the patched ARMiPhoneIAP2
-            // is emitting `_iap2` / `_iap2m` recovery fields. Each _iap2* hex payload (up to
-            // ~3KB for 0x5202 maneuver bursts) is emitted on its own log line and chunked at
-            // 3500 chars to stay under Android's per-line logcat limit (~4000). Decoder-side
-            // re-assembly: concatenate all "[NAVI_JSON_RX:_iap2m] chunk=N/M payload=..." lines
-            // for the same timestamp. Strip before production-grade release.
-            val keys = message.payload.keys.sorted()
-            // Dump primitive Navi* values (skip _iap2/_iap2m which are huge hex — those go on
-            // their own chunked lines below). Lets us correlate per-step events against the
-            // 0x5202 maneuver list during the cursor-walk-matcher design pass.
-            val naviPrimitives = message.payload
-                .filterKeys { it.startsWith("Navi") }
-                .entries
-                .joinToString(", ") { (k, v) ->
-                    val s = v.toString()
-                    "$k=${if (s.length > 80) s.take(80) + "…" else s}"
-                }
-            logInfo("[NAVI_JSON_RX] keys=$keys${if (naviPrimitives.isNotEmpty()) " | $naviPrimitives" else ""}", tag = Logger.Tags.NAVI)
-            // v6.1: parse raw 0x5201 RouteGuidanceUpdate for the wire cursor + state and
-            // feed NavigationStateManager BEFORE onNaviJson runs (same USB read thread).
-            // Set null on absent _iap2 OR parse failure to prevent stale-cursor reuse —
-            // see Iap2StateParser.parse contract.
-            val iap2Hex = message.payload["_iap2"] as? String
-            if (iap2Hex != null) {
-                logIap2Field("_iap2", iap2Hex)
-                com.carlink.navigation.NavigationStateManager.setLastIap2State(
-                    com.carlink.navigation.Iap2StateParser.parse(iap2Hex)
-                )
-            } else {
-                com.carlink.navigation.NavigationStateManager.setLastIap2State(null)
-            }
-            (message.payload["_iap2m"] as? String)?.let { iap2m ->
-                logIap2Field("_iap2m", iap2m)
-                // Populate the runtime icon composer cache. Parses the burst synchronously
-                // (cheap) on this USB read thread, then dispatches the per-maneuver
-                // compose+render to a background worker so it never blocks video reads.
-                // Per-step events later call ComposedIconStore.lookup (static fallback until
-                // the background fill completes). Gated by ComposedIconStore.enabled — when
-                // off, lookup returns null and the static-XML / AA-bitmap paths handle the
-                // cluster icon. See app/src/main/kotlin/com/carlink/navigation/compose/.
-                val dispatched = com.carlink.navigation.compose.ComposedIconStore.populateFromIap2m(iap2m)
-                if (dispatched != null) {
-                    logInfo("[NAVI_JSON_RX] Composer dispatched $dispatched maneuvers for background compose", tag = Logger.Tags.NAVI)
-                }
-            }
-            // NOTE: getClusterNavigationSync() is read at message time, NOT cached —
-            // a user toggling cluster navigation in AdapterConfigurationDialog takes effect
-            // on the next NAVI_* message, no restart needed.
-            if (AdapterConfigPreference.getInstance(context).getClusterNavigationSync()) {
-                NavigationStateManager.onNaviJson(message.payload)
-            }
-            return
-        }
-
-        // Route AA maneuver icons to NavigationStateManager (sub-type 201)
-        if (message.type == MediaType.NAVI_IMAGE) {
-            // NOTE: getClusterNavigationSync() is read at message time, NOT cached —
-            // a user toggling cluster navigation in AdapterConfigurationDialog takes effect
-            // on the next NAVI_* message, no restart needed.
-            if (AdapterConfigPreference.getInstance(context).getClusterNavigationSync()) {
-                val imageData = message.payload["NaviImage"] as? ByteArray
-                if (imageData != null) {
-                    NavigationStateManager.onNaviImage(imageData)
-                } else {
-                    logWarn("[NAVI_ICON] NAVI_IMAGE message with no image data", tag = Logger.Tags.NAVI)
-                }
-            }
-            return
-        }
-
-        // Android Auto album art arrives as a standalone MEDIA_DATA subtype 2 message (PNG).
-        // Cache it and push a metadata update so MediaSession gets the cover immediately,
-        // without waiting for the next subtype-1 JSON tick which carries no image bytes.
-        if (message.type == MediaType.ALBUM_COVER_AA) {
-            val coverBytes = message.payload["AlbumCover"] as? ByteArray
-            if (coverBytes != null) {
-                lastAlbumCover = coverBytes
-                mediaSessionManager?.updateMetadata(
-                    title = lastMediaSongName,
-                    artist = lastMediaArtistName,
-                    album = lastMediaAlbumName,
-                    appName = lastMediaAppName,
-                    albumArt = lastAlbumCover,
-                    duration = lastDuration,
-                )
-            }
-            return
-        }
-
         // CallStatus JSON (subtype 100) — iAP2 CallStateEngine forwarding.
         // Log at INFO for release troubleshooting. Not consumed for UI — CarPlay/AA
         // projection already shows call screen, and cluster requires system privilege.
@@ -2814,8 +2337,6 @@ class CarlinkManager(
         currentWifi = null
         videoPhoneTypeInferred = false
         codecDeferred = true
-        videoEncoderType = 2
-        videoOffScreen = 0
         callback?.onPhoneTypeChanged(PhoneType.UNKNOWN)
         clearCachedMediaMetadata()
         activeVoiceMode = VoiceMode.NONE
@@ -2823,7 +2344,6 @@ class CarlinkManager(
         isPhoneCallAudioActive = false
         isAlertAudioActive = false
         stopMicrophoneCapture()
-        gnssForwarder?.stop()
 
         // Stop adapter driver (heartbeat, reading loop) and close USB.
         // Skip graceful teardown — USB is likely dead.
@@ -3080,58 +2600,13 @@ class CarlinkManager(
                     logVideoUsb { "processVideoDirect: frame=$videoFrameCount dataLength=$dataLength, pts=$sourcePtsMs" }
                 }
 
-                // Parse encoder state from video header for touch flags (AutoKit compatibility).
-                // Offset 8: bitmask convention — bit 0 = offScreen, bits 2-3 = encoderType.
-                // Confirmed against AutoKit: its video-header parser extracts `(i9 >> 2) & 3` and
-                // applies the exact mapping below (0→H265, 1→H264, 2→MJPEG), then stores both
-                // values in member fields and packs them into the touch payload at offset 12
-                // as `encoderType | (offScreen << 16)` — identical to [MessageSerializer.serializeSingleTouch].
-                // Values echoed in touch payload only — not used for codec decisions.
-                if (dataLength >= 12) {
-                    val flags =
-                        (data[8].toInt() and 0xFF) or ((data[9].toInt() and 0xFF) shl 8) or
-                            ((data[10].toInt() and 0xFF) shl 16) or ((data[11].toInt() and 0xFF) shl 24)
-                    videoOffScreen = flags and 1
-                    val rawEncoder = (flags shr 2) and 3
-                    videoEncoderType =
-                        when (rawEncoder) {
-                            0 -> 2
-
-                            // H265
-                            1 -> 1
-
-                            // H264
-                            2 -> 4
-
-                            // MJPEG
-                            else -> 2
-                        }
-                }
-
-                // Infer phone type from video header if PLUGGED was missed (mid-session rejoin).
-                // Video header: [0..3]=width, [4..7]=height (LE int32). AA tiers are exactly
-                // 800x480, 1280x720, or 1920x1080. CarPlay uses arbitrary display dims.
-                if (!videoPhoneTypeInferred && currentPhoneType == null && dataLength >= 8) {
+                // Infer CarPlay if PLUGGED was missed (mid-session rejoin) — CarPlay-only build.
+                if (!videoPhoneTypeInferred && currentPhoneType == null) {
                     videoPhoneTypeInferred = true
-                    val w =
-                        (data[0].toInt() and 0xFF) or ((data[1].toInt() and 0xFF) shl 8) or
-                            ((data[2].toInt() and 0xFF) shl 16) or ((data[3].toInt() and 0xFF) shl 24)
-                    val h =
-                        (data[4].toInt() and 0xFF) or ((data[5].toInt() and 0xFF) shl 8) or
-                            ((data[6].toInt() and 0xFF) shl 16) or ((data[7].toInt() and 0xFF) shl 24)
-                    val isAaTier = (w == 1920 && h == 1080) || (w == 1280 && h == 720) || (w == 800 && h == 480)
-                    if (isAaTier) {
-                        logInfo("[VIDEO] Inferred ANDROID_AUTO from video header ${w}x$h (mid-session)", tag = Logger.Tags.VIDEO)
-                        currentPhoneType = PhoneType.ANDROID_AUTO
-                        h264Renderer?.setAndroidAutoMode(true)
-                        callback?.onPhoneTypeChanged(PhoneType.ANDROID_AUTO)
-                    } else {
-                        logInfo("[VIDEO] Inferred CARPLAY from video header ${w}x$h (mid-session)", tag = Logger.Tags.VIDEO)
-                        currentPhoneType = PhoneType.CARPLAY
-                        h264Renderer?.setAndroidAutoMode(false)
-                        callback?.onPhoneTypeChanged(PhoneType.CARPLAY)
-                        scheduleDelayedKeyframe()
-                    }
+                    logInfo("[VIDEO] Inferred CARPLAY from video (mid-session)", tag = Logger.Tags.VIDEO)
+                    currentPhoneType = PhoneType.CARPLAY
+                    callback?.onPhoneTypeChanged(PhoneType.CARPLAY)
+                    scheduleDelayedKeyframe()
                 }
 
                 // Skip 20-byte video header, feed H.264 data directly to codec

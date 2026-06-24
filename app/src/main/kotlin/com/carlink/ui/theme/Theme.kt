@@ -1,6 +1,7 @@
 package com.carlink.ui.theme
 
 import android.app.Activity
+import android.os.Build
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Typography
@@ -11,7 +12,6 @@ import androidx.compose.material3.lightColorScheme
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.SideEffect
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.unit.dp
 import androidx.core.view.WindowCompat
@@ -119,6 +119,8 @@ fun CarlinkTheme(
 ) {
     val colorScheme =
         when {
+            // Dynamic color (Material You) — minSdk 32, always available when enabled.
+            // dynamicColor defaults false for consistent branding (see param KDoc).
             dynamicColor -> {
                 val context = androidx.compose.ui.platform.LocalContext.current
                 if (darkTheme) dynamicDarkColorScheme(context) else dynamicLightColorScheme(context)
@@ -145,15 +147,12 @@ fun CarlinkTheme(
         // the work only runs when inputs actually change.
         SideEffect {
             val window = (view.context as Activity).window
-            // HAZARD (latent visual bug): neither `DarkColorScheme` nor `LightColorScheme`
-            // declares `background`, so Material's defaults are used here
-            // (`#FFFBFE` light / `#1C1B1F` dark) — these DO NOT match the custom `surface`
-            // tokens (`#F5FAFB` / `#0E1415`). Result: status/nav bars can visibly drift
-            // from the app surface. To fix (future change, intentionally not applied here):
-            // either use `colorScheme.surface.toArgb()` on the two lines below, or declare
-            // `background` explicitly in both schemes to match `surface`.
-            window.statusBarColor = colorScheme.background.toArgb()
-            window.navigationBarColor = colorScheme.background.toArgb()
+            // System-bar background colors are intentionally NOT set here. Window
+            // statusBarColor / navigationBarColor are deprecated (edge-to-edge enforcement),
+            // and MainActivity already calls enableEdgeToEdge(), drawing content behind
+            // transparent system bars. We only drive the bar ICON appearance (light/dark) to
+            // match the theme; the bar scrims are handled by edge-to-edge. (This also removes
+            // the prior background-vs-surface color-mismatch hazard.)
             WindowCompat.getInsetsController(window, view).apply {
                 isAppearanceLightStatusBars = !darkTheme
                 isAppearanceLightNavigationBars = !darkTheme

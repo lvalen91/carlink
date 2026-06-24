@@ -102,10 +102,6 @@ object MessageParser {
 
             MessageType.SESSION_TOKEN -> SessionTokenMessage(header, header.length)
 
-            MessageType.NAVI_FOCUS_REQUEST -> NaviFocusMessage(header, isRequest = true)
-
-            MessageType.NAVI_FOCUS_RELEASE -> NaviFocusMessage(header, isRequest = false)
-
             MessageType.PEER_BLUETOOTH_ADDRESS_ALT -> parsePeerBluetoothAddress(header, payload)
 
             MessageType.LOGO_TYPE -> parseIntPayload(header, payload, "LogoType")
@@ -797,17 +793,6 @@ class SessionTokenMessage(
     val payloadSize: Int,
 ) : Message(header) {
     override fun toString(): String = "SessionToken(${payloadSize}B encrypted)"
-}
-
-/**
- * Navigation focus request/release (0x6E/0x6F).
- * Signals when CarPlay navigation video should start/stop.
- */
-class NaviFocusMessage(
-    header: MessageHeader,
-    val isRequest: Boolean,
-) : Message(header) {
-    override fun toString(): String = if (isRequest) "NaviFocusRequest" else "NaviFocusRelease"
 }
 
 /**

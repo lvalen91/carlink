@@ -81,3 +81,6 @@ mempalace.yaml
 # Serena MCP local cache/logs/config
 .serena/
 **/.serena/
+
+# Personal planning notes (local only)
+documents/STRIP_PLAN.md

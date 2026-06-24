@@ -2,6 +2,7 @@ package com.carlink.ui.settings
 
 import android.view.HapticFeedbackConstants
 import androidx.compose.foundation.Image
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -25,8 +26,6 @@ import androidx.compose.material.icons.filled.Wifi
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
-import androidx.compose.material3.Card
-import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
@@ -42,6 +41,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.res.painterResource
@@ -53,6 +53,8 @@ import com.carlink.CarlinkManager
 import com.carlink.R
 import com.carlink.protocol.PhoneType
 import com.carlink.ui.theme.AutomotiveDimens
+import com.carlink.ui.theme.GlassShapes
+import com.carlink.ui.theme.liquidGlass
 import kotlinx.coroutines.delay
 
 /**
@@ -63,7 +65,7 @@ import kotlinx.coroutines.delay
  * name + status line + Remove button without wrapping. No design token; retune only if
  * a device with non-200dpi ships.
  */
-private val CARD_WIDTH = 360.dp
+private val CARD_WIDTH = 240.dp
 
 /**
  * Phones tab — shows adapter's paired device list as horizontal scrolling cards.
@@ -125,10 +127,11 @@ fun PhonesTabContent(carlinkManager: CarlinkManager) {
         modifier = Modifier.fillMaxSize(),
         contentAlignment = Alignment.Center,
     ) {
+        // Row wraps its content (no fillMaxWidth) so the Box can center it both axes; when the
+        // cards overflow the card width, horizontalScroll lets the list scroll.
         Row(
             modifier =
                 Modifier
-                    .fillMaxWidth()
                     .height(IntrinsicSize.Max)
                     .horizontalScroll(rememberScrollState())
                     .padding(24.dp),
@@ -235,19 +238,11 @@ private fun UsbDeviceCard(
     val colorScheme = MaterialTheme.colorScheme
     val alpha = if (isConnected) 1f else 0.38f
 
-    val containerColor =
-        if (isConnected && phoneType != null) {
-            activeCardColor(phoneType)
-        } else {
-            colorScheme.surfaceContainerLow
-        }
-
+    val tint = if (isConnected && phoneType != null) activeCardColor(phoneType).copy(alpha = 0.5f) else null
     val textColor = if (isConnected) Color.White else colorScheme.onSurface.copy(alpha = alpha)
 
-    Card(
-        modifier = modifier,
-        elevation = CardDefaults.cardElevation(defaultElevation = 1.dp),
-        colors = CardDefaults.cardColors(containerColor = containerColor),
+    Box(
+        modifier = modifier.liquidGlass(GlassShapes.Inner, tint = tint),
     ) {
         Column(
             modifier = Modifier.padding(24.dp).fillMaxWidth().fillMaxHeight(),
@@ -276,8 +271,8 @@ private fun UsbDeviceCard(
             if (isConnected && phoneType != null) {
                 Text(
                     text = "Connected",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = Color.White.copy(alpha = 0.85f),
+                    style = MaterialTheme.typography.titleMedium,
+                    color = Color.White,
                 )
 
                 // Push icon to bottom
@@ -300,7 +295,7 @@ private fun UsbDeviceCard(
                 Text(
                     text = "No device",
                     style = MaterialTheme.typography.bodyLarge,
-                    color = colorScheme.onSurface.copy(alpha = 0.38f),
+                    color = colorScheme.onSurface.copy(alpha = 0.6f),
                 )
             }
         }
@@ -333,28 +328,27 @@ private fun WirelessDeviceCard(
 ) {
     val colorScheme = MaterialTheme.colorScheme
 
-    val containerColor =
+    // Active state shows as a translucent green/blue tint over the glass; unknown types and the
+    // inactive state fall through to neutral glass.
+    val tint =
         if (isConnected) {
-            // See class KDoc: String match is fragile — unknown types fall through here.
             when (device.type) {
-                "CarPlay" -> CarPlayActiveColor
-                "AndroidAuto" -> AndroidAutoActiveColor
-                else -> colorScheme.surfaceContainerHighest
+                "CarPlay" -> CarPlayActiveColor.copy(alpha = 0.5f)
+                "AndroidAuto" -> AndroidAutoActiveColor.copy(alpha = 0.5f)
+                else -> null
             }
         } else {
-            colorScheme.surfaceContainer
+            null
         }
 
-    // UX INCONSISTENCY: Card(onClick=...) has no `enabled` parameter, so the ripple still
-    // animates on tap when `enabled == false`; only the inner `if (enabled) onTap()` barrier
-    // suppresses the action. The Button below uses the proper `enabled = enabled` and is
-    // visually/interaction-disabled correctly. Consider wrapping the Card click in an
-    // interactionSource-gated modifier, or migrating to a clickable modifier with enabled.
-    Card(
-        onClick = { if (enabled) onTap() },
-        modifier = modifier,
-        elevation = CardDefaults.cardElevation(defaultElevation = 1.dp),
-        colors = CardDefaults.cardColors(containerColor = containerColor),
+    // clickable(enabled=...) gates both the ripple and the action (fixes the prior Card(onClick)
+    // ripple-while-disabled inconsistency).
+    Box(
+        modifier =
+            modifier
+                .liquidGlass(GlassShapes.Inner, tint = tint)
+                .clip(GlassShapes.Inner)
+                .clickable(enabled = enabled, onClick = onTap),
     ) {
         Column(
             modifier = Modifier.padding(24.dp).fillMaxWidth().fillMaxHeight(),
@@ -403,8 +397,8 @@ private fun WirelessDeviceCard(
                     } else {
                         device.lastConnected?.let { "Last seen: $it" } ?: "Disconnected"
                     },
-                style = MaterialTheme.typography.bodySmall,
-                color = if (isConnected) Color.White.copy(alpha = 0.85f) else colorScheme.onSurfaceVariant,
+                style = MaterialTheme.typography.bodyLarge,
+                color = if (isConnected) Color.White else colorScheme.onSurface,
                 textAlign = TextAlign.Center,
             )
 
@@ -449,13 +443,8 @@ private fun WirelessDeviceCard(
 private fun EmptyDeviceCard(modifier: Modifier = Modifier) {
     val colorScheme = MaterialTheme.colorScheme
 
-    Card(
-        modifier = modifier,
-        elevation = CardDefaults.cardElevation(defaultElevation = 1.dp),
-        colors =
-            CardDefaults.cardColors(
-                containerColor = colorScheme.surfaceContainerLow,
-            ),
+    Box(
+        modifier = modifier.liquidGlass(GlassShapes.Inner),
     ) {
         Column(
             modifier =
@@ -474,13 +463,13 @@ private fun EmptyDeviceCard(modifier: Modifier = Modifier) {
             Text(
                 text = "No paired wireless devices",
                 style = MaterialTheme.typography.titleMedium,
-                color = colorScheme.onSurface.copy(alpha = 0.6f),
+                color = colorScheme.onSurface,
             )
             Spacer(modifier = Modifier.height(4.dp))
             Text(
                 text = "Connect a phone to the adapter to get started",
                 style = MaterialTheme.typography.bodyMedium,
-                color = colorScheme.onSurfaceVariant.copy(alpha = 0.6f),
+                color = colorScheme.onSurface.copy(alpha = 0.8f),
             )
         }
     }

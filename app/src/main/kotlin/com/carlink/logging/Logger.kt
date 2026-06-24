@@ -3,25 +3,20 @@ package com.carlink.logging
 import android.util.Log
 import com.carlink.BuildConfig
 import java.util.concurrent.ConcurrentHashMap
-import java.util.concurrent.CopyOnWriteArrayList
 
 /**
- * Centralized logging facade for the app.
+ * Centralized logging facade for the CarPlay-only (cp-stripped) build.
  *
- * Responsibilities:
- *  - Uniform call surface (v/d/i/w/e plus top-level logDebug/logInfo/logWarn/logError).
- *  - Tag filtering (27 tags in [Tags]) with a default-ENABLED policy for unregistered tags
- *    — callers must use presets to disable tags they don't want.
- *  - Level filtering via [LogLevel] presets, with a derived [minLevel] fast-path.
- *  - [LogListener] fan-out for persistence. Today [FileLogManager] is the sole listener.
- *  - Debug-build-only mirroring to android.util.Log; release builds route exclusively
- *    through listeners to avoid per-packet Log.d() overhead on the GM AAOS Intel Atom.
- *  - [Tags.PROTO_UNKNOWN] bypass so protocol anomalies always reach persistence.
- *  - Inline [logDebugOnly] family with lambda message builders for zero-cost call sites
- *    when a tag is disabled.
+ * - Uniform call surface (v/d/i/w/e plus the top-level logDebug/logInfo/logWarn/logError).
+ * - logcat policy: DEBUG builds emit everything; RELEASE builds emit WARN/ERROR only, plus
+ *   [Tags.PROTO_UNKNOWN] which always passes (protocol anomalies must reach logcat for
+ *   post-mortem forensics). The log-to-file feature was removed in this variant — there is
+ *   no listener fan-out and no preset/level UI.
+ * - Zero-cost [logDebugOnly] family: the message lambda runs only when debug logging is
+ *   enabled AND the tag is enabled, so release builds compile verbose call sites to no-ops.
  *
- * Threading: [log] dispatches to listeners SYNCHRONOUSLY on the caller's thread. That
- * is the load-bearing invariant [FileLogManager.onLog] is engineered around.
+ * `setDebugLoggingEnabled(false)` (set at startup in release builds) disables the verbose
+ * video/audio pipeline tags so their [logDebugOnly] call sites become no-ops.
  */
 object Logger {
     private const val TAG = "CARLINK"
@@ -34,16 +29,6 @@ object Logger {
         INFO(Log.INFO),
         WARN(Log.WARN),
         ERROR(Log.ERROR),
-    }
-
-    /** LogPreset-compatible log levels. Intentionally omits VERBOSE — presets cannot
-     *  filter VERBOSE and no call site uses [Logger.v] today; it exists as a logcat-only
-     *  escape hatch. */
-    enum class LogLevel {
-        DEBUG,
-        INFO,
-        WARN,
-        ERROR,
     }
 
     object Tags {
@@ -69,10 +54,10 @@ object Logger {
         const val CLUSTER = "CLUSTER"
         const val ICON_SHIM = "ICON_SHIM"
 
-        /** Protocol unknowns — bypasses ALL tag/level filtering. Always reaches file logs. */
+        /** Protocol unknowns — always emitted, even in release builds. */
         const val PROTO_UNKNOWN = "PROTO_UNKNOWN"
 
-        // Video Pipeline Debug Tags
+        // Video / audio pipeline debug tags (gated off in release via setDebugLoggingEnabled).
         const val VIDEO_USB = "VIDEO_USB"
         const val VIDEO_RING_BUFFER = "VIDEO_RING"
         const val VIDEO_CODEC = "VIDEO_CODEC"
@@ -84,11 +69,23 @@ object Logger {
     @Volatile
     private var debugLoggingEnabled = true
 
-    /** Set debug logging state. In release mode, disables verbose pipeline tags. */
+    private val enabledTags = ConcurrentHashMap<String, Boolean>()
+
+    init {
+        enableTag(Tags.USB)
+        enableTag(Tags.VIDEO)
+        enableTag(Tags.AUDIO)
+        enableTag(Tags.ADAPTR)
+        enableTag(Tags.PHONE)
+        enableTag(Tags.MEDIA_SESSION)
+        enableTag(Tags.ERROR_RECOVERY)
+    }
+
+    /** Enable/disable debug logging. When disabled (release builds), the verbose pipeline tags
+     *  are turned off so their [logDebugOnly] call sites become no-ops. */
     fun setDebugLoggingEnabled(enabled: Boolean) {
         debugLoggingEnabled = enabled
         if (!enabled) {
-            // In release mode, disable verbose video pipeline tags
             disableTag(Tags.VIDEO_USB)
             disableTag(Tags.VIDEO_RING_BUFFER)
             disableTag(Tags.VIDEO_CODEC)
@@ -101,31 +98,6 @@ object Logger {
 
     fun isDebugLoggingEnabled(): Boolean = debugLoggingEnabled
 
-    interface LogListener {
-        fun onLog(
-            level: Level,
-            tag: String?,
-            message: String,
-            timestamp: Long,
-        )
-    }
-
-    private val enabledTags = ConcurrentHashMap<String, Boolean>()
-    private val listeners = CopyOnWriteArrayList<LogListener>()
-
-    @Volatile
-    private var minLevel = Level.DEBUG
-
-    init {
-        enableTag(Tags.USB)
-        enableTag(Tags.VIDEO)
-        enableTag(Tags.AUDIO)
-        enableTag(Tags.ADAPTR)
-        enableTag(Tags.PHONE)
-        enableTag(Tags.MEDIA_SESSION)
-        enableTag(Tags.ERROR_RECOVERY)
-    }
-
     fun enableTag(tag: String) {
         enabledTags[tag] = true
     }
@@ -134,113 +106,9 @@ object Logger {
         enabledTags[tag] = false
     }
 
-    // Default-ENABLED: unregistered tags pass the filter. LogPreset.apply() always
-    // explicitly configures the full set (via enableAllTags/disableAllTags followed by
-    // setTagsEnabled), so the default only governs transient states before a preset
-    // runs and one-off tags added without a preset update.
+    // Default-ENABLED: unregistered tags pass. Verbose tags are disabled by
+    // setDebugLoggingEnabled(false) in release builds.
     fun isTagEnabled(tag: String): Boolean = enabledTags[tag] ?: true
-
-    fun setMinLevel(level: Level) {
-        minLevel = level
-    }
-
-    private val logLevelEnabled =
-        ConcurrentHashMap<LogLevel, Boolean>().apply {
-            LogLevel.entries.forEach { put(it, true) }
-        }
-
-    fun setLogLevel(
-        level: LogLevel,
-        enabled: Boolean,
-    ) {
-        logLevelEnabled[level] = enabled
-        // Recalculate to fix release builds staying at ERROR after preset change
-        recalculateMinLevel()
-    }
-
-    // Picks the lowest enabled level as minLevel — i.e., the cutoff passed at
-    // log() line ~262. This ASSUMES contiguous preset masks (e.g., INFO+WARN+ERROR).
-    // A non-contiguous mask (e.g., INFO=on, WARN=off, ERROR=on) would compute
-    // minLevel=INFO and silently let WARN through. All 11 LogPresets use contiguous
-    // ranges today; if that ever changes, upgrade the fast-path to check the per-level
-    // map instead of just minLevel.priority.
-    private fun recalculateMinLevel() {
-        minLevel =
-            when {
-                logLevelEnabled[LogLevel.DEBUG] == true -> Level.DEBUG
-                logLevelEnabled[LogLevel.INFO] == true -> Level.INFO
-                logLevelEnabled[LogLevel.WARN] == true -> Level.WARN
-                logLevelEnabled[LogLevel.ERROR] == true -> Level.ERROR
-                else -> Level.ERROR
-            }
-    }
-
-    fun isLogLevelEnabled(level: LogLevel): Boolean = logLevelEnabled[level] ?: true
-
-    fun setTagsEnabled(
-        tags: List<String>,
-        enabled: Boolean,
-    ) {
-        tags.forEach { tag ->
-            enabledTags[tag] = enabled
-        }
-    }
-
-    fun disableAllTags() {
-        enabledTags.keys.forEach { tag ->
-            enabledTags[tag] = false
-        }
-    }
-
-    fun enableAllTags() {
-        enabledTags.keys.forEach { tag ->
-            enabledTags[tag] = true
-        }
-        // Also enable known tags
-        listOf(
-            Tags.USB,
-            Tags.VIDEO,
-            Tags.AUDIO,
-            Tags.MIC,
-            Tags.H264_RENDERER,
-            Tags.PLATFORM,
-            Tags.SERIALIZE,
-            Tags.COMMAND,
-            Tags.TOUCH,
-            Tags.CONFIG,
-            Tags.ADAPTR,
-            Tags.PHONE,
-            Tags.MEDIA,
-            Tags.MEDIA_SESSION,
-            Tags.FILE_LOG,
-            Tags.USB_RAW,
-            Tags.AUDIO_DEBUG,
-            Tags.ERROR_RECOVERY,
-            Tags.NAVI,
-            Tags.CLUSTER,
-            Tags.ICON_SHIM,
-            Tags.VIDEO_USB,
-            Tags.VIDEO_RING_BUFFER,
-            Tags.VIDEO_CODEC,
-            Tags.VIDEO_SURFACE,
-            Tags.VIDEO_PERF,
-            Tags.AUDIO_PERF,
-        ).forEach { tag ->
-            enabledTags[tag] = true
-        }
-    }
-
-    // Listeners are dispatched SYNCHRONOUSLY on the caller's thread inside log().
-    // Re-entrancy hazard: a listener that calls back into Logger.d/i/w/e on every
-    // onLog() will recurse until StackOverflow. Either queue-then-flush (as
-    // FileLogManager does) or explicitly gate self-logging behind a reentry flag.
-    fun addListener(listener: LogListener) {
-        listeners.add(listener)
-    }
-
-    fun removeListener(listener: LogListener) {
-        listeners.remove(listener)
-    }
 
     fun v(
         message: String,
@@ -274,37 +142,18 @@ object Logger {
         message: String,
         throwable: Throwable? = null,
     ) {
-        // Emit to system logcat only in debug builds (adb logcat capture during development).
-        // Release builds route exclusively through listeners (app file logging) to avoid
-        // per-packet Log.d() overhead on constrained hardware (GM AAOS Intel Atom).
-        if (BuildConfig.DEBUG) {
-            val formattedMessage = if (tag != null) "[$tag] $message" else message
-            when (level) {
-                Level.VERBOSE -> Log.v(TAG, formattedMessage, throwable)
-                Level.DEBUG -> Log.d(TAG, formattedMessage, throwable)
-                Level.INFO -> Log.i(TAG, formattedMessage, throwable)
-                Level.WARN -> Log.w(TAG, formattedMessage, throwable)
-                Level.ERROR -> Log.e(TAG, formattedMessage, throwable)
-            }
-        }
+        // DEBUG builds: emit everything. RELEASE builds: WARN/ERROR only, plus PROTO_UNKNOWN.
+        val emit =
+            BuildConfig.DEBUG || level.priority >= Level.WARN.priority || tag == Tags.PROTO_UNKNOWN
+        if (!emit) return
 
-        // Filter before any further work — skip timestamp + listener dispatch if filtered out.
-        // NEVER filter protocol-unknown messages — they must always reach file logs.
-        val bypassFilter = tag == Tags.PROTO_UNKNOWN
-        if (!bypassFilter) {
-            if (level.priority < minLevel.priority) return
-            if (tag != null && !isTagEnabled(tag)) return
-        }
-
-        if (listeners.isEmpty()) return
-
-        val timestamp = System.currentTimeMillis()
-        for (listener in listeners) {
-            try {
-                listener.onLog(level, tag, message, timestamp)
-            } catch (e: Exception) {
-                if (BuildConfig.DEBUG) Log.e(TAG, "Error in log listener: ${e.message}")
-            }
+        val formattedMessage = if (tag != null) "[$tag] $message" else message
+        when (level) {
+            Level.VERBOSE -> Log.v(TAG, formattedMessage, throwable)
+            Level.DEBUG -> Log.d(TAG, formattedMessage, throwable)
+            Level.INFO -> Log.i(TAG, formattedMessage, throwable)
+            Level.WARN -> Log.w(TAG, formattedMessage, throwable)
+            Level.ERROR -> Log.e(TAG, formattedMessage, throwable)
         }
     }
 }
@@ -340,11 +189,9 @@ fun log(
 
 fun isTagEnabled(tag: String): Boolean = Logger.isTagEnabled(tag)
 
-// Zero-cost debug logging: the message lambda is only invoked if both
-// debugLoggingEnabled AND the tag are enabled. debugLoggingEnabled defaults to true
-// and is wired to BuildConfig.DEBUG by MainActivity.initializeLogging() at startup —
-// so in release builds this compiles down to a no-op at every call site. Any other
-// entry point that forgets to call setDebugLoggingEnabled(false) will pay full cost.
+// Zero-cost debug logging: the message lambda is only invoked if both debugLoggingEnabled
+// AND the tag are enabled. In release builds debugLoggingEnabled is false (set by
+// MainActivity.initializeLogging), so every call site compiles down to a no-op.
 inline fun logDebugOnly(
     tag: String,
     message: () -> String,

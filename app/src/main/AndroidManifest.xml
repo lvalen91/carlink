@@ -4,8 +4,6 @@
 
     <!-- Permissions -->
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
-    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
-    <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />
@@ -13,22 +11,6 @@
     <uses-permission android:name="android.permission.CHANGE_NETWORK_STATE" />
     <uses-permission android:name="android.permission.WAKE_LOCK" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
-    <uses-permission android:name="androidx.car.app.NAVIGATION_TEMPLATES" />
-    <!-- Cluster CarAppService draws into the host-provided render surface. Verified on
-         the AAOS emulator: the Templates Host provisions a virtual display
-         "virtual:zeno.carlink,<uid>,CarAppService,0" owned by this app. Required by
-         Play AAOS review for navigation apps (developer.android.com/training/cars/apps/library/draw-maps). -->
-    <uses-permission android:name="androidx.car.app.ACCESS_SURFACE" />
-
-    <!-- AltVideo (USB 0x2C) IPC permission. Protects NaviVideoSourceService so only
-         co-signed priv-apps (ClusterHomeDisplay) can bind and consume the stream.
-         signature|privileged: caller must share our signing cert AND live in
-         /system/priv-app/. uses-permission is required because the service-protecting
-         permission is declared and used by the same app. -->
-    <permission
-        android:name="com.carlink.permission.NAVI_VIDEO_STREAM"
-        android:protectionLevel="signature|privileged" />
-    <uses-permission android:name="com.carlink.permission.NAVI_VIDEO_STREAM" />
 
     <!-- USB Host. required=false on purpose: the CPC200 adapter needs USB host at
          runtime, but GM AAOS (gm/gminfo37) does NOT advertise android.hardware.usb.host
@@ -51,17 +33,6 @@
     <uses-feature
         android:name="android.hardware.type.automotive"
         android:required="true" />
-    <!-- Car App Library Templates Host. The cluster CarAppService is bound and
-         surface-provisioned by com.google.android.apps.automotive.templates.host
-         (live-verified on the AAOS emulator: renderer_service holds an open
-         ConnectionRecord to CarlinkClusterService). Declared required per Play AAOS
-         review; every certified AAOS build — including GM — ships the Templates Host. -->
-    <uses-feature
-        android:name="android.software.car.templates_host"
-        android:required="true" />
-    <uses-feature
-        android:name="android.hardware.location.gps"
-        android:required="false" />
 
     <application
         android:allowBackup="true"
@@ -117,21 +88,6 @@
                 android:value="true" />
         </activity>
 
-        <!-- Hidden CarAppActivity — exists solely to trigger Templates Host binding.
-             NOT a launcher. Lives in separate task. Excluded from recents.
-             MainActivity remains the primary UI. -->
-        <activity
-            android:name="androidx.car.app.activity.CarAppActivity"
-            android:exported="false"
-            android:launchMode="singleTask"
-            android:taskAffinity="zeno.carlink.templates"
-            android:excludeFromRecents="true"
-            android:theme="@android:style/Theme.Translucent.NoTitleBar">
-            <meta-data
-                android:name="distractionOptimized"
-                android:value="true" />
-        </activity>
-
         <!-- Media3 MediaLibraryService for AAOS Integration.
              Dual intent-filter: the modern `androidx.media3.session.MediaLibraryService`
              action for Media3-aware controllers, and the legacy
@@ -164,37 +120,6 @@
                 android:value="HIDDEN" />
         </service>
 
-        <!-- Cluster Navigation CarAppService (headless — no UI on main display) -->
-        <service
-            android:name=".cluster.CarlinkClusterService"
-            android:enabled="false"
-            android:exported="true"
-            tools:ignore="ExportedService">
-            <intent-filter>
-                <action android:name="androidx.car.app.CarAppService" />
-                <category android:name="androidx.car.app.category.NAVIGATION" />
-                <category android:name="androidx.car.app.category.FEATURE_CLUSTER" />
-            </intent-filter>
-            <meta-data android:name="androidx.car.app.minCarApiLevel" android:value="6" />
-            <meta-data android:name="com.gm.homescreen.visibility" android:value="HIDDEN" />
-        </service>
-
-        <!-- AltVideo (USB 0x2C) producer Service. ClusterHomeDisplay binds to
-             ComponentName("zeno.carlink", "zeno.carlink.ipc.NaviVideoSourceService"),
-             so the class FQN must be the applicationId-prefixed form (NOT the
-             namespace-prefixed .ipc.NaviVideoSourceService shorthand). The class
-             lives at app/src/main/kotlin/zeno/carlink/ipc/NaviVideoSourceService.kt
-             to match.
-
-             Service is exported and present in all builds; it is inert on release
-             APKs and on real devices because the gate in CarlinkManager prevents
-             naviScreenInfo from being sent — without that, the adapter never emits
-             0x2C and no consumer binds. Cost of leaving it exported on prod: zero. -->
-        <service
-            android:name="zeno.carlink.ipc.NaviVideoSourceService"
-            android:exported="true"
-            android:permission="com.carlink.permission.NAVI_VIDEO_STREAM" />
-
         <meta-data
             android:name="com.android.automotive"
             android:resource="@xml/automotive_app_desc" />
@@ -205,30 +130,10 @@
             android:name="androidx.car.app.TintableAttributionIcon"
             android:resource="@drawable/ic_carlink_attribution" />
 
-        <!-- Required at application level — Templates Host reads minCarApiLevel
-             from application metadata, not from service element -->
-        <meta-data
-            android:name="androidx.car.app.minCarApiLevel"
-            android:value="6" />
-
         <!-- APPLICATION-LEVEL DISTRACTION OPTIMIZATION DECLARATION -->
         <meta-data
             android:name="com.android.automotive.application.DISTRACTION_OPTIMIZED"
             android:value="true" />
-
-        <!-- Shim for Templates Host's unregistered ClusterIconContentProvider.
-             Authority is per-flavor (manifestPlaceholder, see app/build.gradle.kts):
-               sideload → GM literal authority; Templates Host calls land here.
-               play     → applicationId-suffixed authority; avoids Play Console
-                          "authority in use by other developers" rejection.
-                          NavigationStateManager runtime guard detects the GM
-                          authority is unowned and disables AA bitmap icons. -->
-        <provider
-            android:name=".provider.ClusterIconShimProvider"
-            android:authorities="${clusterIconAuthority}"
-            android:exported="true"
-            android:grantUriPermissions="true"
-            tools:ignore="ExportedContentProvider" />
 
         <!-- FileProvider for publishing album art as content:// URIs to AAOS media
              controllers (Media Center, cluster, system UI) IN ADDITION to the inline

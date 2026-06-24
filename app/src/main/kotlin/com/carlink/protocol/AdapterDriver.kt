@@ -1,10 +1,11 @@
 package com.carlink.protocol
 
-import com.carlink.protocol.MultiTouchAction
 import com.carlink.usb.UsbDeviceWrapper
 import java.util.Locale
 import java.util.Timer
 import java.util.TimerTask
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
@@ -77,19 +78,26 @@ class AdapterDriver(
     private val typeCounts = mutableMapOf<Int, Int>()
     private var lastTypeDumpMs = 0L
 
+    // OPEN-first handshake: the adapter's hardware uuid (from boxInfo) is captured by the
+    // reading loop and awaited in start() to decide FULL vs MINIMAL init.
+    @Volatile private var receivedUuid: String? = null
+    @Volatile private var boxInfoLatch: CountDownLatch? = null
+    private val boxInfoWaitMs = 1200L
+
     /**
-     * Start the adapter communication with smart initialization.
+     * Start the adapter communication with the OPEN-first handshake.
+     *
+     * Sends OPEN (0x01) — the only per-session-mandatory message, and the one that triggers the
+     * adapter's boxInfo (uuid) — then starts the reading loop, waits up to [boxInfoWaitMs] for
+     * that uuid, calls [resolveInitMode] with it (null on timeout) to pick "FULL"/"MINIMAL_ONLY",
+     * and sends the remaining init messages.
      *
      * @param config Adapter configuration
-     * @param initMode Initialization mode: "FULL", "MINIMAL_PLUS_CHANGES", or "MINIMAL_ONLY"
-     * @param pendingChanges Set of config keys that have changed since last init
+     * @param resolveInitMode Given the adapter uuid (or null on timeout), returns "FULL" or "MINIMAL_ONLY"
      */
     fun start(
         config: AdapterConfig = AdapterConfig.DEFAULT,
-        initMode: String = "FULL",
-        pendingChanges: Set<String> = emptySet(),
-        surfaceWidth: Int = 0,
-        surfaceHeight: Int = 0,
+        resolveInitMode: (uuid: String?) -> String = { "FULL" },
     ): Boolean {
         if (isRunning.getAndSet(true)) {
             log("Adapter already running")
@@ -110,24 +118,36 @@ class AdapterDriver(
         startHeartbeat()
         log("Heartbeat started before initialization (firmware stabilization)")
 
-        // Send initialization sequence based on mode
-        val initMessages = MessageSerializer.generateInitSequence(config, initMode, pendingChanges, surfaceWidth, surfaceHeight)
-        initMessagesCount = initMessages.size
-        var initFailures = 0
-        log("Sending $initMessagesCount initialization messages (mode=$initMode, changes=$pendingChanges)")
+        // OPEN-first handshake: OPEN triggers the adapter's boxInfo (which carries the hardware
+        // uuid). Send OPEN, start the reader so boxInfo is captured, then wait briefly for the
+        // uuid and let the caller pick FULL vs MINIMAL before sending the remaining init messages.
+        receivedUuid = null
+        val latch = CountDownLatch(1)
+        boxInfoLatch = latch
+        val openOk = send(MessageSerializer.serializeOpen(config))
+        log("Init: OPEN sent (ok=$openOk) — starting reader, awaiting boxInfo uuid")
+        startReadingLoop()
 
-        for ((index, message) in initMessages.withIndex()) {
-            log("Init message ${index + 1}/$initMessagesCount")
+        val gotUuid = latch.await(boxInfoWaitMs, TimeUnit.MILLISECONDS)
+        val uuid = if (gotUuid) receivedUuid else null
+        val initMode = resolveInitMode(uuid)
+        val remainder = MessageSerializer.generateInitRemainder(config, initMode)
+        initMessagesCount = 1 + remainder.size
+        var initFailures = if (openOk) 0 else 1
+        log("boxInfo uuid=${uuid ?: "(timeout)"}, mode=$initMode — sending ${remainder.size} remaining init messages")
+
+        for ((index, message) in remainder.withIndex()) {
+            log("Init remainder ${index + 1}/${remainder.size}")
             if (!send(message)) {
                 initFailures++
-                log("Failed to send init message ${index + 1}")
+                log("Failed to send init remainder ${index + 1}")
             }
             // Delay between messages to allow adapter firmware to process each one
             Thread.sleep(120)
         }
 
         val allSent = initFailures == 0
-        log("Initialization sequence completed (${initMessagesCount - initFailures}/$initMessagesCount sent)")
+        log("Initialization sequence completed (mode=$initMode, ${initMessagesCount - initFailures}/$initMessagesCount sent)")
 
         // Schedule wifiConnect with timeout (600 ms delay derived from capture traces
         // under documents/reference/).
@@ -145,10 +165,6 @@ class AdapterDriver(
                     600,
                 )
             }
-
-        // Start reading loop
-        log("Starting message reading loop")
-        startReadingLoop()
 
         return allSent
     }
@@ -222,19 +238,6 @@ class AdapterDriver(
     fun sendMultiTouch(touches: List<MessageSerializer.TouchPoint>): Boolean = send(MessageSerializer.serializeMultiTouch(touches))
 
     /**
-     * Send a single-touch event (Android Auto — type 0x05, 0..10000 ints).
-     * @param encoderType Current video encoder type from video header flags
-     * @param offScreen Current off-screen state from video header flags
-     */
-    fun sendSingleTouch(
-        x: Int,
-        y: Int,
-        action: MultiTouchAction,
-        encoderType: Int = 2,
-        offScreen: Int = 0,
-    ): Boolean = send(MessageSerializer.serializeSingleTouch(x, y, action, encoderType, offScreen))
-
-    /**
      * Send microphone audio data.
      */
     fun sendAudio(
@@ -242,11 +245,6 @@ class AdapterDriver(
         decodeType: Int = 5,
         audioType: Int = 3,
     ): Boolean = send(MessageSerializer.serializeAudio(data, decodeType, audioType))
-
-    /**
-     * Send GNSS/NMEA data to the adapter for forwarding to the phone.
-     */
-    fun sendGnssData(nmeaSentences: String): Boolean = send(MessageSerializer.serializeGnssData(nmeaSentences))
 
     fun rebootAdapter(): Boolean {
         log("[SEND] Reboot adapter (0xCD)")
@@ -422,6 +420,16 @@ class AdapterDriver(
 
                     val header = MessageHeader(dataLength, MessageType.fromId(type))
                     val message = MessageParser.parseMessage(header, data)
+
+                    // OPEN-first handshake: capture the adapter hardware uuid from boxInfo (#1)
+                    // to gate FULL vs MINIMAL init. Only boxInfo #1 carries "uuid".
+                    if (message is BoxSettingsMessage && receivedUuid == null) {
+                        val u = message.json.optString("uuid", "")
+                        if (u.isNotEmpty()) {
+                            receivedUuid = u
+                            boxInfoLatch?.countDown()
+                        }
+                    }
 
                     // Log received message (except high-frequency types). Suppression
                     // list is conservative — extend it if a new echo path becomes noisy

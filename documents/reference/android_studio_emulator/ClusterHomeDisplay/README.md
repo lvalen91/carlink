@@ -4,14 +4,28 @@ Unified cluster home for the AAOS instrument cluster. Renders **navigation + med
 
 Replaces the toggle-via-VHAL pattern used by the sibling `ClusterNavigationDisplay` and `ClusterMediaDisplay` apps. Hooks both `config_clusterMapActivity` (VHAL=1) **and** `config_clusterMusicActivity` (VHAL=2) at priority 100, so the cluster lands here regardless of which UI type the OS asks for.
 
-## After you have run this at least once
-You must — after every emulator reboot — kick the cluster to map mode once so the unified home gets foregrounded:
+## Auto-default on boot (no manual command)
+
+ClusterHome foregrounds itself on the cluster automatically on every boot — **no manual VHAL
+command needed** — provided the app is **platform-signed** (see Requirements + `keys/`).
+
+- `BootCompletedReceiver` launches `ClusterHomeActivity` directly onto the cluster display via
+  `ActivityOptions.setLaunchDisplayId` (retrying until the cluster display, `ClusterOsDouble-VD`,
+  comes up).
+- The `onPause` keep-alive re-asserts that same direct launch if something preempts it (e.g.
+  Templates Host's `ClusterTurnCardActivity` during an active route) — burst-capped to avoid
+  ping-pong.
+
+Both rely on the signature-level `INTERNAL_SYSTEM_WINDOW`, granted only to a platform-signed app.
+The older `CarPropertyManager.setIntProperty(CLUSTER_SWITCH_UI=MAPS)` approach does **not** work
+from an app (`CLUSTER_SWITCH_UI` isn't in the app-facing `carPropertyConfig` list — it throws
+"property ID is not supported"); only the VHAL-inject shell command can drive it.
+
+Manual fallback (debug-signed build, or to force a switch):
 
 ```bash
 adb shell cmd car_service inject-vhal-event 0x11400F34 1
 ```
-
-ClusterHomeSample does not auto-route on boot; the VHAL ping pulls the home activity in. Once foregrounded, the keep-alive in `ClusterHomeActivity` will re-foreground itself if Templates Host's `ClusterTurnCardActivity` preempts it.
 
 ## How It Works
 
@@ -45,6 +59,8 @@ Both panes are alive simultaneously. The overlay layer is invisible until carlin
 
 - **AAOS emulator** with cluster display, API 32+ (tested on API 35)
 - **adb root** + **adb remount** (userdebug build)
+- **`test-keys` image** (`adb shell getprop ro.build.tags` → `test-keys`) — required for platform-signing (below). Standard Android Studio automotive emulators are test-keys.
+- **Platform-signed APK** — the app must be signed with the AOSP platform key to hold `INTERNAL_SYSTEM_WINDOW` (for the boot/keep-alive cluster launch). `deploy.sh` does this automatically using the public test-keys in `keys/` (see `keys/README.md`). A debug-signed build still installs but loses auto-default/resilience and needs the manual VHAL command each boot.
 - **Gradle** and **Android SDK** installed
 - **zeno.carlink** companion app installed and running for the AltVideo overlay (otherwise the app runs in degraded mode — cards only, no overlay)
 
@@ -187,6 +203,60 @@ The overlay sits on `/product/overlay/` (not `/data/`) because the target resour
 | Refresh | 60 Hz |
 
 See `reference/emulator_cluster_config.md` for the full topology: AVD `config.ini` / `hardware-qemu.ini`, `ClusterOsDouble.apk` dimens decode, and live `dumpsys` capture.
+
+## Removing the Secondary (Cluster) Display Entirely — Simplified Single-Display Emulator
+
+If you don't want a cluster at all (a plain main-IVI-only AAOS emulator), the whole secondary
+display is controlled by **one line** in `/product/etc/build.prop`:
+
+```
+hwservicemanager.external.displays=<port>,<width>,<height>,<dpi>,<flag>
+# e.g. stock ultrawide = 1,528,792,160,0
+```
+
+The AVD `config.ini` defines **only** the main display — the cluster physical panel
+(`EMU_display_1`) and the `ClusterOsDouble-VD` virtual display are created **solely** from this
+prop. Comment it out (or delete it) and the entire cluster stack disappears: no `EMU_display_1`,
+no `ClusterOsDouble-VD`, and `com.android.car.cluster.osdouble` / `ClusterHomeActivity` have no
+surface to render into. `cmd display get-displays` then reports only Display 0.
+
+**Procedure (verified Jun 2026 — works both directions):**
+
+The emulator binary lives at `$ANDROID_HOME/emulator/emulator` (add it to `PATH`, or use the full
+path). Replace `ultrawide` with your AVD name. **Use this exact launch command for every
+(re)start in this procedure** — a WRITABLE system + COLD boot are both required:
+
+```bash
+"$ANDROID_HOME/emulator/emulator" -avd ultrawide -writable-system -no-snapshot &
+```
+
+```bash
+# 1. Launch the AVD with the command above (writable system, cold boot), then:
+
+# 2. Make /product writable and comment the line IN PLACE (preserves SELinux context).
+adb root && adb remount                                          # "Using overlayfs for /product"
+adb shell 'sed -i "s/^hwservicemanager.external.displays=/#&/" /product/etc/build.prop'
+adb shell grep external.displays /product/etc/build.prop         # -> #hwservicemanager.external.displays=...
+
+# 3. COLD boot again: kill the process and relaunch with the SAME command above. Do NOT `adb reboot`.
+adb emu kill                                                     # wait for it to exit, then re-run the emulator command
+
+# 4. Verify (single display, cluster gone, /product still healthy):
+adb shell 'cmd display get-displays'                             # only "Display id 0" (2400x960)
+adb shell 'dumpsys display | grep -c EMU_display_1'              # 0
+adb shell 'dumpsys display | grep -c ClusterOsDouble-VD'         # 0
+adb shell getprop ro.product.product.brand                       # google  <- /product props still load = clean
+```
+
+To **re-enable** the cluster: uncomment the line (or restore the value, e.g. `1,1920,620,160,0`)
+the same way and cold boot. With the line present, `EMU_display_1` and `ClusterOsDouble-VD` are
+back (verified: both appear; with it commented, both gone).
+
+> ⚠️ **Gotchas (these will waste hours otherwise):**
+> - **Always launch with `-writable-system`.** If you ever start the *same* AVD with `emulator -avd ultrawide` **without** `-writable-system` in between, it desyncs the overlay and **the entire `/product/etc/build.prop` stops loading at boot** — `getprop ro.product.product.brand` goes empty and the cluster vanishes for the *wrong* reason (corruption, not your edit).
+> - **Cold boot only** (`adb emu kill` + relaunch). A guest `adb reboot` desyncs the external-display registration and won't cleanly apply the change.
+> - **Edit in place with `sed -i`** — do **not** `adb pull`/`adb push` the file (that changes its perms to 666 and can disturb the SELinux context).
+> - **Recovery if `/product` props stop loading** (`ro.product.product.brand` empty): the overlay is wedged — cold boot once with `-wipe-data` to revert to a pristine image, then redo the edit. (`-wipe-data` also reverts any prior `hwservicemanager.external.displays` customization back to the stock `1,528,792,160,0`, and wipes installed apps / this priv-app deploy.)
 
 ## Cluster UI Types (CLUSTER_SWITCH_UI / VHAL 0x11400F34)
 

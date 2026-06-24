@@ -72,17 +72,6 @@ public class H264Renderer {
     private byte[] cachedPps;
     private int cachedPpsLength;
 
-    // Android Auto mode — enables AA-specific decoder behaviors:
-    //   - Skip first N rendered frames (boot-screen IDR avoidance)
-    //   - VIDEO_SCALING_MODE_SCALE_TO_FIT_WITH_CROPPING
-    private volatile boolean androidAutoMode = false;
-
-    // AA first-frame skip: decoded frames are released with render=false until this count
-    // reaches AA_RENDER_SKIP_COUNT. Prevents the deterministic 2,735B boot-screen IDR
-    // from ever displaying. AutoKit uses 4; we use the same threshold.
-    private static final int AA_RENDER_SKIP_COUNT = 4;
-    private final AtomicLong aaRenderedFrameCount = new AtomicLong(0);
-
     private final AppExecutors executors;
     private final String preferredDecoderName;
 
@@ -200,20 +189,6 @@ public class H264Renderer {
         this.csdCallback = callback;
     }
 
-    /**
-     * Enable Android Auto decoder mode.
-     *
-     * Effects:
-     * - first-frame render skip: takes effect immediately on the running codec.
-     * - {@code VIDEO_SCALING_MODE_SCALE_TO_FIT_WITH_CROPPING}: only applied inside
-     *   {@link #initCodec}, so toggling AA mode on a live codec will NOT change the
-     *   scaling mode until the next start/reset.
-     */
-    public void setAndroidAutoMode(boolean enabled) {
-        this.androidAutoMode = enabled;
-        log("[VIDEO] Android Auto mode: " + enabled);
-    }
-
     private void log(String message) {
         logCallback.log("H264_RENDERER", message);
     }
@@ -235,7 +210,6 @@ public class H264Renderer {
         lastLifecycleEventTime = System.currentTimeMillis();
         firstFrameLogged = false;
         syncAcquired = false;
-        aaRenderedFrameCount.set(0);
 
         log("start - " + width + "x" + height);
 
@@ -536,16 +510,6 @@ public class H264Renderer {
         // NO setCallback — sync mode uses dequeueInputBuffer/dequeueOutputBuffer
         mCodec.configure(mediaformat, surface, null, 0);
 
-        // AA: crop-scale to fit letterboxed content (removes black bars at codec level)
-        if (androidAutoMode) {
-            try {
-                mCodec.setVideoScalingMode(MediaCodec.VIDEO_SCALING_MODE_SCALE_TO_FIT_WITH_CROPPING);
-                log("AA video scaling: SCALE_TO_FIT_WITH_CROPPING");
-            } catch (Exception e) {
-                log("AA scaling mode not supported: " + e.getMessage());
-            }
-        }
-
         log("Surface bound: valid=" + (surface != null && surface.isValid()));
     }
 
@@ -838,17 +802,7 @@ public class H264Renderer {
                         }
 
                         try {
-                            // AA first-frame skip: don't render the first N decoded frames.
                             boolean shouldRender = bufferInfo.size != 0;
-                            if (shouldRender && androidAutoMode) {
-                                long renderCount = aaRenderedFrameCount.incrementAndGet();
-                                if (renderCount <= AA_RENDER_SKIP_COUNT) {
-                                    shouldRender = false;
-                                    if (renderCount == AA_RENDER_SKIP_COUNT) {
-                                        log("[VIDEO] AA warmup complete — rendering enabled");
-                                    }
-                                }
-                            }
                             codec.releaseOutputBuffer(outputBufferIndex, shouldRender);
                         } catch (Exception e) {
                             // Ignore release errors

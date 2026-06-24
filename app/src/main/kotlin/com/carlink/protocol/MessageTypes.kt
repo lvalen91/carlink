@@ -286,15 +286,15 @@ enum class MessageType(
     FACTORY_SETTING(0x77), // Factory setting idle notification (A→H: empty) / factory reset (H→A: 4B)
     // Dual-direction wire IDs. These enum names reflect the INBOUND (adapter→host) meaning,
     // which is how the Android parser routes them. Firmware reuses the same IDs with
-    // different outbound semantics; OUTBOUND senders (MessageSerializer.serializeRebootAdapter,
-    // serializeUsbReset) piggy-back on the inbound enum entry for wire-type encoding —
+    // different outbound semantics; the OUTBOUND sender (MessageSerializer.serializeRebootAdapter)
+    // piggy-backs on the inbound enum entry for wire-type encoding —
     // the name does NOT reflect what's being sent. Cross-referenced against macOS
     // carlink_macOS/Protocol/MessageTypes.swift which models each direction separately.
     //
     //   0x88  A→H: AdapterIdle state notification           | H→A: DebugTest   (macOS: debugTest)
     //   0xBB  A→H: Status/config value                      | H→A: UpdateState (macOS: updateState) — not used by Android outbound
     //   0xCD  A→H: Heartbeat ack (every 2s)                 | H→A: Reboot adapter — USED OUTBOUND via serializeRebootAdapter (MessageSerializer.kt:291)
-    //   0xCE  A→H: Error report                             | H→A: USB reset   — USED OUTBOUND via serializeUsbReset     (MessageSerializer.kt:296)
+    //   0xCE  A→H: Error report                             | H→A: USB reset   — not used by Android outbound
     //   0xF0  A→H: Remote display parameters                | H→A: Enable crypt (CMD_ENABLE_CRYPT)
     //   0xFD  A→H: Firmware update progress                 | H→A: Display ready (macOS: displayReady) — not used by Android outbound
     //
@@ -303,7 +303,7 @@ enum class MessageType(
     // call-site documents intent.
     ADAPTER_IDLE(0x88),     // A→H name; H→A = debugTest (not used here)
     HEARTBEAT_ECHO(0xCD),   // A→H name; H→A = rebootAdapter (MessageSerializer.serializeRebootAdapter)
-    ERROR_REPORT(0xCE),     // A→H name; H→A = resetUSB     (MessageSerializer.serializeUsbReset)
+    ERROR_REPORT(0xCE),     // A→H name; H→A = resetUSB (not used by Android outbound)
     REMOTE_DISPLAY(0xF0),   // A→H name; H→A = enableCrypt (not used here)
     UPDATE_PROGRESS(0xFD),  // A→H name; H→A = displayReady (not used here)
     DEBUG_TRACE(0xFF), // Debug/trace data from adapter
@@ -409,7 +409,6 @@ enum class FileAddress(
     CHARGE_MODE("/tmp/charge_mode"),
     BOX_NAME("/etc/box_name"),
     AIRPLAY_CONFIG("/etc/airplay.conf"),
-    ANDROID_WORK_MODE("/etc/android_work_mode"),
     OEM_ICON("/etc/oem_icon.png"),
     ICON_120("/etc/icon_120x120.png"),
     ICON_180("/etc/icon_180x180.png"),
@@ -534,63 +533,39 @@ data class AdapterConfig(
     var height: Int = 720,
     var fps: Int = 60,
     var dpi: Int = 160,
-    /** True if user explicitly selected a resolution (non-AUTO). When true, CarlinkManager
-     *  will use these width/height values instead of actual surface dimensions. */
-    val userSelectedResolution: Boolean = false,
     val format: Int = 5,
     val iBoxVersion: Int = 2,
     val packetMax: Int = 49152,
     val phoneWorkMode: Int = 2,
     val boxName: String = "carlink",
-    val mediaDelay: Int = 1000,
+    /** Media audio buffer latency (ms) sent in BoxSettings. 500 matches CarPlay's internal
+     *  expectation on this hardware (was 1000; retuned 2026-06-23 on-device). */
+    val mediaDelay: Int = 500,
     /** Audio transfer mode: true=bluetooth, false=adapter (USB audio, default) */
     val audioTransferMode: Boolean = false,
     /** Sample rate for media audio (48000 Hz). Controls mediaSound in BoxSettings. */
     val sampleRate: Int = 48000,
     val wifiType: String = "5ghz",
     val micType: String = "os",
-    /** Call quality: 0=normal, 1=clear, 2=HD. Sent in BoxSettings. */
-    val callQuality: Int = 2,
     val oemIconVisible: Boolean = true,
-    val androidWorkMode: Boolean = true,
     /** Hand drive mode: 0 = LHD (dock left, US/EU default), 1 = RHD (dock right, UK/JP/AU) */
     val handDriveMode: Int = 0,
-    /** GPS forwarding: true = app sends GNSS_DATA (0x29) to adapter for CarPlay, false = no GPS data sent. Adapter-side GNSSCapability=3 is always set in BoxSettings. */
-    val gpsForwarding: Boolean = false,
-    val icon120Data: ByteArray? = null,
-    val icon180Data: ByteArray? = null,
-    val icon256Data: ByteArray? = null,
     /** ViewArea binary data (24B) for adapter — always sent */
     val viewAreaData: ByteArray? = null,
     /** SafeArea binary data (20B) for adapter — always sent */
     val safeAreaData: ByteArray? = null,
-    /** Bundled aa_gps_fix.sh content (NMEA divisor in-memory patcher). Pushed to
-     *  /tmp/aa_gps_fix.sh on every init (full + minimal) because adapter power-cycle
-     *  between sessions wipes /tmp. Placement only — invocation is a separate step. */
-    val gpsFixScriptData: ByteArray? = null,
-    /** Bundled patched ARMiPhoneIAP2 (NaviJSON _iap2 + _iap2m roundabout recovery).
-     *  Pushed to /tmp/bin/ARMiPhoneIAP2 on every init to preempt phone_link_deamon's
-     *  factory-copy step, so the next CarPlay session execs our patched binary.
-     *  Atomic rename means a session in progress is unaffected (running iAP2 keeps
-     *  the old inode via mmap; next respawn picks up the new file). */
-    val patchedIap2BinaryData: ByteArray? = null,
 ) {
     companion object {
         val DEFAULT = AdapterConfig()
     }
 
-    // equals/hashCode are PARTIAL by design: they cover only the fields whose
-    // change triggers a display-mode-level re-init (resolution, DPI, format, box
-    // name, icon assets, view/safe area). Fields that affect only BoxSettings-level
-    // config (audioTransferMode, sampleRate, wifiType, micType, callQuality,
-    // oemIconVisible, androidWorkMode, handDriveMode, gpsForwarding, mediaDelay,
-    // iBoxVersion, packetMax, phoneWorkMode, userSelectedResolution) are tracked
-    // separately via AdapterConfigPreference's pendingChanges set and MINIMAL_PLUS_CHANGES
-    // init mode — they don't need to invalidate AdapterConfig equality to propagate.
+    // equals/hashCode are PARTIAL by design: they cover only the resolution/DPI/format/
+    // box-name/view-area/safe-area fields whose change triggers a session re-init. The
+    // hardcoded config fields (audioTransferMode, wifiType, micType, handDriveMode,
+    // mediaDelay, etc.) are constant in this build and don't affect equality.
     //
-    // Consequence: two AdapterConfigs differing only in those config fields will be
-    // equal() and produce the same hashCode(). Do NOT use AdapterConfig as a HashMap
-    // key or HashSet member expecting full-field distinction.
+    // Consequence: do NOT use AdapterConfig as a HashMap key or HashSet member expecting
+    // full-field distinction.
     override fun equals(other: Any?): Boolean {
         if (this === other) return true
         if (javaClass != other?.javaClass) return false
@@ -601,9 +576,6 @@ data class AdapterConfig(
             dpi == other.dpi &&
             format == other.format &&
             boxName == other.boxName &&
-            icon120Data.contentEquals(other.icon120Data) &&
-            icon180Data.contentEquals(other.icon180Data) &&
-            icon256Data.contentEquals(other.icon256Data) &&
             viewAreaData.contentEquals(other.viewAreaData) &&
             safeAreaData.contentEquals(other.safeAreaData)
     }
@@ -614,9 +586,6 @@ data class AdapterConfig(
         result = 31 * result + fps
         result = 31 * result + dpi
         result = 31 * result + boxName.hashCode()
-        result = 31 * result + (icon120Data?.contentHashCode() ?: 0)
-        result = 31 * result + (icon180Data?.contentHashCode() ?: 0)
-        result = 31 * result + (icon256Data?.contentHashCode() ?: 0)
         result = 31 * result + (viewAreaData?.contentHashCode() ?: 0)
         result = 31 * result + (safeAreaData?.contentHashCode() ?: 0)
         return result
