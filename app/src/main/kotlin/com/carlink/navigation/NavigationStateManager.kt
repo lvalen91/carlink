@@ -37,6 +37,11 @@ data class NavigationState(
     val turnSide: Int = 0, // 0=right-hand driving, 1=left-hand driving
     val junctionType: Int = 0, // 0=intersection, 1=roundabout
     val roundaboutExit: Int = 0, // NaviRoundaboutExit (1-19, 0=not roundabout)
+    // Driver-relative roundabout exit angle (iAP2 0x000b for CarPlay, NaviTurnAngle for AA),
+    // signed degrees. Null when unavailable — drives the directional `..._WITH_ANGLE` Maneuver
+    // for the VCUNH1 cluster (see ManeuverMapper.roundaboutExitAngleAndroidx). Distinct from
+    // [turnAngle]: nullable so "absent" is not confused with a genuine 0° (straight) exit.
+    val exitAngle: Int? = null,
     // Next-step fields — from firmware double-maneuver burst
     val nextManeuverType: Int? = null,
     val nextOrderType: Int? = null,
@@ -44,6 +49,7 @@ data class NavigationState(
     val nextTurnAngle: Int? = null,
     val nextJunctionType: Int? = null,
     val nextRoundaboutExit: Int? = null,
+    val nextExitAngle: Int? = null,
 ) {
     val isActive: Boolean get() = status == 1
     val isIdle: Boolean get() = status == 0
@@ -54,7 +60,7 @@ data class NavigationState(
  * Manages navigation state from CarPlay NaviJSON messages.
  *
  * Thread safety: Called from USB read thread, publishes via StateFlow (thread-safe).
- * Merge strategy matches LIVI normalizeNavigation.ts:
+ * Merge strategy:
  * - Incremental: new fields merge into existing state
  * - Flush: NaviStatus=0 clears all state
  *
@@ -73,11 +79,66 @@ object NavigationStateManager {
     /** Burst window: two maneuver messages within this threshold are current + next. */
     private const val BURST_THRESHOLD_MS = 50L
 
+    // Intentionally a literal — DO NOT swap to BuildConfig.CLUSTER_ICON_AUTHORITY for
+    // symmetry with ClusterIconShimProvider. This constant is the probe target for the
+    // runtime guard below, and the probe is meaningful only against the authority
+    // Templates Host actually calls (the GM literal hardcoded in its dex). On the play
+    // flavor our shim is registered under a different (applicationId-suffixed) authority
+    // to satisfy Play Console; templating this would make resolveContentProvider() find
+    // our own shim and incorrectly enable the AA bitmap path when Templates Host's call
+    // still goes nowhere — silent icon failure instead of the documented graceful fallback.
     private const val CLUSTER_ICON_PROVIDER_AUTHORITY =
         "com.google.android.apps.automotive.templates.host.ClusterIconContentProvider"
 
     /** Timestamp (elapsedRealtime) of the last maneuver-bearing message. */
     private var lastManeuverMs = 0L
+
+    // ─── Tier C v5 (timeline-driven cursor, Apple as verification) ───
+    /** Cursor into ComposedIconStore.currentRoute(). Self-advances on physical crossing signals. */
+    @Volatile
+    private var localCursor: Int = 0
+
+    /** Reference identity of the last seen route; reset cursor on change. */
+    @Volatile
+    private var lastRouteRef: com.carlink.navigation.Iap2RouteData? = null
+
+    /**
+     * Previous NaviRemainDistance. -1 means unseeded (first event or post-flush).
+     * Cursor self-advances when (lastDistance in 0..49 AND incomingDist >= 50) — the
+     * pattern of "distance was near a maneuver point, now reset to next maneuver's distance."
+     * Empirically verified: NaviRemainDistance = distance to NEXT maneuver, jumps up by
+     * hundreds-to-thousands of meters when user crosses each maneuver point.
+     */
+    @Volatile
+    private var lastDistance: Int = -1
+
+    /**
+     * True once the cursor has been bootstrapped to Apple's first valid step match after
+     * a route load. Prevents subsequent Apple previews from forward-snapping the cursor.
+     * Reset on flush, clear(), and route change.
+     */
+    @Volatile
+    private var bootstrapDone: Boolean = false
+
+    // ─── Tier C v6.1 (authoritative cursor from iAP2 0x5201 field 0x000d) ───
+    /**
+     * Last parsed iAP2 0x5201 RouteGuidanceUpdate state.
+     *
+     * Set by [CarlinkManager.processMediaMetadata] via [setLastIap2State] BEFORE
+     * [onNaviJson] runs (same USB read thread). Null when the most recent NaviJSON
+     * lacked `_iap2`, when parsing failed, or after flush / clear. v6.1's cursor body
+     * reads this — never preserves a stale value across a tick that didn't carry `_iap2`.
+     */
+    @Volatile
+    private var lastIap2State: Iap2RouteGuidanceState? = null
+
+    /**
+     * Set the latest parsed 0x5201 state. Pass null on missing `_iap2` or parse failure
+     * to prevent stale-cursor reuse. Called from the USB read thread.
+     */
+    fun setLastIap2State(state: Iap2RouteGuidanceState?) {
+        lastIap2State = state
+    }
 
     /**
      * Latest AA maneuver icon received via MEDIA_DATA sub-type 201.
@@ -94,6 +155,16 @@ object NavigationStateManager {
     /** Null until checked; then true when the cluster icon provider can be resolved by this app. */
     @Volatile
     private var isClusterIconProviderAvailable: Boolean? = null
+
+    /**
+     * True on the GM VCU/VCUNH1 (CT5, AAOS 14) cluster, where the QNX safety-domain VM renders a
+     * native Altia sprite from the Maneuver enum and MASKS the app bitmap/URI. When set, the
+     * AA-bitmap cluster-icon path is dead, so [canUseAaManeuverIcon] returns false and any pending
+     * icon is dropped. Set once from [com.carlink.CarlinkManager] init via [setClusterEnumOnly].
+     * BEST-EFFORT / UNTESTED — keyed on [com.carlink.platform.PlatformDetector.PlatformInfo.isVcuCluster].
+     */
+    @Volatile
+    private var clusterEnumOnly: Boolean = false
 
     /**
      * Resolve whether Templates Host's ClusterIconContentProvider authority is actually
@@ -129,8 +200,8 @@ object NavigationStateManager {
 
             if (isAccessible) {
                 logInfo(
-                    "[NAVI_ICON] Cluster icon provider available via ${providerInfo?.packageName} " +
-                        "(exported=${providerInfo?.exported}) — AA maneuver bitmaps enabled",
+                    "[NAVI_ICON] Cluster icon provider available via ${providerInfo.packageName} " +
+                        "(exported=${providerInfo.exported}) — AA maneuver bitmaps enabled",
                     tag = Logger.Tags.NAVI,
                 )
             } else {
@@ -144,8 +215,18 @@ object NavigationStateManager {
         }
     }
 
-    /** True unless we have explicitly confirmed the provider is unavailable. */
-    fun canUseAaManeuverIcon(): Boolean = isClusterIconProviderAvailable != false
+    /**
+     * Declare whether this is an enum-only cluster (VCU/VCUNH1) where app maneuver bitmaps are
+     * masked. Called once from [com.carlink.CarlinkManager] init. Drops any current icon so the
+     * dead AA-bitmap path goes inert immediately.
+     */
+    fun setClusterEnumOnly(value: Boolean) {
+        clusterEnumOnly = value
+        if (value) dropCurrentManeuverIcon()
+    }
+
+    /** True unless this is an enum-only cluster OR we confirmed the provider is unavailable. */
+    fun canUseAaManeuverIcon(): Boolean = !clusterEnumOnly && isClusterIconProviderAvailable != false
 
     private fun dropCurrentManeuverIcon() {
         val hadIcon = currentManeuverIcon != null || currentIconHash != 0
@@ -219,6 +300,15 @@ object NavigationStateManager {
             logInfo("[NAVI] Flush signal received (NaviStatus=$naviStatus) — clearing state", tag = Logger.Tags.NAVI)
             _state.value = NavigationState()
             lastManeuverMs = 0
+            localCursor = 0
+            lastRouteRef = null
+            lastDistance = -1
+            bootstrapDone = false
+            lastIap2State = null
+            // Drop any pre-composed maneuver icons from the prior route. Next route-calc
+            // (incoming _iap2m field) repopulates via ComposedIconStore.populateFromIap2m.
+            com.carlink.navigation.compose.ComposedIconStore.clear()
+            com.carlink.navigation.compose.ManeuverIconDebugDumper.resetSession()
             return
         }
 
@@ -270,6 +360,8 @@ object NavigationStateManager {
                     nextTurnAngle = (payload["NaviTurnAngle"] as? Number)?.toInt(),
                     nextJunctionType = (payload["NaviJunctionType"] as? Number)?.toInt(),
                     nextRoundaboutExit = (payload["NaviRoundaboutExit"] as? Number)?.toInt(),
+                    // AA roundabout exit angle for the previewed next maneuver (NaviTurnAngle).
+                    nextExitAngle = (payload["NaviTurnAngle"] as? Number)?.toInt(),
                 )
 
             logInfo(
@@ -280,7 +372,218 @@ object NavigationStateManager {
             )
 
             _state.value = merged
+            // Keep lastDistance current so Tier C's dist-jump detection survives bursts.
+            (payload["NaviRemainDistance"] as? Number)?.toInt()?.let { lastDistance = it }
             return
+        }
+
+        // ─── Tier C v6.1: authoritative cursor from iAP2 0x5201 field 0x000d ───
+        // Apple's per-tick `_iap2` carries RouteGuidanceManeuverCurrentList — the explicit
+        // (currentIdx, nextIdx) pair. The patched ARMiPhoneIAP2 v5 binary on the adapter
+        // forwards this raw frame; Iap2StateParser parses it; CarlinkManager sets it via
+        // setLastIap2State before this call. When the wire cursor + route plan agree we
+        // use the cursor directly — no inference, no heuristic.
+        //
+        // Falls through to Tier C v5 below when:
+        //   - lastIap2State is null (no _iap2 this tick, parse failed, post-flush, etc.)
+        //   - currentManeuverIdx is null (0x000d absent/empty — both the len-2 [current] and
+        //     len-4 [current,next] wire forms now populate currentManeuverIdx, so this is rare)
+        //   - route is not loaded yet
+        //   - currentManeuverIdx is out of route bounds (likely a reroute in flight)
+        //   - ManeuverCount disagrees with route plan size (route/cursor desynced)
+        val routeV6 = com.carlink.navigation.compose.ComposedIconStore.currentRoute()
+        val iap2 = lastIap2State
+        if (routeV6 != null && routeV6.maneuvers.isNotEmpty() &&
+            iap2?.currentManeuverIdx != null &&
+            iap2.currentManeuverIdx < routeV6.maneuvers.size &&
+            (iap2.maneuverCount == null || iap2.maneuverCount == routeV6.maneuvers.size)
+        ) {
+            if (routeV6 !== lastRouteRef) {
+                lastRouteRef = routeV6
+                lastDistance = -1
+                logInfo(
+                    "[NAVI] V6_FIRED: new route — cursor=${iap2.currentManeuverIdx} (${routeV6.maneuvers.size} steps)",
+                    tag = Logger.Tags.NAVI,
+                )
+            }
+            localCursor = iap2.currentManeuverIdx
+            bootstrapDone = true
+
+            val routeStep = routeV6.maneuvers[localCursor]
+            val nextStep = iap2.nextManeuverIdx?.let { idx ->
+                if (idx < routeV6.maneuvers.size) routeV6.maneuvers[idx] else null
+            } ?: routeV6.maneuvers.getOrNull(localCursor + 1)
+            val derivedRoadName = routeStep.instructionText.takeIf { it.isNotEmpty() }
+                ?: routeStep.postManeuverRoadName.takeIf { it.isNotEmpty() }
+                ?: current.roadName
+            val mergedV6 = current.copy(
+                status = naviStatus ?: current.status,
+                maneuverType = routeStep.cpManeuverType,
+                orderType = (payload["NaviOrderType"] as? Number)?.toInt() ?: current.orderType,
+                roadName = derivedRoadName,
+                remainDistance = (payload["NaviRemainDistance"] as? Number)?.toInt() ?: current.remainDistance,
+                distanceToDestination =
+                    (payload["NaviDistanceToDestination"] as? Number)?.toInt()
+                        ?: current.distanceToDestination,
+                timeToDestination = (payload["NaviTimeToDestination"] as? Number)?.toInt() ?: current.timeToDestination,
+                destinationName =
+                    (payload["NaviDestinationName"] as? String)?.takeIf { it.isNotEmpty() }
+                        ?: current.destinationName,
+                appName = (payload["NaviAPPName"] as? String)?.takeIf { it.isNotEmpty() } ?: current.appName,
+                turnAngle = (payload["NaviTurnAngle"] as? Number)?.toInt() ?: current.turnAngle,
+                turnSide = (payload["NaviTurnSide"] as? Number)?.toInt() ?: current.turnSide,
+                junctionType = (payload["NaviJunctionType"] as? Number)?.toInt() ?: current.junctionType,
+                roundaboutExit = (payload["NaviRoundaboutExit"] as? Number)?.toInt() ?: current.roundaboutExit,
+                // CarPlay roundabout exit angle straight from the route plan's iAP2 0x000b field.
+                exitAngle = routeStep.exitAngle,
+                nextManeuverType = nextStep?.cpManeuverType,
+                nextOrderType = null,
+                nextRoadName = nextStep?.instructionText?.takeIf { it.isNotEmpty() } ?: nextStep?.postManeuverRoadName,
+                nextTurnAngle = null,
+                nextJunctionType = null,
+                nextRoundaboutExit = null,
+                nextExitAngle = nextStep?.exitAngle,
+            )
+            logNavi {
+                "[NAVI] V6_FIRED cursor=$localCursor/${routeV6.maneuvers.size}, maneuver=${mergedV6.maneuverType}, " +
+                    "road=${mergedV6.roadName}, remainDist=${mergedV6.remainDistance}m, " +
+                    "next=${mergedV6.nextManeuverType}@${mergedV6.nextRoadName}"
+            }
+            _state.value = mergedV6
+            (payload["NaviRemainDistance"] as? Number)?.toInt()?.let { lastDistance = it }
+            return
+        }
+
+        // Diagnostic: ManeuverCount disagreement between Apple's wire and our route plan.
+        // Does NOT alter control flow — v6.1 already fell through to v5 by the gate above.
+        if (iap2?.currentManeuverIdx != null && routeV6 != null &&
+            iap2.maneuverCount != null && iap2.maneuverCount != routeV6.maneuvers.size
+        ) {
+            logInfo(
+                "[NAVI] V6_DISCREPANCY: maneuverCount=${iap2.maneuverCount} but route has " +
+                    "${routeV6.maneuvers.size} steps — likely stale route plan, v5 fallback active",
+                tag = Logger.Tags.NAVI,
+            )
+        }
+
+        // ─── Tier C v5: timeline-driven cursor (non-burst events only) ───
+        // state.maneuverType + state.roadName are ALWAYS derived from route[localCursor].
+        // Cursor self-advances on physical crossing signal: NaviRemainDistance jumps UP
+        // when user crosses a maneuver point (lastDistance was near zero, now significant).
+        // Apple's per-step messages used for verification ONLY: cold-start bootstrap
+        // (lastDistance=-1) snaps cursor to Apple's idx; backward correction snaps only when
+        // delta ≥ 3 (avoids duplicate-(cp,road) spurious snap-back). Apple's forward previews
+        // (idx > cursor) DO NOT advance cursor — they show up naturally as state.next.
+        // Falls through to existing normal-transition body when no route plan is available
+        // (AA / pre-iap2m) OR when incoming doesn't match anywhere in route (hard reroute).
+        val route = com.carlink.navigation.compose.ComposedIconStore.currentRoute()
+        val incomingDistTierC = (payload["NaviRemainDistance"] as? Number)?.toInt()
+        if (route != null && route.maneuvers.isNotEmpty()) {
+            // Route change → reset cursor + distance baseline + bootstrap flag
+            if (route !== lastRouteRef) {
+                localCursor = 0
+                lastDistance = -1
+                lastRouteRef = route
+                bootstrapDone = false
+                logInfo("[NAVI] Tier C: new route — cursor=0 (${route.maneuvers.size} steps)", tag = Logger.Tags.NAVI)
+            }
+
+            // ─── 1. Self-advance cursor on physical crossing signal ───
+            // NaviRemainDistance JUMPS UP when user crosses a maneuver point — empirically
+            // verified via captured Alaska run5 #121-122: distance went 10m → 1093m in one
+            // tick when user crossed the Merge maneuver, BEFORE Apple sent the next
+            // maneuver-bearing message. Detection: lastDistance was small (≤ 50m, "near a
+            // maneuver point") AND incomingDist > lastDistance + 5 (any meaningful increase).
+            // The +5m delta resists GPS jitter near 0 while still firing for short consecutive
+            // sub-steps (e.g., Park Way step 5→6 has distM=9 — jumps 0 → 9 fires correctly).
+            // Mid-segment GPS noise resisted because lastDistance must be ≤ 50m (highway
+            // approach distances like 800m → 850m don't qualify).
+            if (incomingDistTierC != null && lastDistance in 0..50 && incomingDistTierC > lastDistance + 5) {
+                if (localCursor + 1 < route.maneuvers.size) {
+                    val prev = localCursor
+                    localCursor++
+                    bootstrapDone = true
+                    logInfo(
+                        "[NAVI] Tier C dist-advance: cursor $prev → $localCursor (dist $lastDistance → $incomingDistTierC)",
+                        tag = Logger.Tags.NAVI,
+                    )
+                }
+            }
+
+            // ─── 2. Apple message verification (no forward advance; backward/cold-start only) ───
+            val incomingRoad = (payload["NaviRoadName"] as? String)?.takeIf { it.isNotEmpty() }
+            var hardReroute = false
+            if (isManeuverMessage && resolvedManeuverType != null && incomingRoad != null) {
+                val idx = route.findStepIndexLoose(resolvedManeuverType, incomingRoad, searchStartIndex = 0)
+                if (idx == null) {
+                    // No match anywhere — hard reroute. Fall through to existing logic
+                    // until fresh _iap2m arrives.
+                    hardReroute = true
+                    lastRouteRef = null
+                    logInfo("[NAVI] Tier C hard reroute: no match for $resolvedManeuverType@\"$incomingRoad\" — falling through", tag = Logger.Tags.NAVI)
+                } else if (!bootstrapDone && idx > localCursor) {
+                    // Cold-start bootstrap: FIRST maneuver-bearing message after route load.
+                    // Trust Apple's idx (one-shot — flag flips after first use). Safe because
+                    // we haven't yet driven anywhere on the new route so Apple's idea of
+                    // "current step" IS our starting position.
+                    logInfo("[NAVI] Tier C cold-start bootstrap: cursor $localCursor → $idx via $resolvedManeuverType@\"$incomingRoad\"", tag = Logger.Tags.NAVI)
+                    localCursor = idx
+                    bootstrapDone = true
+                } else if (idx < localCursor && (localCursor - idx) >= 3) {
+                    // Backward correction: snap only if delta ≥ 3 (avoids duplicate (cp, road)
+                    // matches in same route from triggering spurious snaps).
+                    logInfo("[NAVI] Tier C backward correction: cursor $localCursor → $idx via $resolvedManeuverType@\"$incomingRoad\"", tag = Logger.Tags.NAVI)
+                    localCursor = idx
+                }
+                // idx >= localCursor: confirmation (=) or preview (>). Don't advance cursor.
+                // Preview info will surface naturally via state.next-* from route[cursor+1].
+            }
+
+            if (!hardReroute) {
+                val routeStep = route.maneuvers[localCursor.coerceAtMost(route.maneuvers.size - 1)]
+                val nextStep = route.maneuvers.getOrNull(localCursor + 1)
+                // Prefer instructionText (the title — what Apple's iPhone displays as the BIG label,
+                // e.g. "Merge onto 2 Richardson Hwy" or "Badger Rd to Fairbanks"). Fall back to
+                // postManeuverRoadName when title is empty (rare).
+                val derivedRoadName = routeStep.instructionText.takeIf { it.isNotEmpty() }
+                    ?: routeStep.postManeuverRoadName.takeIf { it.isNotEmpty() }
+                    ?: current.roadName
+                val mergedTierC = current.copy(
+                    status = naviStatus ?: current.status,
+                    maneuverType = routeStep.cpManeuverType,
+                    orderType = (payload["NaviOrderType"] as? Number)?.toInt() ?: current.orderType,
+                    roadName = derivedRoadName,
+                    remainDistance = (payload["NaviRemainDistance"] as? Number)?.toInt() ?: current.remainDistance,
+                    distanceToDestination =
+                        (payload["NaviDistanceToDestination"] as? Number)?.toInt()
+                            ?: current.distanceToDestination,
+                    timeToDestination = (payload["NaviTimeToDestination"] as? Number)?.toInt() ?: current.timeToDestination,
+                    destinationName =
+                        (payload["NaviDestinationName"] as? String)?.takeIf { it.isNotEmpty() }
+                            ?: current.destinationName,
+                    appName = (payload["NaviAPPName"] as? String)?.takeIf { it.isNotEmpty() } ?: current.appName,
+                    turnAngle = (payload["NaviTurnAngle"] as? Number)?.toInt() ?: current.turnAngle,
+                    turnSide = (payload["NaviTurnSide"] as? Number)?.toInt() ?: current.turnSide,
+                    junctionType = (payload["NaviJunctionType"] as? Number)?.toInt() ?: current.junctionType,
+                    roundaboutExit = (payload["NaviRoundaboutExit"] as? Number)?.toInt() ?: current.roundaboutExit,
+                    // CarPlay roundabout exit angle straight from the route plan's iAP2 0x000b field.
+                    exitAngle = routeStep.exitAngle,
+                    nextManeuverType = nextStep?.cpManeuverType,
+                    nextOrderType = null,
+                    nextRoadName = nextStep?.instructionText?.takeIf { it.isNotEmpty() } ?: nextStep?.postManeuverRoadName,
+                    nextTurnAngle = null,
+                    nextJunctionType = null,
+                    nextRoundaboutExit = null,
+                    nextExitAngle = nextStep?.exitAngle,
+                )
+                logNavi {
+                    "[NAVI] Tier C state: cursor=$localCursor, maneuver=${mergedTierC.maneuverType}, road=${mergedTierC.roadName}, " +
+                        "remainDist=${mergedTierC.remainDistance}m, next=${mergedTierC.nextManeuverType}@${mergedTierC.nextRoadName}"
+                }
+                _state.value = mergedTierC
+                if (incomingDistTierC != null) lastDistance = incomingDistTierC
+                return
+            }
         }
 
         // Normal transition: update current maneuver fields, clear next-step
@@ -303,6 +606,9 @@ object NavigationStateManager {
                 turnSide = (payload["NaviTurnSide"] as? Number)?.toInt() ?: current.turnSide,
                 junctionType = (payload["NaviJunctionType"] as? Number)?.toInt() ?: current.junctionType,
                 roundaboutExit = (payload["NaviRoundaboutExit"] as? Number)?.toInt() ?: current.roundaboutExit,
+                // AA / non-route path: roundabout exit angle is NaviTurnAngle when present (same
+                // driver-relative convention). Nullable so absent ≠ a genuine 0° (straight) exit.
+                exitAngle = (payload["NaviTurnAngle"] as? Number)?.toInt() ?: current.exitAngle,
                 // Clear next-step on normal maneuver transition — previous preview is stale.
                 // Distance-only updates (no NaviManeuverType) preserve existing next-step.
                 nextManeuverType = if (isManeuverMessage) null else current.nextManeuverType,
@@ -311,6 +617,7 @@ object NavigationStateManager {
                 nextTurnAngle = if (isManeuverMessage) null else current.nextTurnAngle,
                 nextJunctionType = if (isManeuverMessage) null else current.nextJunctionType,
                 nextRoundaboutExit = if (isManeuverMessage) null else current.nextRoundaboutExit,
+                nextExitAngle = if (isManeuverMessage) null else current.nextExitAngle,
             )
 
         if (isManeuverMessage && current.hasNextStep) {
@@ -332,6 +639,9 @@ object NavigationStateManager {
         }
 
         _state.value = merged
+        // Keep lastDistance current even on fallback paths so Tier C dist-jump detection
+        // works correctly on the next event after a hard-reroute or AA-mode fall-through.
+        (payload["NaviRemainDistance"] as? Number)?.toInt()?.let { lastDistance = it }
     }
 
     /**
@@ -378,6 +688,11 @@ object NavigationStateManager {
         logNavi { "[NAVI] State cleared (USB disconnect or session end)" }
         _state.value = NavigationState()
         lastManeuverMs = 0
+        localCursor = 0
+        lastRouteRef = null
+        lastDistance = -1
+        bootstrapDone = false
+        lastIap2State = null
         dropCurrentManeuverIcon()
     }
 }

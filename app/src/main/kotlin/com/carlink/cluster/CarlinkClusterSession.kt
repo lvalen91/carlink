@@ -35,8 +35,9 @@ import kotlinx.coroutines.launch
 /**
  * Standard Car App Library cluster session — renders NavigationTemplate directly via onGetTemplate().
  *
- * NOT currently active. CarlinkClusterService returns [ClusterMainSession] instead.
- * However, this is NOT dead code — it is the correct implementation for non-GM AAOS platforms.
+ * NOT currently active. CarlinkClusterService unconditionally returns [ClusterMainSession]
+ * (no SessionInfo-based routing yet). However, this is NOT dead code — it is the correct
+ * implementation for non-GM AAOS platforms and will be selected once the platform switch lands.
  *
  * Two rendering paths exist in AAOS:
  * - **GM AAOS**: Has internal OnStarTurnByTurnManager that consumes NavigationManager.updateTrip()
@@ -46,9 +47,12 @@ import kotlinx.coroutines.launch
  *   onGetTemplate() directly on the cluster display. This class targets that path — its
  *   [CarlinkClusterScreen] returns NavigationTemplate with RoutingInfo (maneuver, distance, road).
  *
- * TODO: Add platform-aware switch in [CarlinkClusterService]:
- *   - GM AAOS → ClusterMainSession (NavigationManager relay)
- *   - Other AAOS → CarlinkClusterSession (direct Screen rendering)
+ * TODO: Add platform-aware switch in [CarlinkClusterService] gated on
+ *   PlatformDetector.PlatformInfo.isGmAaos (already available). 2026-04-20 POTATO
+ *   evidence shows GM's cluster is owned by VMSClusterService + OnStarTurnByTurnManager;
+ *   the GM branch may end up being "return null / don't register" rather than
+ *   "use ClusterMainSession" — NavigationManager.updateTrip() reaching GM's cluster is
+ *   unverified.
  * TODO: Port primary/secondary multiplexing from [ClusterMainSession] to handle emulator
  *   dual-session creation (DISPLAY_TYPE_MAIN + DISPLAY_TYPE_CLUSTER).
  */
@@ -57,6 +61,10 @@ class CarlinkClusterSession : Session() {
     private var navigationManager: NavigationManager? = null
     private var scope: CoroutineScope? = null
     private var isNavigating = false
+
+    // Suppresses spurious navigationEnded() before any active state has been observed:
+    // the initial NavigationState emitted on cold start is idle, and calling navigationEnded()
+    // without a prior navigationStarted() is a protocol violation that the Host rejects.
     private var hasSeenActiveNav = false
 
     override fun onCreateScreen(intent: Intent): Screen {
@@ -80,6 +88,8 @@ class CarlinkClusterSession : Session() {
                     isNavigating = false
                 }
 
+                // Auto-drive (hands-free) is not supported by the upstream NaviJSON protocol;
+                // log only so the host-level event is still observable in traces.
                 override fun onAutoDriveEnabled() {
                     logNavi { "[CLUSTER] Auto drive enabled" }
                 }
@@ -125,8 +135,9 @@ class CarlinkClusterSession : Session() {
     /**
      * Collect navigation state with debounce for rapid partial updates.
      *
-     * NaviJSON arrives in bursts (1-5 fields per message, ~100-500ms apart).
-     * Debouncing prevents excessive updateTrip() calls to Templates Host.
+     * NaviJSON arrives in bursts (1-5 fields per message, ~100-500ms apart — see
+     * NavigationStateManager KDoc). Debouncing coalesces the burst into a single
+     * NavigationManager.updateTrip() relay per stable state.
      */
     private suspend fun collectNavigationState() {
         var debounceJob: Job? = null
@@ -259,6 +270,8 @@ class CarlinkClusterScreen(
                 .setNavigationInfo(routingInfo)
                 .build()
         } catch (e: Exception) {
+            // Car App Library builders throw on malformed RoutingInfo or unknown Maneuver
+            // types from adapter data; fall back to an empty template so the Host doesn't crash.
             logError(
                 "[CLUSTER_SCREEN] Failed to build NavigationTemplate: ${e.message}",
                 tag = Logger.Tags.NAVI,

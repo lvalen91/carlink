@@ -36,12 +36,20 @@ data class MicFormatConfig(
 
 /**
  * Predefined microphone formats from CPC200-CCPA protocol.
+ *
+ * The capture format is NOT static — it is selected dynamically from the `decodeType`
+ * field of the adapter's `AUDIO_INPUT_CONFIG` command at session start. CarPlay/Siri
+ * use 16kHz wideband; Android Auto phone calls switch to 8kHz HFP/SCO narrowband.
+ * See `documents/reference/adapter/RE_Documention/03_Audio_Processing/microphone_processing.md`.
  */
 object MicFormats {
-    val PHONE_CALL = MicFormatConfig(8000, 1) // decodeType=3: Phone calls
-    val SIRI_VOICE = MicFormatConfig(16000, 1) // decodeType=5: Siri/voice assistant
-    val ENHANCED = MicFormatConfig(24000, 1) // decodeType=6: Enhanced voice
-    val STEREO_VOICE = MicFormatConfig(16000, 2) // decodeType=7: Stereo voice
+    val PHONE_CALL = MicFormatConfig(8000, 1)  // decodeType=3: Android Auto phone calls (HFP/SCO narrowband). CarPlay phone calls use SIRI_VOICE
+    val SIRI_VOICE = MicFormatConfig(16000, 1) // decodeType=5: Siri/voice assistant + CarPlay phone calls (iAP2 wideband)
+    // Dead-code-in-practice: WebRTC AECM accepts only 8kHz/16kHz, and the firmware does
+    // not forward upstream mic audio at these rates downstream. Listed for protocol
+    // completeness; never use as the live mic format.
+    val ENHANCED = MicFormatConfig(24000, 1)   // decodeType=6: Enhanced voice — firmware accepts format but drops/misroutes the audio
+    val STEREO_VOICE = MicFormatConfig(16000, 2) // decodeType=7: Stereo voice — same; firmware does not forward stereo mic audio
 
     fun fromDecodeType(decodeType: Int): MicFormatConfig =
         when (decodeType) {
@@ -80,7 +88,9 @@ object MicFormats {
  * - Ring buffer absorbs AudioRecord timing jitter and USB send variations
  * - Dedicated high-priority capture thread
  * - Non-blocking reads for USB thread
- * - VOICE_COMMUNICATION audio source for OS-level echo cancellation/noise suppression
+ * - VOICE_COMMUNICATION audio source — requests OS-level echo cancellation /
+ *   noise suppression. Actual effect is HAL-dependent and not guaranteed
+ *   (varies by device; on the GM IOK target it depends on the SST HAL config).
  *
  * THREAD SAFETY:
  * - Capture thread writes to ring buffer (single writer)
@@ -106,12 +116,12 @@ class MicrophoneCaptureManager(
 
     @Volatile private var overrunCount: Int = 0
 
-    // 500ms buffer prevents overruns when main thread blocked (Session 6 fix)
+    // 500ms buffer prevents overruns when main thread blocked
     private val bufferCapacityMs = 500
     private val captureChunkMs = 20
 
     // Pre-allocated read buffer — reused by readChunk() to avoid per-call allocation.
-    // Sized for max readChunk request (640 bytes = 20ms of 16kHz mono PCM16).
+    // Initially sized for 16kHz mono 20ms (640B); grows on demand if readChunk requests more.
     // Safe to reuse: caller (sendMicrophoneData) consumes data synchronously before next tick.
     private var readBuffer = ByteArray(640)
 
@@ -123,7 +133,14 @@ class MicrophoneCaptureManager(
             Manifest.permission.RECORD_AUDIO,
         ) == PackageManager.PERMISSION_GRANTED
 
-    /** Start capture. decodeType: 3=phone, 5=siri (default), 6=enhanced, 7=stereo. */
+    /**
+     * Start capture. [decodeType] should come from the adapter's `AUDIO_INPUT_CONFIG`:
+     *  - 3 = Android Auto phone call (8kHz HFP/SCO narrowband)
+     *  - 5 = Siri / voice assistant / CarPlay phone call (16kHz wideband — default)
+     *  - 6 = enhanced voice (24kHz mono): firmware accepts the format but does not
+     *        forward the audio downstream — dead in practice.
+     *  - 7 = stereo voice (16kHz stereo): same — firmware does not forward stereo mic.
+     */
     fun start(decodeType: Int = 5): Boolean {
         synchronized(lock) {
             if (isRunning.get()) {
@@ -153,7 +170,8 @@ class MicrophoneCaptureManager(
 
                 val recordBufferSize = minBufferSize * 3
 
-                // VOICE_COMMUNICATION enables OS echo cancellation/noise suppression
+                // VOICE_COMMUNICATION requests OS echo cancellation/noise suppression
+                // (HAL-dependent — see class doc).
                 audioRecord =
                     AudioRecord(
                         MediaRecorder.AudioSource.VOICE_COMMUNICATION,
@@ -293,7 +311,7 @@ class MicrophoneCaptureManager(
             format.sampleRate == 16000 && format.channelCount == 1 -> 5
             format.sampleRate == 24000 && format.channelCount == 1 -> 6
             format.sampleRate == 16000 && format.channelCount == 2 -> 7
-            else -> 5
+            else -> 5 // defensive — unreachable, currentFormat is always one of the four MicFormats
         }
     }
 

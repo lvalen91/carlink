@@ -10,6 +10,7 @@ import android.hardware.usb.UsbDeviceConnection
 import android.hardware.usb.UsbEndpoint
 import android.hardware.usb.UsbInterface
 import android.hardware.usb.UsbManager
+import android.os.Build
 import androidx.core.content.ContextCompat
 import com.carlink.logging.Logger
 import com.carlink.logging.logDebug
@@ -24,16 +25,40 @@ import kotlin.coroutines.resume
 
 private const val ACTION_USB_PERMISSION = "com.carlink.USB_PERMISSION"
 private const val MAX_PAYLOAD_SIZE = 2 * 1024 * 1024 // 2MB — reject corrupted headers
-private const val INITIAL_RESPONSE_TIMEOUT_MS = 15_000L // adapter must respond within 15s of reading loop start
+// 15s chosen with headroom over the adapter's ~10s heartbeat window (see
+// documents/reference/heartbeat_analysis.md). If no data arrives at all inside this window
+// after loop start, the USB IN endpoint is assumed dead. Live validation 2026-04-20:
+// timeout fired correctly at 07:29:26 after ~70s of post-handshake silence
+// (logcat_20260420_063729_carlink.txt:15735); zero spurious 15s timeouts across 6 sessions.
+private const val INITIAL_RESPONSE_TIMEOUT_MS = 15_000L
 
 /**
- * USB Device Wrapper for Carlinkit Adapter Communication
+ * USB Device Wrapper for Carlinkit Adapter Communication.
  *
  * Provides a high-level interface for USB device operations including:
  * - Device discovery and permission handling
  * - Connection lifecycle management
  * - Bulk transfer operations for data exchange
  * - Interface claiming and endpoint configuration
+ *
+ * Thread model: the reading loop runs on one dedicated "USB-ReadLoop" daemon thread.
+ * [write] can be called from several threads (heartbeat timer, mic capture, frame
+ * interval, UI); the atomic counters in this file cover statistics only — the
+ * underlying UsbDeviceConnection.bulkTransfer is NOT documented thread-safe on a
+ * single endpoint. See AdapterDriver's class KDoc for the full threading contract
+ * and why the current writer cadences make this safe in practice.
+ *
+ * Known failure modes worth documenting up-front:
+ * - Header desync (on parse error or oversized header) has no scan-for-magic resync;
+ *   recovery requires reconnect. See the reading-loop body for details.
+ * - Chunk-buffer over-read in the non-video payload path: if a single USB transaction
+ *   delivers more than one message's worth of bytes, the tail (containing the next
+ *   header) can be lost. Latent — CPC200 bulk transfers align one-msg-per-transaction
+ *   in practice.
+ * - close() ↔ in-flight bulkTransfer race: close() calls stopReadingLoop().join(1000);
+ *   if the read thread is blocked in bulkTransfer, join times out and teardown
+ *   proceeds while the call is still mid-flight. Android unsticks pending transfers
+ *   by returning -1 on endpoint close, so it survives.
  */
 class UsbDeviceWrapper(
     private val context: Context,
@@ -49,6 +74,9 @@ class UsbDeviceWrapper(
     private val _isOpened = AtomicBoolean(false)
     private val _isReadingLoopActive = AtomicBoolean(false)
 
+    // @Volatile guards visibility only. Read/write happens from startReadingLoop
+    // (creator) and stopReadingLoop/close (joiner + nulling); mutual exclusion comes
+    // from the CAS on _isReadingLoopActive in stopReadingLoop, not from volatility.
     @Volatile private var readLoopThread: Thread? = null
 
     val isOpened: Boolean get() = _isOpened.get()
@@ -59,7 +87,10 @@ class UsbDeviceWrapper(
     val deviceName: String get() = device.deviceName
 
     // Performance tracking — atomic because write() is called from multiple threads
-    // (heartbeat timer, mic capture timer, frame interval coroutine, UI thread)
+    // (heartbeat timer, mic capture timer, frame interval coroutine, UI thread).
+    // NOTE: atomics cover STATS ONLY; the underlying bulkTransfer is not documented
+    // thread-safe. See class KDoc and AdapterDriver's threading section for why
+    // concurrent write() calls survive today.
     private val bytesSent = AtomicLong(0)
     private val bytesReceived = AtomicLong(0)
     private val sendCount = AtomicInteger(0)
@@ -125,14 +156,18 @@ class UsbDeviceWrapper(
                     ContextCompat.RECEIVER_NOT_EXPORTED,
                 )
 
-                // Create pending intent with explicit Intent (package set) for Android 12+ security
-                // FLAG_MUTABLE is required because UsbManager adds extras to the intent
+                // Create pending intent with explicit Intent (package set) for Android 12+ security.
+                // FLAG_MUTABLE (API 31+) is required because UsbManager injects EXTRA_DEVICE /
+                // EXTRA_PERMISSION_GRANTED into the intent at send time. Pre-31 PendingIntents are
+                // mutable by default, so the flag is omitted there (it does not exist below API 31).
+                val mutableFlag =
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) PendingIntent.FLAG_MUTABLE else 0
                 val pendingIntent =
                     PendingIntent.getBroadcast(
                         context,
                         0,
                         Intent(ACTION_USB_PERMISSION).apply { setPackage(context.packageName) },
-                        PendingIntent.FLAG_MUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
+                        mutableFlag or PendingIntent.FLAG_UPDATE_CURRENT,
                     )
                 usbManager.requestPermission(device, pendingIntent)
 
@@ -359,20 +394,26 @@ class UsbDeviceWrapper(
         }
 
         Thread {
-            // Elevate thread priority: USB read feeds BOTH audio and video pipelines
-            // Must be >= video codec priority to prevent audio underruns from data starvation
-            // Using -10 (between URGENT_DISPLAY=-8 and AUDIO=-16) to match MediaCodec_loop priority
+            // Elevate thread priority: USB read feeds BOTH audio and video pipelines.
+            // Must be >= video codec priority to prevent audio underruns from data starvation.
+            // Using -10 (between URGENT_DISPLAY=-8 and URGENT_AUDIO=-19) to match
+            // MediaCodec_loop priority (see documents/reference/gminfo/projection/cpc200_integration.md:110).
             android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_URGENT_DISPLAY - 2)
 
             log("Reading loop started")
             val headerBuffer = ByteArray(16)
 
             // Pre-allocate video buffer to avoid per-frame allocation (reduces GC pressure at 60fps)
-            // Initial size 256KB covers most frames; grows if needed (rare for 1080p H.264)
+            // Initial size 256KB covers most frames; grows if needed (rare for 1080p H.264).
+            // Growth is MONOTONIC (never shrinks); bounded by MAX_PAYLOAD_SIZE.
             var videoBuffer = ByteArray(256 * 1024)
 
-            // Pre-allocate audio buffer to avoid per-packet allocation (~17 packets/sec)
+            // Pre-allocate audio buffer to avoid per-packet allocation (~17 packets/sec).
             // Initial size 16KB covers typical 11532-byte audio payloads; grows if needed
+            // (monotonic, bounded by MAX_PAYLOAD_SIZE).
+            // REUSE CONTRACT: when AUDIO_DATA is delivered via callback.onMessage, the
+            // returned payload is this same audioBuffer. Downstream consumers MUST copy
+            // or fully consume bytes before the next AUDIO_DATA arrives on this thread.
             var audioBuffer = ByteArray(16 * 1024)
 
             // Pre-allocate chunk buffer for non-video message reads (audio, commands, etc.)
@@ -428,7 +469,13 @@ class UsbDeviceWrapper(
                     consecutiveTimeouts = 0
                     hasReceivedData = true
 
-                    // Parse header
+                    // Parse header.
+                    // DESYNC HAZARD: on failure we `continue`, which reads the next 16 bytes
+                    // from wherever the stream currently is — no scan-for-magic resync is
+                    // performed. If the stream is misaligned, every subsequent header parse
+                    // will fail until the adapter reconnects. Acceptable today because the
+                    // CPC200 aligns one-message-per-bulk-transaction in practice; if stream
+                    // corruption becomes a real scenario, add PROTOCOL_MAGIC-byte search here.
                     val header =
                         try {
                             com.carlink.protocol.MessageParser
@@ -442,7 +489,8 @@ class UsbDeviceWrapper(
                             continue
                         }
 
-                    // Reject corrupted headers with implausible payload sizes
+                    // Reject corrupted headers with implausible payload sizes.
+                    // Same desync hazard as above — no attempt to drain the phantom payload.
                     if (header.length > MAX_PAYLOAD_SIZE) {
                         val hex = headerBuffer.take(16).joinToString(" ") { "%02X".format(it) }
                         logWarn(
@@ -452,13 +500,36 @@ class UsbDeviceWrapper(
                         continue
                     }
 
-                    // Handle VIDEO_DATA and NAVI_VIDEO_DATA with direct handoff to codec
-                    if ((
-                            header.type == com.carlink.protocol.MessageType.VIDEO_DATA ||
-                                header.type == com.carlink.protocol.MessageType.NAVI_VIDEO_DATA
-                        ) &&
-                        header.length > 0 && videoProcessor != null
-                    ) {
+                    // Demux split for 0x06 (VIDEO_DATA) and 0x2C (NAVI_VIDEO_DATA / AltVideo):
+                    //   0x06 → main IHU video pipeline (videoProcessor → H264Renderer → Surface).
+                    //   0x2C → ClusterHomeDisplay forwarder (com.carlink.ipc.NaviVideoForwarder),
+                    //          which strips the 20B video header and broadcasts H.264 Annex-B
+                    //          payloads to bound consumer sinks over AIDL.
+                    //
+                    // Both paths share the chunked USB read into videoBuffer + the source-PTS
+                    // extraction below; dispatch happens after totalRead == header.length.
+                    //
+                    // Previously both types OR'd into the same videoProcessor call — a latent
+                    // bug: a 0x2C frame would stomp the main-video MediaCodec with nav-resolution
+                    // SPS/PPS and stall the decoder. The split fixes that.
+                    //
+                    // 0x2C is only accepted when NaviVideoSingleton.enabled is true (debug build
+                    // on AAOS emulator); on prod/non-emulator the adapter doesn't emit 0x2C
+                    // anyway because MessageSerializer skips naviScreenInfo BoxSettings, and any
+                    // unexpected 0x2C is drained via the non-video branch below.
+                    //
+                    // Gated on header.length > 0: zero-length video headers fall through to
+                    // the non-video branch below where payload ends up null and callback.onMessage
+                    // fires with dataLength=0 — this is the VideoStreamingSignal sentinel path
+                    // consumed by MessageParser.kt (see the VideoStreamingSignal object for
+                    // the synthetic-message contract).
+                    val isMainVideo =
+                        header.type == com.carlink.protocol.MessageType.VIDEO_DATA &&
+                            videoProcessor != null
+                    val isNaviVideo =
+                        header.type == com.carlink.protocol.MessageType.NAVI_VIDEO_DATA &&
+                            com.carlink.ipc.NaviVideoSingleton.enabled
+                    if ((isMainVideo || isNaviVideo) && header.length > 0) {
                         val conn = connection
                         val endpoint = inEndpoint
                         if (conn != null && endpoint != null) {
@@ -511,7 +582,16 @@ class UsbDeviceWrapper(
                                     }
 
                                 if (totalRead == header.length) {
-                                    videoProcessor.processVideoDirect(videoBuffer, totalRead, sourcePts)
+                                    if (isMainVideo) {
+                                        videoProcessor.processVideoDirect(videoBuffer, totalRead, sourcePts)
+                                    } else {
+                                        // isNaviVideo — gate already enforced upstream.
+                                        // Forwarder copies the Annex-B payload out before AIDL
+                                        // broadcast, so the shared videoBuffer is safe to reuse
+                                        // for the next read immediately.
+                                        com.carlink.ipc.NaviVideoSingleton.forwarder
+                                            .onUsbFrame(videoBuffer, totalRead)
+                                    }
                                 } else {
                                     logDebug(
                                         "[VIDEO_READ] Partial frame dropped: got=$totalRead/${header.length} " +
@@ -531,7 +611,13 @@ class UsbDeviceWrapper(
                     }
 
                     // Read payload for non-video messages (audio, commands, media metadata, etc.)
-                    // For AUDIO_DATA: reuse pre-allocated audioBuffer to avoid per-packet allocation
+                    // For AUDIO_DATA: reuse pre-allocated audioBuffer to avoid per-packet allocation.
+                    // CHUNK OVER-READ HAZARD: read(chunkBuffer, timeout) may deliver more bytes
+                    // than (header.length - totalRead). The minOf() below clamps the COPY to
+                    // exactly header.length, but the untranscribed tail of chunkBuffer is
+                    // overwritten on the next iteration. If a single USB transaction ever
+                    // delivers more than one message's worth (rare but possible), the next
+                    // header is lost and the loop desyncs. Latent today.
                     val isAudio = header.type == com.carlink.protocol.MessageType.AUDIO_DATA
                     var dataLength = 0
                     val payload: ByteArray? =
@@ -598,6 +684,15 @@ class UsbDeviceWrapper(
 
     /**
      * Stop the reading loop.
+     *
+     * Best-effort: if the read thread is blocked inside UsbDeviceConnection.bulkTransfer
+     * at the moment this is called, the join(1000) will time out silently and
+     * readLoopThread is nulled anyway. Subsequent close() then releases the interface
+     * and closes the connection, which Android uses as the signal to unstick the
+     * pending transfer (returns -1). The read-loop try/catch absorbs the fallout and
+     * flips _isReadingLoopActive=false in its finally block. Net: the loop exits
+     * cleanly, but there is a brief window where a closing connection is still in
+     * use by the reader thread.
      */
     fun stopReadingLoop() {
         if (!_isReadingLoopActive.getAndSet(false)) return
@@ -611,6 +706,11 @@ class UsbDeviceWrapper(
 
     // ==================== Private Methods ====================
 
+    // First-match semantics: claims the first interface that exposes BOTH a bulk-IN
+    // and bulk-OUT endpoint. If the adapter ever exposes multiple such interfaces,
+    // the code claims the lowest-index one and ignores the rest. Known devices (per
+    // KnownDevices in MessageTypes.kt) present exactly one matching interface, so
+    // this is safe today.
     private fun claimBulkInterface(): Boolean {
         for (i in 0 until device.interfaceCount) {
             val iface = device.getInterface(i)
@@ -674,7 +774,15 @@ class UsbDeviceWrapper(
 
         /**
          * Extract source PTS from video header buffer.
-         * PTS is at offset 12 in the 20-byte video header, little-endian int.
+         *
+         * PTS sits at absolute byte 0x1C (=28) in the full USB frame per
+         * documents/reference/.../video_protocol.md. Because [buffer] in the
+         * reading-loop call site holds PAYLOAD ONLY (the 16-byte USB header
+         * already consumed), the effective offset is 28 - 16 = 12, little-endian Int.
+         *
+         * The [offset] parameter supports reading the PTS from elsewhere in a larger
+         * buffer (not used today; kept for future reuse with buffers that include
+         * the 16-byte header).
          */
         fun extractPtsFromHeader(
             buffer: ByteArray,

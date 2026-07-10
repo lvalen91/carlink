@@ -57,14 +57,25 @@ import com.carlink.ui.theme.AutomotiveDimens
 /**
  * Display Mode Dialog with Live Preview
  *
- * Allows users to select between three display modes with instant visual preview.
- * Changes are previewed immediately by toggling system bars, but require restart
- * to properly reconfigure video surface dimensions.
+ * Allows users to select between four display modes with instant visual preview.
+ * Changes are previewed immediately by toggling system bars. Apply performs an
+ * in-place tier-2 session reinit via MainActivity.reinitializeForDisplayMode
+ * (NOT a process kill/restart — see SettingsScreen.kt:559 for historical context).
  *
  * Modes:
  * - SYSTEM_UI_VISIBLE: Both status bar and navigation bar always visible
  * - STATUS_BAR_HIDDEN: Only status bar hidden, navigation bar remains visible
+ * - NAV_BAR_HIDDEN: Only navigation bar hidden, status bar remains visible
  * - FULLSCREEN_IMMERSIVE: Both bars hidden, swipe to reveal temporarily
+ *
+ * Precondition: WindowCompat.setDecorFitsSystemWindows(window, false) MUST be in effect;
+ * MainActivity sets it at onCreate. Confirmed working on gminfo37 (POTATO 2026-04-20: cutout
+ * T:0 B:0 L:0 R:0; bounds 2400x960 == display 2400x960 regardless of mode). Preview toggles
+ * would no-op under the default `true`.
+ *
+ * @param onApplyAndRestart Historical name; behavior is an in-place session reinit
+ *   via MainActivity.reinitializeForDisplayMode, NOT a process restart. Name is
+ *   preserved to avoid breaking callers.
  */
 @Composable
 internal fun DisplayModeDialog(
@@ -96,7 +107,14 @@ internal fun DisplayModeDialog(
         window?.let { applyDisplayModePreview(it, selectedMode) }
     }
 
-    // Restore original mode when dialog dismissed without saving
+    // Restore original mode when dialog dismissed without saving.
+    // KNOWN ISSUE (flicker on Apply): SettingsScreen.kt:548 flips
+    // showDisplayModeDialog=false synchronously, so onDispose fires immediately
+    // with the STALE captured savedMode — before the setDisplayMode(newMode)
+    // coroutine has emitted. System bars briefly flip to the old mode until
+    // MainActivity.reinitializeForDisplayMode applies the new one.
+    // Also redundant: Cancel, back-press, and outside-tap each already call
+    // applyDisplayModePreview(savedMode); onDispose is a third (harmless) call.
     DisposableEffect(Unit) {
         onDispose {
             window?.let { applyDisplayModePreview(it, savedMode) }
@@ -148,6 +166,9 @@ internal fun DisplayModeDialog(
                 Spacer(modifier = Modifier.height(8.dp))
 
                 // Subtitle with preview indicator
+                // NOTE: Text is stale — Apply now performs in-place tier-2 session
+                // reinit (no process restart). Consider rewording to
+                // "Preview changes instantly • Reinitialize to apply".
                 Text(
                     text = "Preview changes instantly • Restart required to apply",
                     style = MaterialTheme.typography.bodyMedium,
@@ -165,6 +186,7 @@ internal fun DisplayModeDialog(
                     verticalArrangement = Arrangement.spacedBy(16.dp),
                 ) {
                     // Configuration option card
+                    // See ConfigurationOptionCard in AdapterConfigurationDialog.kt:929 (internal).
                     ConfigurationOptionCard(
                         title = "App Immersion",
                         description = "Control system UI visibility during projection",
@@ -251,6 +273,9 @@ internal fun DisplayModeDialog(
                     }
 
                     // Apply & Restart
+                    // NOTE: Label "Apply & Restart" is stale — the underlying action
+                    // is an in-place session reinit (MainActivity.reinitializeForDisplayMode),
+                    // NOT a process restart. Label preserved for user familiarity.
                     Button(
                         onClick = { onApplyAndRestart(selectedMode) },
                         modifier = Modifier.weight(1.5f),
@@ -282,7 +307,10 @@ private fun applyDisplayModePreview(
 
     when (mode) {
         DisplayMode.SYSTEM_UI_VISIBLE -> {
-            // Show all system bars - let AAOS manage display bounds
+            // Show all system bars - let AAOS manage display bounds.
+            // MINOR QUIRK: systemBarsBehavior is not reset here. If the user
+            // previously previewed a hiding mode, BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+            // persists on the controller. Benign since bars are shown, but noted.
             controller.show(WindowInsetsCompat.Type.systemBars())
         }
 
@@ -316,6 +344,11 @@ private fun applyDisplayModePreview(
  *
  * Toggle button with animated visual indicator for selected state.
  * Styled to match AudioSourceButton for consistency.
+ *
+ * PERF NOTE: Uses 5 animate*AsState per button (bg, border width, border color,
+ * content color, icon scale) × 4 buttons = 20 animation state objects. Not a
+ * flicker risk, but a noticeable recomposition cost on AAOS. Deliberate trade-off
+ * for button feel.
  */
 @Composable
 private fun DisplayModeButton(

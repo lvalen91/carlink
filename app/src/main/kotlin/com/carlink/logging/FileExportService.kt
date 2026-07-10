@@ -31,24 +31,40 @@ import java.io.IOException
  * ```
  *
  * Design rationale:
- * - Stateless: No mutable state, no race conditions
- * - Suspend functions: All I/O runs on Dispatchers.IO per Android best practices
- * - Result type: Explicit error handling without exceptions propagating
- * - Separation of concerns: Compose handles lifecycle, this handles I/O
- * - Streaming: Large files are copied in chunks to avoid memory pressure
+ * - Stateless: No mutable state. (Two concurrent calls with the same Uri can still race
+ *   at the SAF document-provider level — don't launch two exports of the same target.)
+ * - Suspend functions: All I/O runs on Dispatchers.IO per Android best practices.
+ * - Result type: Explicit error handling for the expected I/O failure modes
+ *   (IOException, SecurityException). CancellationException propagates normally per
+ *   Kotlin structured concurrency; OOM / other RuntimeExceptions are not caught.
+ * - Separation of concerns: Compose handles lifecycle, this handles I/O.
+ * - Streaming: Large files (>LARGE_FILE_THRESHOLD) are copied in 8 KiB chunks. Smaller
+ *   files are read whole via File.readBytes() — a 1 MiB single allocation at the
+ *   threshold boundary, which is acceptable for log-file export but not for arbitrary
+ *   payloads.
  *
  * @see <a href="https://developer.android.com/training/data-storage/shared/documents-files">SAF Documentation</a>
  */
 object FileExportService {
     private const val TAG = Logger.Tags.FILE_LOG
-    private const val STREAM_BUFFER_SIZE = 8192 // 8KB buffer for streaming
-    private const val LARGE_FILE_THRESHOLD = 1024 * 1024L // 1MB - use streaming above this
+
+    // Chunk size for the streaming path. 8 KiB matches the default used by
+    // Okio/BufferedInputStream — larger values yield diminishing returns for SAF writes.
+    private const val STREAM_BUFFER_SIZE = 8192
+
+    // Empirically chosen for the LogsTab export flow. Rotated log files are typically
+    // under 1 MiB; exports above this size use streaming instead of a whole-file
+    // ByteArray allocation. Adjust if this service is ever used for larger payloads.
+    private const val LARGE_FILE_THRESHOLD = 1024 * 1024L
 
     /**
      * Writes file contents to the specified URI.
      *
-     * For files larger than 1MB, uses streaming copy to avoid memory pressure.
-     * For smaller files, reads into memory for simplicity.
+     * For files larger than LARGE_FILE_THRESHOLD (1 MiB), uses streaming copy. For
+     * smaller files, reads into memory via File.readBytes() and delegates to
+     * writeBytesToUri. The small-file path incurs a nested withContext(Dispatchers.IO)
+     * inside the outer one — harmless (same-dispatcher calls are collapsed) but kept
+     * so writeBytesToUri remains a safe public entry point on its own.
      *
      * @param context Android context for ContentResolver access
      * @param uri Destination URI from SAF document picker
@@ -92,6 +108,13 @@ object FileExportService {
     /**
      * Streams file contents to the specified URI using buffered copy.
      * Avoids loading entire file into memory - suitable for large files.
+     *
+     * Known gap: outputStream is opened before the inputStream's use {} block. If
+     * file.inputStream() throws (file deleted after the exists() check, permission
+     * change, etc.) the outputStream is caught by the IOException handler but is not
+     * closed — it leaks until its ContentResolver-side client is GC'd. Low-risk for
+     * the current log-export flow but worth fixing by inverting the use {} nesting
+     * (outputStream.use { file.inputStream().use { ... } }).
      *
      * @param context Android context for ContentResolver access
      * @param uri Destination URI from SAF document picker

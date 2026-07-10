@@ -1,5 +1,15 @@
 <?xml version="1.0" encoding="utf-8"?>
+<!--
+    AAOS enumerates apps by the <uses name="..."/> entries here.
+    - media      : required so AAOS Media Center lists Carlink as a selectable source
+                   (the MediaBrowserService intent-filter is necessary but not sufficient)
+    - template   : Car App Library template surfaces used by cluster sessions
+    - navigation : CarlinkClusterService declares androidx.car.app.category.NAVIGATION
+                   (cluster-only via FEATURE_CLUSTER — does not conflict with Maps
+                   on the main display)
+-->
 <automotiveApp>
+    <uses name="media"/>
     <uses name="template"/>
     <uses name="navigation"/>
 </automotiveApp>

@@ -53,6 +53,11 @@ object MessageParser {
     /**
      * Parse a complete message from header and payload.
      *
+     * NOTE: this `when` has an `else` catch-all that returns [UnknownMessage] — so
+     * adding a new entry to [MessageType] without a case here will compile cleanly
+     * and fall through to the catch-all (showing up as [Logger.Tags.PROTO_UNKNOWN]
+     * at runtime). When you add a MessageType, add its branch here too.
+     *
      * @param header Parsed message header
      * @param payload Message payload bytes (can be null for some message types)
      * @return Parsed Message object
@@ -109,6 +114,9 @@ object MessageParser {
 
             MessageType.UI_HIDE_PEER_INFO -> InfoMessage(header, "UiHidePeerInfo")
 
+            // Observed as an active runtime signal during CarPlay session setup:
+            // emitted once with a zero-length payload shortly after the paired-list
+            // broadcast. Treated as diagnostic only at this layer.
             MessageType.UI_BRING_TO_FOREGROUND -> InfoMessage(header, "UiBringToForeground")
 
             MessageType.REMOTE_CX_CY -> parseHexPayload(header, payload, "RemoteCxCy")
@@ -151,6 +159,43 @@ object MessageParser {
             else -> UnknownMessage(header, payload)
         }
 
+    /**
+     * Bounds-safe ByteBuffer.wrap that tolerates adapter frames whose declared
+     * header.length exceeds the bytes actually delivered by the USB bulk read.
+     *
+     * WHY: ByteBuffer.wrap(array, offset, length) throws IOOBE when
+     * offset+length > array.size. Without this helper, a short/corrupt frame
+     * would throw out of the USB-ReadLoop thread and require a full reconnect to
+     * recover (UsbDeviceWrapper already caps header.length at MAX_PAYLOAD_SIZE,
+     * so the window was narrow — but the failure mode was fatal when it hit).
+     * The clamp converts any would-be crash into a logged drop; the state
+     * machine's existing reconnect logic then handles recovery if needed.
+     *
+     * Returns null only for negative declared length (hard protocol violation);
+     * callers should treat null as "return UnknownMessage".
+     */
+    private fun safeWrap(
+        payload: ByteArray,
+        declared: Int,
+        tag: String,
+    ): ByteBuffer? {
+        if (declared < 0) {
+            logWarn(
+                "[MessageParser] $tag: negative header.length=$declared; dropping",
+                Logger.Tags.PROTO_UNKNOWN,
+            )
+            return null
+        }
+        val safe = declared.coerceAtMost(payload.size)
+        if (safe != declared) {
+            logWarn(
+                "[MessageParser] $tag: truncated frame, header.length=$declared payload=${payload.size}; clamping to $safe",
+                Logger.Tags.PROTO_UNKNOWN,
+            )
+        }
+        return ByteBuffer.wrap(payload, 0, safe).order(ByteOrder.LITTLE_ENDIAN)
+    }
+
     private fun parseAudioData(
         header: MessageHeader,
         payload: ByteArray?,
@@ -159,16 +204,19 @@ object MessageParser {
             return UnknownMessage(header, payload)
         }
 
-        val buffer = ByteBuffer.wrap(payload, 0, header.length).order(ByteOrder.LITTLE_ENDIAN)
+        val buffer = safeWrap(payload, header.length, "parseAudioData")
+            ?: return UnknownMessage(header, payload)
 
         val decodeType = buffer.int
         val volume = buffer.float
         val audioType = buffer.int
 
-        val remainingBytes = header.length - 12
+        // Use buffer.limit() (the safeWrap-clamped bound) rather than header.length
+        // to avoid reading past the actual payload on truncated frames.
+        val remainingBytes = (buffer.limit() - 12).coerceAtLeast(0)
 
         return when {
-            remainingBytes == 1 -> {
+            remainingBytes == 1 && payload.size > 12 -> {
                 val commandId = payload[12].toInt() and 0xFF
                 AudioDataMessage(
                     header = header,
@@ -232,48 +280,59 @@ object MessageParser {
             return MediaDataMessage(header, MediaType.UNKNOWN, emptyMap())
         }
 
-        val buffer = ByteBuffer.wrap(payload, 0, header.length).order(ByteOrder.LITTLE_ENDIAN)
+        val buffer = safeWrap(payload, header.length, "parseMediaData")
+            ?: return MediaDataMessage(header, MediaType.UNKNOWN, emptyMap())
         val typeInt = buffer.int
         val mediaType = MediaType.fromId(typeInt)
+
+        // Use buffer.limit() rather than header.length so we respect the clamped
+        // bound from safeWrap() on truncated frames. end is always <= payload.size.
+        val end = buffer.limit()
+        val bodyLen = (end - 4).coerceAtLeast(0)
 
         val mediaPayload: Map<String, Any> =
             when (mediaType) {
                 MediaType.ALBUM_COVER,
                 MediaType.ALBUM_COVER_AA -> {
-                    val imageData = ByteArray(header.length - 4)
-                    System.arraycopy(payload, 4, imageData, 0, imageData.size)
-                    mapOf("AlbumCover" to imageData)
+                    if (bodyLen > 0) {
+                        val imageData = ByteArray(bodyLen)
+                        System.arraycopy(payload, 4, imageData, 0, bodyLen)
+                        mapOf("AlbumCover" to imageData)
+                    } else {
+                        emptyMap()
+                    }
                 }
 
                 MediaType.NAVI_IMAGE -> {
-                    if (header.length > 4) {
-                        val imageData = ByteArray(header.length - 4)
-                        System.arraycopy(payload, 4, imageData, 0, imageData.size)
+                    if (bodyLen > 0) {
+                        val imageData = ByteArray(bodyLen)
+                        System.arraycopy(payload, 4, imageData, 0, bodyLen)
                         mapOf("NaviImage" to imageData)
                     } else {
                         emptyMap()
                     }
                 }
 
-                MediaType.DATA, MediaType.NAVI_JSON -> {
-                    if (header.length < 6) {
-                        // Need at least: 4 (type int) + 1 (JSON byte) + 1 (trailing null)
+                MediaType.DATA, MediaType.NAVI_JSON, MediaType.CALL_STATUS -> {
+                    if (bodyLen < 1) {
                         emptyMap()
                     } else {
+                        // WHY trimEnd('\u0000') instead of a hardcoded "header.length - 5":
+                        // the adapter's NUL-termination is inconsistent across payload
+                        // types (BT-address strings definitely vary; media JSON is
+                        // defensive against the same pattern). A hardcoded "-5" offset
+                        // would drop the last JSON char on any frame without the
+                        // trailing NUL. trimEnd tolerates 0..N trailing NULs without
+                        // losing real content; trimEnd (not trim) preserves leading
+                        // NULs as a framing-bug signal rather than silently masking.
+                        val jsonString = String(payload, 4, bodyLen, StandardCharsets.UTF_8)
+                            .trimEnd('\u0000')
                         try {
-                            val jsonBytes = ByteArray(header.length - 5) // Exclude type int and trailing null
-                            System.arraycopy(payload, 4, jsonBytes, 0, jsonBytes.size)
-                            val jsonString = String(jsonBytes, StandardCharsets.UTF_8).trim('\u0000')
                             val json = JSONObject(jsonString)
                             json.keys().asSequence().associateWith { json.get(it) }
                         } catch (e: JSONException) {
-                            val rawPreview = try {
-                                val raw = ByteArray(header.length - 5)
-                                System.arraycopy(payload, 4, raw, 0, raw.size)
-                                String(raw, StandardCharsets.UTF_8).take(256)
-                            } catch (_: Exception) { "(unreadable)" }
                             logWarn(
-                                "[MessageParser] Failed to parse media JSON: ${e.message} raw=$rawPreview",
+                                "[MessageParser] Failed to parse media JSON: ${e.message} raw=${jsonString.take(256)}",
                                 Logger.Tags.PROTO_UNKNOWN,
                             )
                             emptyMap()
@@ -282,11 +341,18 @@ object MessageParser {
                 }
 
                 else -> {
-                    // Unknown subtype — preserve raw bytes for diagnostic logging
-                    val preview = if (header.length > 4) {
-                        val limit = (header.length - 4).coerceAtMost(64)
-                        payload.drop(4).take(limit).joinToString(" ") { "%02X".format(it) } +
-                            if (header.length - 4 > 64) " … (${header.length - 4}B total)" else ""
+                    // Unknown subtype — preserve raw bytes for diagnostic logging.
+                    // Keys are underscore-prefixed so downstream consumers treat them
+                    // as diagnostic metadata rather than real media fields.
+                    val preview = if (bodyLen > 0) {
+                        val limit = bodyLen.coerceAtMost(64)
+                        val hex = StringBuilder(limit * 3)
+                        for (i in 0 until limit) {
+                            if (i > 0) hex.append(' ')
+                            hex.append("%02X".format(payload[4 + i]))
+                        }
+                        if (bodyLen > 64) hex.append(" … (${bodyLen}B total)")
+                        hex.toString()
                     } else ""
                     mapOf("_unknownSubtype" to typeInt, "_hexPreview" to preview)
                 }
@@ -302,7 +368,8 @@ object MessageParser {
         if (payload == null || header.length < 4) {
             return CommandMessage(header, CommandMapping.INVALID, rawId = -1)
         }
-        val buffer = ByteBuffer.wrap(payload, 0, header.length).order(ByteOrder.LITTLE_ENDIAN)
+        val buffer = safeWrap(payload, header.length, "parseCommand")
+            ?: return CommandMessage(header, CommandMapping.INVALID, rawId = -1)
         val commandId = buffer.int
         return CommandMessage(header, CommandMapping.fromId(commandId), rawId = commandId)
     }
@@ -314,7 +381,8 @@ object MessageParser {
         if (payload == null || header.length < 4) {
             return PluggedMessage(header, PhoneType.UNKNOWN, null)
         }
-        val buffer = ByteBuffer.wrap(payload, 0, header.length).order(ByteOrder.LITTLE_ENDIAN)
+        val buffer = safeWrap(payload, header.length, "parsePlugged")
+            ?: return PluggedMessage(header, PhoneType.UNKNOWN, null)
         val phoneTypeId = buffer.int
         val phoneType = PhoneType.fromId(phoneTypeId)
 
@@ -337,14 +405,17 @@ object MessageParser {
         }
 
         // Payload is null-terminated JSON string
-        val jsonString = String(payload, 0, header.length, StandardCharsets.UTF_8).trim('\u0000')
+        val safeLen = header.length.coerceAtMost(payload.size)
+        val jsonString = String(payload, 0, safeLen, StandardCharsets.UTF_8).trim('\u0000')
         if (jsonString.isEmpty()) {
             return UnknownMessage(header, payload)
         }
 
         return try {
             val json = JSONObject(jsonString)
-            // Discriminate: second BoxSettings has MDModel (phone info)
+            // Discriminate: the phone-info form carries "MDModel"; the adapter-info
+            // form carries "uuid" (+ boxType / hwVersion / productType) and arrives
+            // as the adapter's echo of the host's BoxSettings write during FULL init.
             val isPhoneInfo = json.has("MDModel")
             BoxSettingsMessage(header, json, isPhoneInfo)
         } catch (e: JSONException) {
@@ -357,7 +428,7 @@ object MessageParser {
         header: MessageHeader,
         payload: ByteArray?,
     ): Message {
-        if (payload == null || header.length < 17) {
+        if (payload == null || header.length < 17 || payload.size < 17) {
             return UnknownMessage(header, payload)
         }
 
@@ -373,7 +444,8 @@ object MessageParser {
         payload: ByteArray?,
     ): Message {
         if (payload == null || header.length < 4) return PhaseMessage(header, -1)
-        val buffer = ByteBuffer.wrap(payload, 0, header.length).order(ByteOrder.LITTLE_ENDIAN)
+        val buffer = safeWrap(payload, header.length, "parsePhase")
+            ?: return PhaseMessage(header, -1)
         return PhaseMessage(header, buffer.int)
     }
 
@@ -382,7 +454,8 @@ object MessageParser {
         payload: ByteArray?,
     ): Message {
         if (payload == null || header.length < 4) return StatusValueMessage(header, -1)
-        val buffer = ByteBuffer.wrap(payload, 0, header.length).order(ByteOrder.LITTLE_ENDIAN)
+        val buffer = safeWrap(payload, header.length, "parseStatusValue")
+            ?: return StatusValueMessage(header, -1)
         return StatusValueMessage(header, buffer.int)
     }
 
@@ -394,9 +467,14 @@ object MessageParser {
      * is used as a reliable delimiter to split entries.
      *
      * Example payloads:
-     *   "64:31:35:8C:29:69Luis"                          — single device
-     *   "64:31:35:8C:29:69Zeno\0B0:D5:FB:A3:7E:AAPixel"  — null-separated
-     *   "64:31:35:8C:29:69ZenoB0:D5:FB:A3:7E:AAPixel 10" — no separator
+     *   "AA:BB:CC:DD:EE:FFDoe"                           — single device
+     *   "AA:BB:CC:DD:EE:FFJane\011:22:33:44:55:66Pixel"  — null-separated
+     *   "AA:BB:CC:DD:EE:FFJane11:22:33:44:55:66Pixel 10" — no separator
+     *
+     * Verified against live CarPlay sessions: the single-device "MAC + name with no
+     * delimiter" form is actually emitted by real adapters (25-byte payload carrying
+     * a 17-byte MAC immediately followed by an 8-byte name such as "iPhone"). The
+     * regex split strategy survives this format without ambiguity.
      */
     private val BT_MAC_PATTERN = Regex("[0-9A-Fa-f]{2}(?::[0-9A-Fa-f]{2}){5}")
 
@@ -407,7 +485,8 @@ object MessageParser {
         if (payload == null || header.length < 17) {
             return BluetoothPairedListMessage(header, "", emptyList())
         }
-        val raw = String(payload, 0, header.length, StandardCharsets.UTF_8)
+        val safeLen = header.length.coerceAtMost(payload.size)
+        val raw = String(payload, 0, safeLen, StandardCharsets.UTF_8)
             .replace(Regex("[\\x00-\\x1F\\x7F]+"), "") // strip all control characters
         val devices = mutableListOf<Pair<String, String>>()
 
@@ -431,7 +510,8 @@ object MessageParser {
         label: String,
     ): Message {
         if (payload == null || header.length < 1) return InfoMessage(header, label, "")
-        val str = String(payload, 0, header.length, StandardCharsets.UTF_8).trim('\u0000')
+        val safeLen = header.length.coerceAtMost(payload.size)
+        val str = String(payload, 0, safeLen, StandardCharsets.UTF_8).trim('\u0000')
         return InfoMessage(header, label, str)
     }
 
@@ -441,7 +521,8 @@ object MessageParser {
         label: String,
     ): Message {
         if (payload == null || header.length < 4) return InfoMessage(header, label, "${header.length}B")
-        val buffer = ByteBuffer.wrap(payload, 0, header.length).order(ByteOrder.LITTLE_ENDIAN)
+        val buffer = safeWrap(payload, header.length, "parseIntPayload[$label]")
+            ?: return InfoMessage(header, label, "${header.length}B")
         return InfoMessage(header, label, "${buffer.int}")
     }
 
@@ -451,11 +532,12 @@ object MessageParser {
         label: String,
     ): Message {
         if (payload == null || header.length < 1) return InfoMessage(header, label, "0B")
+        val safeLen = header.length.coerceAtMost(payload.size)
         val hex =
             payload
-                .take(header.length.coerceAtMost(32))
+                .take(safeLen.coerceAtMost(32))
                 .joinToString(" ") { "%02X".format(it) }
-        val suffix = if (header.length > 32) "... (${header.length}B)" else ""
+        val suffix = if (safeLen > 32) "... (${safeLen}B)" else ""
         return InfoMessage(header, label, "$hex$suffix")
     }
 
@@ -464,7 +546,8 @@ object MessageParser {
         payload: ByteArray?,
     ): Message {
         if (payload == null || header.length < 8) return InfoMessage(header, "OpenEcho", "${header.length}B")
-        val buffer = ByteBuffer.wrap(payload, 0, header.length).order(ByteOrder.LITTLE_ENDIAN)
+        val buffer = safeWrap(payload, header.length, "parseOpenEcho")
+            ?: return InfoMessage(header, "OpenEcho", "${header.length}B")
         val w = buffer.int
         val h = buffer.int
         return InfoMessage(header, "OpenEcho", "${w}x$h")
@@ -475,6 +558,12 @@ object MessageParser {
 
 /**
  * Base class for all protocol messages.
+ *
+ * Sealed: every concrete subclass must live in THIS file (Kotlin sealed-class
+ * constraint). Do not extract subclasses without understanding that moving them
+ * will break the sealing contract. [InfoMessage] is the catch-all for known-type
+ * diagnostic-only frames; [UnknownMessage] is the catch-all for unrecognised
+ * MessageType codes (preserves raw payload for forensics).
  */
 sealed class Message(
     val header: MessageHeader,
@@ -585,9 +674,13 @@ class MediaDataMessage(
 }
 
 /**
- * Video streaming signal (synthetic, not from protocol).
- * Indicates that video data is being streamed directly to the renderer.
- * Used when video data bypasses message parsing for zero-copy performance.
+ * Video streaming signal (synthetic, not from the protocol wire).
+ * Emitted by [AdapterDriver]'s read loop when VIDEO_DATA arrives with
+ * data==null || dataLength==0 — i.e., the frame was consumed directly by the
+ * VideoDataProcessor for zero-copy rendering. The header.length is always 0
+ * as a clue that this is synthetic, not a real on-wire frame.
+ * Consumers ([CarlinkManager.handleMessage]) use it as a streaming-liveness
+ * pulse (keyframe request, STREAMING-state transition) without touching pixels.
  */
 object VideoStreamingSignal : Message(MessageHeader(0, MessageType.VIDEO_DATA)) {
     override fun toString(): String = "VideoStreamingSignal"
@@ -630,6 +723,17 @@ class PeerBluetoothAddressMessage(
  * Phase 0=terminated, 7=connecting, 8=streaming, 13=negotiation_failed.
  * NOTE: Phase 0 is a session termination signal (alternative to UNPLUGGED).
  * NOTE: Phase 13 indicates AirPlay session negotiation failed (e.g., viewArea/safeArea constraint violation).
+ *
+ * Observed on live CarPlay sessions: PLUGGED(phoneType=3 CARPLAY) arrives first, then
+ * Phase 7 ~1 s later, then Phase 8 ~1.8 s after that. [SessionTokenMessage] (0xA3)
+ * typically lands at the SAME millisecond as the Phase 8 transition — the encrypted
+ * telemetry is delivered as the adapter crosses into streaming. Clean session teardown
+ * does not require a Phase 0 (host-initiated stop sends DisconnectPhone+CloseDongle
+ * and the adapter may end the stream without a final Phase message).
+ *
+ * The adapter's internal CarPlay-phase state machine uses a broader enum (visible on
+ * its console as values like 0/1/2/3/100/101/102); only the subset above is
+ * transmitted over USB to the host.
  */
 class PhaseMessage(
     header: MessageHeader,
@@ -672,9 +776,21 @@ class BluetoothPairedListMessage(
 }
 
 /**
- * Encrypted session telemetry (0xA3).
- * AES-128-CBC encrypted JSON with phone/adapter info.
- * Key: SESSION_TOKEN_ENCRYPTION_KEY in MessageTypes.kt.
+ * Encrypted session telemetry (0xA3) — OPAQUE at this layer.
+ *
+ * Wire format is AES-128-CBC-encrypted JSON with phone/adapter info (phone model,
+ * adapter UUID, firmware version). The key [SESSION_TOKEN_ENCRYPTION_KEY] is
+ * declared in MessageTypes.kt for FUTURE decryption but is not currently used —
+ * this class stores only the encrypted payload size, and [CarlinkManager.handleMessage]
+ * logs receipt without decoding. Do not assume the decrypted fields are accessible
+ * from this message.
+ *
+ * Observed wire characteristics: payload is ASCII Base64 (with trailing `=` padding)
+ * typically 428 bytes long on CarPlay sessions; decodes to a 16-byte IV + an integer
+ * number of 16-byte AES-CBC ciphertext blocks. Arrives exactly once per session, at
+ * the same millisecond the adapter emits [PhaseMessage] with phase=8 (streaming).
+ * If the encrypted payload also appears in an in-tree capture header slot, treat it
+ * as potentially truncated; the authoritative source is always the 0xA3 body record.
  */
 class SessionTokenMessage(
     header: MessageHeader,

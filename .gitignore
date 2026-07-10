@@ -73,3 +73,11 @@ logs/
 secrets.properties
 credentials.json
 google-services.json
+
+# Local tooling artifacts
+entities.json
+mempalace.yaml
+
+# Serena MCP local cache/logs/config
+.serena/
+**/.serena/

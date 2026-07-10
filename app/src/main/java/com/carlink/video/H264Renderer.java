@@ -1,21 +1,6 @@
 package com.carlink.video;
 
-/**
- * Hardware-accelerated H.264 decoder using MediaCodec SYNC mode.
- *
- * Decodes video from CPC200-CCPA adapter and renders to SurfaceView.
- * CarPlay/Android Auto streams are live UI — prioritize immediacy over fidelity.
- *
- * Sync codec approach matches the proven Autokit AvcDecoder pattern:
- * - Bare MediaFormat (no KEY_LOW_LATENCY, KEY_PRIORITY, KEY_MAX_INPUT_SIZE, csd-0/csd-1)
- * - All frames fed with flags=0 (no BUFFER_FLAG_CODEC_CONFIG)
- * - PTS from elapsed time: (uptimeMillis - startDecodeTime) * 1000 microseconds
- * - Separate render thread started on first decoded frame
- * - No frame dropping — render all decoded frames immediately
- */
 import android.media.MediaCodec;
-import android.media.MediaCodecInfo;
-import android.media.MediaCodecList;
 import android.media.MediaFormat;
 import android.os.Process;
 import android.os.SystemClock;
@@ -23,8 +8,6 @@ import android.view.Surface;
 
 import java.io.IOException;
 import java.nio.ByteBuffer;
-import java.util.ArrayList;
-import java.util.List;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
@@ -36,6 +19,19 @@ import com.carlink.util.AppExecutors;
 import com.carlink.util.LogCallback;
 
 
+/**
+ * Hardware-accelerated H.264 decoder using MediaCodec SYNC mode.
+ *
+ * Decodes video from the CPC200-CCPA adapter and renders to a {@link Surface}.
+ * CarPlay/Android Auto streams are live UI — prioritize immediacy over fidelity.
+ *
+ * Sync codec approach matches the proven Autokit AvcDecoder pattern:
+ * - Bare MediaFormat (no KEY_LOW_LATENCY, KEY_PRIORITY, KEY_MAX_INPUT_SIZE, csd-0/csd-1)
+ * - All frames fed with flags=0 (no BUFFER_FLAG_CODEC_CONFIG)
+ * - PTS from elapsed time: (uptimeMillis - startDecodeTime) * 1000 microseconds
+ * - Separate render thread started on first queued frame
+ * - No frame dropping — render all decoded frames immediately
+ */
 public class H264Renderer {
 
     /** Callback to request keyframe (IDR) from adapter after codec reset. */
@@ -53,7 +49,6 @@ public class H264Renderer {
     private static final class StagedFrame {
         final byte[] data;
         int length;
-        long timestamp;
         StagedFrame(int capacity) {
             this.data = new byte[capacity];
         }
@@ -64,6 +59,7 @@ public class H264Renderer {
     private int height;
     private Surface surface;
     private volatile boolean running = false;
+    private volatile boolean stopped = false;     // Shutdown flag — prevents timer resurrection; cleared on resume()
     private volatile java.util.Timer retryTimer;  // Stored for cancellation in stop()
     private final LogCallback logCallback;
     private KeyframeRequestCallback keyframeCallback;
@@ -78,7 +74,6 @@ public class H264Renderer {
 
     // Android Auto mode — enables AA-specific decoder behaviors:
     //   - Skip first N rendered frames (boot-screen IDR avoidance)
-    //   - Frame cache for replay recovery (60s IDR gap mitigation)
     //   - VIDEO_SCALING_MODE_SCALE_TO_FIT_WITH_CROPPING
     private volatile boolean androidAutoMode = false;
 
@@ -87,18 +82,6 @@ public class H264Renderer {
     // from ever displaying. AutoKit uses 4; we use the same threshold.
     private static final int AA_RENDER_SKIP_COUNT = 4;
     private final AtomicLong aaRenderedFrameCount = new AtomicLong(0);
-
-    // AA frame cache: stores frames since last IDR for replay on decoder recreation.
-    // With AA's 60s natural IDR interval, losing the decoder means 60s of corruption
-    // without cached frames to replay. AutoKit uses Vector capacity 320; we use a
-    // bounded array for GC-free operation.
-    private static final int FRAME_CACHE_MAX_FRAMES = 120;  // ~4s at 30fps
-    private static final int FRAME_CACHE_ENTRY_SIZE = 128 * 1024;  // 128KB per cached frame
-    private byte[][] frameCacheData;
-    private int[] frameCacheLengths;
-    private int frameCacheCount;
-    private byte[] frameCacheSps;  // SPS+PPS cache for replay (separate from codec CSD cache)
-    private int frameCacheSpsLength;
 
     private final AppExecutors executors;
     private final String preferredDecoderName;
@@ -109,8 +92,9 @@ public class H264Renderer {
     private static final long PERF_LOG_INTERVAL_MS = 30000;
     private long lastPerfLogTime = 0;
 
-    // Pipeline diagnostic counters (debug builds only)
-    // These help identify WHERE the pipeline breaks when video freezes
+    // Pipeline diagnostic counters — always updated; only the periodic logStats()
+    // emission is gated (via the VIDEO_PERF tag in logPerf). They identify
+    // WHERE the pipeline breaks when video freezes.
     private final AtomicLong framesReceived = new AtomicLong(0);
     private final AtomicLong feedSuccesses = new AtomicLong(0);
     private volatile long lastFeedTime = 0;
@@ -169,9 +153,11 @@ public class H264Renderer {
     private final Object codecLock = new Object();
 
     // FIFO staging queue (SPSC ring): USB thread writes, feeder thread reads.
-    // 4-slot power-of-2 ring (3 usable) absorbs USB frame bursts without overwrites.
+    // 4-slot power-of-2 ring (3 usable) absorbs short USB frame bursts. On sustained
+    // overflow, the incoming frame is dropped (queued frames preserved) and a
+    // reactive keyframe request is fired so we don't render corrupted P-frames.
     // 6 buffers: 1 write + up to 3 in queue + 1 feeder + 1 pool margin.
-    private static final int STAGED_FRAME_CAPACITY = 512 * 1024;  // 512KB, covers 1080p I-frames
+    private static final int STAGED_FRAME_CAPACITY = 2 * 1024 * 1024;  // 2MB — covers AA 1080p (~1.5MB) and CarPlay up to 2400x960 (~1.7MB) worst-case H.264 frames. NOT enough for CarPlay 4K (~6MB); see resolution-derived sizing if higher tiers are used.
     private static final int STAGED_FRAME_COUNT = 6;               // write + queue(3) + feed + margin
     private static final int STAGING_QUEUE_SLOTS = 4;              // power-of-2, 3 usable slots
 
@@ -185,7 +171,9 @@ public class H264Renderer {
     private final AtomicLong stagingDropCount = new AtomicLong(0);
     private final AtomicLong oversizedDropCount = new AtomicLong(0);
 
-    // Fix A: Reactive keyframe request after staging drops
+    // Reactive keyframe request after a staging drop: signal the feeder thread to
+    // ask the source for an IDR so we don't render corrupted P-frames until the
+    // next natural keyframe. Cooldown bounds how often we re-request.
     private volatile boolean stagingOverwriteDetected = false;
     private volatile long lastReactiveKeyframeTimeNs = 0;
     private static final long REACTIVE_KEYFRAME_COOLDOWN_NS = 500_000_000L;  // 500ms
@@ -214,114 +202,16 @@ public class H264Renderer {
 
     /**
      * Enable Android Auto decoder mode.
-     * Must be called before start() or during codec lifecycle for immediate effect.
-     * Enables: first-frame skip, frame cache replay, crop scaling mode.
+     *
+     * Effects:
+     * - first-frame render skip: takes effect immediately on the running codec.
+     * - {@code VIDEO_SCALING_MODE_SCALE_TO_FIT_WITH_CROPPING}: only applied inside
+     *   {@link #initCodec}, so toggling AA mode on a live codec will NOT change the
+     *   scaling mode until the next start/reset.
      */
     public void setAndroidAutoMode(boolean enabled) {
         this.androidAutoMode = enabled;
-        if (enabled) {
-            initFrameCache();
-        }
         log("[VIDEO] Android Auto mode: " + enabled);
-    }
-
-    /** Allocate frame cache arrays (lazy, only for AA). */
-    private void initFrameCache() {
-        if (frameCacheData != null) return;
-        frameCacheData = new byte[FRAME_CACHE_MAX_FRAMES][];
-        frameCacheLengths = new int[FRAME_CACHE_MAX_FRAMES];
-        frameCacheCount = 0;
-        frameCacheSps = null;
-        frameCacheSpsLength = 0;
-    }
-
-    /** Clear frame cache (on IDR or decoder reset). */
-    private void clearFrameCache() {
-        frameCacheCount = 0;
-    }
-
-    /** Add a frame to the cache. On IDR, clears first. */
-    private void cacheFrame(byte[] data, int offset, int length, int nalType) {
-        if (frameCacheData == null) return;
-
-        // On IDR: clear cache and save SPS+PPS for replay prefix
-        if (nalType == NAL_IDR || nalType == NAL_SPS) {
-            clearFrameCache();
-            // If this is SPS bundle, extract SPS+PPS portion for replay
-            if (nalType == NAL_SPS) {
-                int idrOff = findNalOffset(data, offset + 4, length - 4, NAL_IDR);
-                if (idrOff > 0) {
-                    int spsLen = idrOff - offset;
-                    if (frameCacheSps == null || frameCacheSps.length < spsLen) {
-                        frameCacheSps = new byte[spsLen];
-                    }
-                    System.arraycopy(data, offset, frameCacheSps, 0, spsLen);
-                    frameCacheSpsLength = spsLen;
-                }
-            }
-        }
-
-        if (frameCacheCount >= FRAME_CACHE_MAX_FRAMES) return;  // Cache full, stop adding
-
-        int idx = frameCacheCount;
-        if (frameCacheData[idx] == null || frameCacheData[idx].length < length) {
-            frameCacheData[idx] = new byte[Math.max(length, FRAME_CACHE_ENTRY_SIZE)];
-        }
-        System.arraycopy(data, offset, frameCacheData[idx], 0, length);
-        frameCacheLengths[idx] = length;
-        frameCacheCount++;
-    }
-
-    /**
-     * Replay cached frames through the codec after decoder recreation.
-     * Feeds SPS+PPS first (as normal data, flags=0), then all cached frames since last IDR.
-     * Uses sync dequeueInputBuffer for direct feeding.
-     */
-    private void replayFrameCache() {
-        if (frameCacheData == null || frameCacheCount == 0) return;
-        if (mCodec == null || !running) return;
-
-        log("[VIDEO] Replaying " + frameCacheCount + " cached frames for AA recovery");
-
-        // Feed cached SPS+PPS first if available (as normal data, flags=0)
-        if (frameCacheSps != null && frameCacheSpsLength > 0) {
-            try {
-                int spsIdx = mCodec.dequeueInputBuffer(DEQUEUE_INPUT_TIMEOUT_US);
-                if (spsIdx >= 0) {
-                    ByteBuffer buf = mCodec.getInputBuffers()[spsIdx];
-                    buf.clear();
-                    buf.put(frameCacheSps, 0, frameCacheSpsLength);
-                    long pts = (SystemClock.uptimeMillis() - startDecodeTime) * 1000;
-                    mCodec.queueInputBuffer(spsIdx, 0, frameCacheSpsLength, pts, 0);
-                    frameCnt.incrementAndGet();
-                } else {
-                    log("[VIDEO] Frame cache replay: no input buffer for SPS");
-                }
-            } catch (Exception e) {
-                log("[VIDEO] Frame cache SPS replay error: " + e.getMessage());
-            }
-        }
-
-        // Feed each cached frame
-        for (int i = 0; i < frameCacheCount; i++) {
-            try {
-                int idx = mCodec.dequeueInputBuffer(DEQUEUE_INPUT_TIMEOUT_US);
-                if (idx < 0) {
-                    log("[VIDEO] Frame cache replay: no input buffer at frame " + i + "/" + frameCacheCount);
-                    break;
-                }
-                ByteBuffer buf = mCodec.getInputBuffers()[idx];
-                buf.clear();
-                buf.put(frameCacheData[i], 0, frameCacheLengths[i]);
-                long pts = (SystemClock.uptimeMillis() - startDecodeTime) * 1000;
-                mCodec.queueInputBuffer(idx, 0, frameCacheLengths[i], pts, 0);
-                frameCnt.incrementAndGet();
-                feedSuccesses.incrementAndGet();
-            } catch (Exception e) {
-                log("[VIDEO] Frame cache replay error at " + i + ": " + e.getMessage());
-                break;
-            }
-        }
     }
 
     private void log(String message) {
@@ -333,6 +223,7 @@ public class H264Renderer {
     }
 
     public void start() {
+        if (stopped) return;
         if (running) return;
 
         running = true;
@@ -345,7 +236,6 @@ public class H264Renderer {
         firstFrameLogged = false;
         syncAcquired = false;
         aaRenderedFrameCount.set(0);
-        if (androidAutoMode) clearFrameCache();
 
         log("start - " + width + "x" + height);
 
@@ -367,18 +257,27 @@ public class H264Renderer {
 
             running = false;
 
-            log("restarting in 5s");
-            retryTimer = new java.util.Timer();
-            retryTimer.schedule(new java.util.TimerTask() {
-                @Override
-                public void run() {
-                    start();
-                }
-            }, 5000);
+            if (!stopped) {
+                log("restarting in 5s");
+                retryTimer = new java.util.Timer();
+                retryTimer.schedule(new java.util.TimerTask() {
+                    @Override
+                    public void run() {
+                        start();
+                    }
+                }, 5000);
+            }
         }
     }
 
     public void stop() {
+        stopped = true;
+        stopInternal();
+    }
+
+    /** Internal stop — tears down codec without setting the permanent stopped flag.
+     *  Used by reset() and resume() for mid-session restarts. */
+    private void stopInternal() {
         // Cancel any pending start() retry to prevent resurrection after stop().
         if (retryTimer != null) {
             retryTimer.cancel();
@@ -422,14 +321,9 @@ public class H264Renderer {
             lastLifecycleEventTime = System.currentTimeMillis();
 
             Surface savedSurface = this.surface;
-            stop();
+            stopInternal();
             this.surface = savedSurface;
             start();
-
-            // AA: replay cached frames through fresh decoder for faster recovery
-            if (androidAutoMode) {
-                replayFrameCache();
-            }
         }
 
         if (keyframeCallback != null) {
@@ -465,14 +359,10 @@ public class H264Renderer {
             }
 
             // Full restart needed (codec not running or setOutputSurface failed)
-            stop();
+            stopInternal();
             this.surface = newSurface;
+            stopped = false;  // Clear shutdown flag — resume is an intentional restart
             start();
-
-            // AA: replay cached frames through fresh decoder for faster recovery
-            if (androidAutoMode) {
-                replayFrameCache();
-            }
         }
 
         if (keyframeCallback != null) {
@@ -758,7 +648,8 @@ public class H264Renderer {
                     decodeFrame(frame);
                     framePool.offer(frame);
 
-                    // Fix A: After feeding, check if a staging drop occurred -> request reactive keyframe
+                    // After feeding, if a staging drop occurred, ask the source for an
+                    // IDR (cooldown-bounded) so subsequent P-frames decode cleanly.
                     if (stagingOverwriteDetected) {
                         stagingOverwriteDetected = false;
                         long now = System.nanoTime();
@@ -778,7 +669,11 @@ public class H264Renderer {
                         }
                     }
                 } else {
-                    LockSupport.parkNanos(1_000_000L);  // 1ms — 0.5ms avg added latency
+                    // Block until the USB producer enqueues a frame (feedDirect → unpark)
+                    // or stopStaging() unparks for shutdown. park() consumes a permit, so an
+                    // unpark racing just before this returns immediately and we re-poll — no
+                    // lost frame. Spurious wakeups simply re-loop and re-poll.
+                    LockSupport.park();
                 }
             }
         } catch (Exception e) {
@@ -834,8 +729,9 @@ public class H264Renderer {
             while (!inputted && running) {
                 int inputBufferIndex = codec.dequeueInputBuffer(DEQUEUE_INPUT_TIMEOUT_US);
                 if (inputBufferIndex >= 0) {
-                    // Use getInputBuffers()[index] (old API) for maximum compatibility (matching Autokit)
-                    ByteBuffer inputBuffer = codec.getInputBuffers()[inputBufferIndex];
+                    // getInputBuffer(index): allocation-free, API 21+ (minSdk 29). Replaces the
+                    // deprecated getInputBuffers()[index] array accessor.
+                    ByteBuffer inputBuffer = codec.getInputBuffer(inputBufferIndex);
                     inputBuffer.clear();
                     inputBuffer.put(frame.data, 0, frame.length);
                     // ALL frames fed with flags=0 — no BUFFER_FLAG_CODEC_CONFIG ever
@@ -859,10 +755,6 @@ public class H264Renderer {
                                 (nalType == NAL_SPS ? " [SPS+PPS+IDR bundle]" : ""));
                     }
 
-                    // AA frame cache: store frames since last IDR for replay on decoder recreation
-                    if (androidAutoMode) {
-                        cacheFrame(frame.data, 0, frame.length, nalType);
-                    }
                 } else {
                     logPerf("dequeueInputBuffer timeout: " + inputBufferIndex);
                 }
@@ -917,9 +809,10 @@ public class H264Renderer {
 
                 do {
                     if (outputBufferIndex == MediaCodec.INFO_TRY_AGAIN_LATER) {
-                        // No output available yet — will block again at top of while loop
+                        // No output yet — fall through to exit do-while; the outer
+                        // loop will re-block on dequeueOutputBuffer with the 100ms timeout.
                     } else if (outputBufferIndex == MediaCodec.INFO_OUTPUT_BUFFERS_CHANGED) {
-                        // Deprecated but harmless
+                        // Deprecated since API 21 but still emitted on some devices; ignore.
                     } else if (outputBufferIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
                         try {
                             MediaFormat format = codec.getOutputFormat();
@@ -970,8 +863,9 @@ public class H264Renderer {
                         continue;  // Process the newly dequeued buffer
                     }
 
-                    // For non-data results (TRY_AGAIN_LATER, FORMAT_CHANGED, etc.), exit inner loop
-                    outputBufferIndex = -1;  // Signal to exit do-while
+                    // Non-data result (TRY_AGAIN_LATER, FORMAT_CHANGED, etc.): exit
+                    // the inner drain loop and re-block on the outer dequeue.
+                    outputBufferIndex = -1;
                 } while (outputBufferIndex >= 0);
             }
         } catch (Exception e) {
@@ -1078,10 +972,11 @@ public class H264Renderer {
 
     /**
      * Stage H.264 data for codec feeding. GC-immune USB thread fast path.
-     * Called from USB-ReadLoop thread. [FIFO_STAGING] implementation.
+     * Called from the USB read loop.
      *
-     * USB -> System.arraycopy -> SPSC ring offer. No JNI, no codec calls.
-     * Feeder thread handles all codec interaction on its own timeline.
+     * Hot path: {@code System.arraycopy} into a pre-allocated buffer, then SPSC
+     * ring offer. No JNI, no codec calls. The feeder thread handles all codec
+     * interaction on its own timeline.
      *
      * @return true if frame was staged, false if dropped (oversized, no buffer, or queue full)
      */
@@ -1099,20 +994,37 @@ public class H264Renderer {
         }
 
         StagedFrame wf = writeFrame;
-        if (wf == null) return false;  // Staging not initialized
+        if (wf == null) {
+            // Pool momentarily drained — writeFrame goes null after a successful stagingOffer()
+            // when framePool was empty at that instant; the feeder returns a buffer within ~1ms.
+            // Track this drop SYMMETRICALLY with the queue-full path below so an IDR lost here
+            // isn't silently unrecovered. NAL type is read from the source buffer since there is
+            // no staging buffer to inspect.
+            stagingDropCount.incrementAndGet();
+            stagingOverwriteDetected = true;
+            if (getNalType(data, offset, length) == NAL_IDR) {
+                long sessionTotal = sessionIdrDrops.incrementAndGet();
+                idrDropCount.incrementAndGet();
+                log("Pool drained, IDR dropped (" + length + "B) session=" + sessionTotal);
+            }
+            return false;
+        }
 
         // The only real work: memcpy into pre-allocated buffer
         System.arraycopy(data, offset, wf.data, 0, length);
         wf.length = length;
-        wf.timestamp = 0;  // PTS computed at decode time from elapsed clock
 
         // FIFO enqueue — feeder thread drains in order
         if (stagingOffer(wf)) {
+            // Wake the (possibly parked) feeder. LockSupport.unpark(null) is a documented
+            // no-op, so the brief start/stop window where feederThread is null is harmless.
+            LockSupport.unpark(feederThread);
             // Frame enqueued — get a fresh buffer from pool for next write
             writeFrame = framePool.poll();
             // writeFrame may be null briefly if feeder hasn't returned buffers yet.
-            // Next feedDirect() call will return false (null guard above). This is fine —
-            // the feeder will return buffers to the pool within ~1ms.
+            // The next feedDirect() call hits the null guard above, which now drops the
+            // incoming frame with the same IDR-aware reactive-keyframe handling as the
+            // queue-full path. The feeder returns buffers to the pool within ~1ms.
         } else {
             // Queue full — drop incoming frame (preserves FIFO order of already-queued frames).
             // wf stays as writeFrame for reuse (data will be overwritten next call).

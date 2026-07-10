@@ -14,25 +14,58 @@
     <uses-permission android:name="android.permission.WAKE_LOCK" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="androidx.car.app.NAVIGATION_TEMPLATES" />
+    <!-- Cluster CarAppService draws into the host-provided render surface. Verified on
+         the AAOS emulator: the Templates Host provisions a virtual display
+         "virtual:zeno.carlink,<uid>,CarAppService,0" owned by this app. Required by
+         Play AAOS review for navigation apps (developer.android.com/training/cars/apps/library/draw-maps). -->
+    <uses-permission android:name="androidx.car.app.ACCESS_SURFACE" />
 
-    <!-- USB Host Feature (required) -->
+    <!-- AltVideo (USB 0x2C) IPC permission. Protects NaviVideoSourceService so only
+         co-signed priv-apps (ClusterHomeDisplay) can bind and consume the stream.
+         signature|privileged: caller must share our signing cert AND live in
+         /system/priv-app/. uses-permission is required because the service-protecting
+         permission is declared and used by the same app. -->
+    <permission
+        android:name="com.carlink.permission.NAVI_VIDEO_STREAM"
+        android:protectionLevel="signature|privileged" />
+    <uses-permission android:name="com.carlink.permission.NAVI_VIDEO_STREAM" />
+
+    <!-- USB Host. required=false on purpose: the CPC200 adapter needs USB host at
+         runtime, but GM AAOS (gm/gminfo37) does NOT advertise android.hardware.usb.host
+         in its Play device profile, so required=true filtered the truck out of the AAOS
+         track. required=false stops Play filtering on it; the UsbManager API + the
+         usb_device_filter below are unaffected and still work at runtime. -->
     <uses-feature
         android:name="android.hardware.usb.host"
-        android:required="true" />
+        android:required="false" />
 
     <!-- Optional Features -->
     <uses-feature
         android:name="android.hardware.microphone"
         android:required="false" />
+    <!-- AAOS-only distribution per developer.android.com/training/cars/distribute:
+         media apps on the Android Automotive OS Play track must declare
+         android.hardware.type.automotive as required=true (or unset). Setting it false
+         would let the same APK install on phones/tablets where the AAOS-specific
+         services have no host. -->
     <uses-feature
         android:name="android.hardware.type.automotive"
-        android:required="false" />
+        android:required="true" />
+    <!-- Car App Library Templates Host. The cluster CarAppService is bound and
+         surface-provisioned by com.google.android.apps.automotive.templates.host
+         (live-verified on the AAOS emulator: renderer_service holds an open
+         ConnectionRecord to CarlinkClusterService). Declared required per Play AAOS
+         review; every certified AAOS build — including GM — ships the Templates Host. -->
+    <uses-feature
+        android:name="android.software.car.templates_host"
+        android:required="true" />
     <uses-feature
         android:name="android.hardware.location.gps"
         android:required="false" />
 
     <application
         android:allowBackup="true"
+        android:appCategory="audio"
         android:dataExtractionRules="@xml/data_extraction_rules"
         android:fullBackupContent="@xml/backup_rules"
         android:icon="@mipmap/ic_launcher"
@@ -99,15 +132,32 @@
                 android:value="true" />
         </activity>
 
-        <!-- MediaBrowserService for AAOS Integration -->
+        <!-- Media3 MediaLibraryService for AAOS Integration.
+             Dual intent-filter: the modern `androidx.media3.session.MediaLibraryService`
+             action for Media3-aware controllers, and the legacy
+             `android.media.browse.MediaBrowserService` action for AAOS Media Center and
+             other MediaBrowserCompat clients. Per Media3 migration guide
+             (developer.android.com/media/media3/exoplayer/migration-guide),
+             MediaLibraryService is backwards-compatible with legacy MediaBrowserCompat
+             clients, so declaring both actions covers both controller generations. -->
         <service
             android:name=".media.CarlinkMediaBrowserService"
             android:exported="true"
             android:foregroundServiceType="mediaPlayback|connectedDevice"
             tools:ignore="ExportedService">
             <intent-filter>
+                <action android:name="androidx.media3.session.MediaLibraryService" />
                 <action android:name="android.media.browse.MediaBrowserService" />
             </intent-filter>
+            <!-- AAOS CarLauncher opt-in. Required because carlink is BOTH a launcher
+                 app and an MBS: MediaSource.isMediaTemplate() classifies dual-role
+                 apps as "non media template" unless this explicit opt-in is present.
+                 Without it the homescreen Media card hides carlink, and any source
+                 re-election after a force-close fails to promote zeno.carlink (which
+                 in turn leaves ClusterHome with nothing to mirror). -->
+            <meta-data
+                android:name="androidx.car.app.launchable"
+                android:value="true" />
             <!-- GM Homescreen: Hide from launcher while keeping service functional -->
             <meta-data
                 android:name="com.gm.homescreen.visibility"
@@ -129,9 +179,31 @@
             <meta-data android:name="com.gm.homescreen.visibility" android:value="HIDDEN" />
         </service>
 
+        <!-- AltVideo (USB 0x2C) producer Service. ClusterHomeDisplay binds to
+             ComponentName("zeno.carlink", "zeno.carlink.ipc.NaviVideoSourceService"),
+             so the class FQN must be the applicationId-prefixed form (NOT the
+             namespace-prefixed .ipc.NaviVideoSourceService shorthand). The class
+             lives at app/src/main/kotlin/zeno/carlink/ipc/NaviVideoSourceService.kt
+             to match.
+
+             Service is exported and present in all builds; it is inert on release
+             APKs and on real devices because the gate in CarlinkManager prevents
+             naviScreenInfo from being sent — without that, the adapter never emits
+             0x2C and no consumer binds. Cost of leaving it exported on prod: zero. -->
+        <service
+            android:name="zeno.carlink.ipc.NaviVideoSourceService"
+            android:exported="true"
+            android:permission="com.carlink.permission.NAVI_VIDEO_STREAM" />
+
         <meta-data
             android:name="com.android.automotive"
             android:resource="@xml/automotive_app_desc" />
+
+        <!-- Tintable monochrome icon used by AAOS Media Center / system UI on media
+             cards. Per developer.android.com/training/cars/media/configure-manifest. -->
+        <meta-data
+            android:name="androidx.car.app.TintableAttributionIcon"
+            android:resource="@drawable/ic_carlink_attribution" />
 
         <!-- Required at application level — Templates Host reads minCarApiLevel
              from application metadata, not from service element -->
@@ -145,13 +217,48 @@
             android:value="true" />
 
         <!-- Shim for Templates Host's unregistered ClusterIconContentProvider.
-             Claims the authority using the applicationId to avoid conflicts on upload. -->
+             Authority is per-flavor (manifestPlaceholder, see app/build.gradle.kts):
+               sideload → GM literal authority; Templates Host calls land here.
+               play     → applicationId-suffixed authority; avoids Play Console
+                          "authority in use by other developers" rejection.
+                          NavigationStateManager runtime guard detects the GM
+                          authority is unowned and disables AA bitmap icons. -->
         <provider
             android:name=".provider.ClusterIconShimProvider"
-            android:authorities="cc.funkemunky.carlink.ClusterIconContentProvider"
+            android:authorities="${clusterIconAuthority}"
             android:exported="true"
             android:grantUriPermissions="true"
             tools:ignore="ExportedContentProvider" />
+
+        <!-- FileProvider for publishing album art as content:// URIs to AAOS media
+             controllers (Media Center, cluster, system UI) IN ADDITION to the inline
+             METADATA_KEY_ALBUM_ART Bitmap. URI path is additive only — the inline
+             Bitmap is the primary renderer guarantee so that a missing/failed URI
+             does not blank the Media Card.
+
+             grantUriPermissions="true" enables this provider's URIs to be granted via
+             Context.grantUriPermission(). Note (observation as of 2026-05-03 against
+             Media3 1.10.0 source — re-verify on upgrade): a grep of all
+             androidx.media3.session.* sources read on that date did not surface any
+             grantUriPermission or FLAG_GRANT_READ_URI calls, suggesting Media3 does
+             not auto-grant these URIs to bound MediaControllers in 1.10.0. The session
+             appears to resolve artworkUri server-side via BitmapLoader.loadBitmapFromMetadata
+             and ship a decoded Bitmap, so most controllers do not need URI access at
+             all in this configuration. The few consumers that read URIs directly (GM
+             RHMI cluster via its own ContentProvider chain, etc.) get permission from
+             MediaSessionManager's grantUriToConsumers() — which is the mechanism
+             observed to be doing the work for those consumers on the firmware tested. -->
+
+
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.albumart"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/file_paths_albumart" />
+        </provider>
 
     </application>
 

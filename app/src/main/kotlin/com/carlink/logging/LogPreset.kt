@@ -2,7 +2,23 @@ package com.carlink.logging
 
 import androidx.compose.ui.graphics.Color
 
-/** Logging presets that configure which tags and levels are enabled. */
+/**
+ * User-facing policy bundles that reconfigure [Logger] tag/level filtering.
+ *
+ * Each entry is presented in the LogsTab settings UI as a color-tagged chip
+ * (displayName + description). User-chosen preset is persisted via
+ * [LoggingPreferences] and re-applied at cold start.
+ *
+ * ORDERING IS LOAD-BEARING: entries are persisted by `ordinal` in
+ * [LoggingPreferences.KEY_LOG_LEVEL]. Reordering, inserting non-terminal entries,
+ * or removing any entry will silently reinterpret every user's saved preference.
+ * Append new entries at the end only. A future-proof fix is to migrate persistence
+ * to stringPreferencesKey + LogPreset.name.
+ *
+ * PROTO_UNKNOWN note: [Logger.Tags.PROTO_UNKNOWN] bypasses all filtering in
+ * [Logger.log], so SILENT and tag-clearing presets do NOT silence protocol-anomaly
+ * messages — that is intentional, for post-mortem forensics.
+ */
 enum class LogPreset(
     val displayName: String,
     val description: String,
@@ -61,13 +77,27 @@ enum class LogPreset(
     ;
 
     companion object {
-        val DEFAULT = NORMAL
-
+        // Out-of-range fallback = SILENT (same as the LoggingPreferences cold-start
+        // default). Cannot detect enum reordering — see class KDoc ordering hazard.
         fun fromIndex(index: Int): LogPreset = entries.getOrElse(index) { SILENT }
     }
 }
 
-/** Apply this preset to the Logger system. */
+/**
+ * Apply this preset to the Logger system.
+ *
+ * Required call order inside each branch (do not reorder — step 3 depends on step 2):
+ *  1. setLogLevel for all four [Logger.LogLevel] values (contiguous range; see
+ *     [Logger.recalculateMinLevel] fast-path assumption).
+ *  2. Reset the tag baseline via [Logger.enableAllTags] or [Logger.disableAllTags].
+ *  3. Selectively flip specific tags via [Logger.setTagsEnabled].
+ *  4. Set [Logger.setDebugLoggingEnabled]:
+ *     - BuildConfig.DEBUG: for general-use presets (SILENT, MINIMAL, NORMAL) — respect
+ *       the build variant; release builds get zero-cost inline debug helpers.
+ *     - true: for user-requested diagnostic presets (DEBUG, PERFORMANCE, RX_MESSAGES,
+ *       VIDEO_ONLY, AUDIO_ONLY, PIPELINE_DEBUG, CLUSTER_MEDIA) — the user explicitly
+ *       asked for diagnostics, so force inline helpers on in release builds too.
+ */
 fun LogPreset.apply() {
     when (this) {
         LogPreset.SILENT -> {
@@ -138,6 +168,7 @@ fun LogPreset.apply() {
             Logger.setLogLevel(Logger.LogLevel.ERROR, true)
             Logger.disableAllTags()
             Logger.setTagsEnabled(listOf(Logger.Tags.USB_RAW, Logger.Tags.USB, Logger.Tags.ADAPTR), true)
+            Logger.setDebugLoggingEnabled(true)
         }
 
         LogPreset.VIDEO_ONLY -> {
@@ -170,6 +201,7 @@ fun LogPreset.apply() {
             Logger.setTagsEnabled(
                 listOf(
                     Logger.Tags.AUDIO,
+                    Logger.Tags.AUDIO_DEBUG,
                     Logger.Tags.MIC,
                     Logger.Tags.AUDIO_PERF,
                     Logger.Tags.ADAPTR,

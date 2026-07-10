@@ -18,11 +18,13 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.displayCutout
+import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.requiredHeight
+import androidx.compose.foundation.layout.requiredWidth
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.systemBars
 import androidx.compose.foundation.layout.width
@@ -38,6 +40,7 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
@@ -73,20 +76,21 @@ fun MainScreen(
     carlinkManager: CarlinkManager,
     displayMode: DisplayMode,
     onNavigateToSettings: () -> Unit,
+    onResetConnection: (() -> Unit)? = null,
 ) {
     val scope = rememberCoroutineScope()
     // Key state on carlinkManager identity — when manager is replaced (display mode reinit),
     // all session-scoped state resets automatically. This prevents stale callbacks, flags,
     // or touch state from the old manager leaking into the new session.
-    var state by remember(carlinkManager) { mutableStateOf(CarlinkManager.State.DISCONNECTED) }
+    var connectionState by remember(carlinkManager) { mutableStateOf(CarlinkManager.State.DISCONNECTED) }
     var statusText by remember(carlinkManager) { mutableStateOf("Connect Adapter") }
     var isResetting by remember(carlinkManager) { mutableStateOf(false) }
     val surfaceState = rememberVideoSurfaceState()
     var isAndroidAuto by remember(carlinkManager) { mutableStateOf(false) }
     var aaCropParams by remember(carlinkManager) { mutableStateOf<CarlinkManager.AaCropParams?>(null) }
 
-    LaunchedEffect(state) {
-        logInfo("[UI_STATE] MainScreen connection state: $state", tag = "UI")
+    LaunchedEffect(connectionState) {
+        logInfo("[UI_STATE] MainScreen connection state: $connectionState", tag = "UI")
     }
 
     var lastTouchTime by remember(carlinkManager) { mutableLongStateOf(0L) }
@@ -95,10 +99,18 @@ fun MainScreen(
 
     // Container dimensions (display-mode-padded area) — used for BoxSettings AR calculation.
     // Tracked separately from surfaceState because AA oversizes the SurfaceView beyond the container.
+    // NOTE: activeTouches (L95) may leak stale DOWN entries if the SurfaceView is destroyed
+    // mid-gesture (AA resize) without a matching UP; bounded-minor leak cleared on next manager
+    // reinit (remember(carlinkManager) resets the map).
     var containerSize by remember(carlinkManager) { mutableStateOf(IntSize.Zero) }
 
     // Handle surface initialization for adapter — uses CONTAINER dimensions for config/BoxSettings,
-    // not the SurfaceView dimensions (which may be oversized for AA bar cropping).
+    // not the SurfaceView dimensions (oversized for AA bar cropping — confirmed in AutoKit; not
+    // exercised in 2026-04-20 POTATO gminfo37 captures since all sessions ran CarPlay isAA=false).
+    // Re-invoked on every Surface change (SurfaceView destroy→create, AA oversize resize, rotation);
+    // CarlinkManager.initialize MUST be idempotent. hasStartedConnection (L96) is cleared only on
+    // manager swap, so a new Surface with the same manager (AA resize) will re-initialize but will
+    // NOT re-invoke start() — preserving the session.
     LaunchedEffect(surfaceState.surface, containerSize) {
         surfaceState.surface?.let { surface ->
             if (containerSize.width <= 0 || containerSize.height <= 0) return@let
@@ -119,8 +131,8 @@ fun MainScreen(
                 surfaceHeight = adapterHeight,
                 callback =
                     object : CarlinkManager.Callback {
-                        override fun onStateChanged(newState: CarlinkManager.State) {
-                            state = newState
+                        override fun onStateChanged(state: CarlinkManager.State) {
+                            connectionState = state
                         }
 
                         override fun onStatusTextChanged(text: String) {
@@ -132,6 +144,10 @@ fun MainScreen(
                         }
 
                         override fun onPhoneTypeChanged(phoneType: PhoneType) {
+                            // Known limitation: aaCropParams is only refreshed on phoneType transition.
+                            // If CarlinkManager later recomputes crop params (e.g. mid-session display
+                            // resize), this UI won't see the update until the next phoneType toggle or
+                            // manager reinit.
                             val isAA = phoneType == PhoneType.ANDROID_AUTO
                             if (isAA != isAndroidAuto) {
                                 isAndroidAuto = isAA
@@ -151,7 +167,7 @@ fun MainScreen(
         }
     }
 
-    val isLoading = state != CarlinkManager.State.STREAMING
+    val isLoading = connectionState != CarlinkManager.State.STREAMING
     val colorScheme = MaterialTheme.colorScheme
 
     val baseModifier = Modifier.fillMaxSize().background(Color.Black)
@@ -173,8 +189,10 @@ fun MainScreen(
                 baseModifier
                     .windowInsetsPadding(WindowInsets.systemBars)
             }
-            // No displayCutout padding — video extends behind cutout,
-            // SafeArea tells CarPlay where to avoid placing UI elements
+            // No displayCutout padding — video extends behind cutout.
+            // (SafeArea, which tells CarPlay where to avoid placing UI, is NOT sent from this file —
+            // it is emitted by CarlinkManager/MessageSerializer. This comment documents the visual
+            // intent of the hidden-bars branch above, not an action performed here.)
         }
 
     Box(modifier = boxModifier) {
@@ -184,6 +202,8 @@ fun MainScreen(
         // Black bars in the codec frame fall outside the clip → cropped visually.
         // Codec start is deferred until phone type is known, so surface resize
         // (destroyed→created at oversized dims) happens before decoder is active.
+        // (Cross-file: the deferral is enforced in CarlinkManager.kt — see initialize()
+        // and the phone-type gate around the codec start path, approx. :247 / :1153 / :1477.)
         BoxWithConstraints(
             modifier = Modifier.fillMaxSize().clipToBounds(),
         ) {
@@ -198,20 +218,40 @@ fun MainScreen(
                 }
             }
 
-            // AA: oversize SurfaceView to tier AR so black bars overflow the clip region.
-            // CarPlay: SurfaceView fills container (frame matches surface, no crop needed).
+            // AA: oversize SurfaceView to tier AR so the phone's baked black bars overflow the
+            // clip region. Two-way fit puts bars on exactly ONE axis: cropTop>0 → bars top/bottom
+            // (oversize height); cropLeft>0 → bars left/right (oversize width). CarPlay fills.
             val surfaceModifier =
                 if (aaCropParams != null) {
-                    val tierAR = aaCropParams!!.tierWidth.toFloat() / aaCropParams!!.tierHeight.toFloat()
-                    val oversizedHeightDp = with(density) { (maxWidth.toPx() / tierAR).toInt().toDp() }
-                    Modifier
-                        .fillMaxWidth()
-                        .requiredHeight(oversizedHeightDp)
-                        .align(Alignment.Center)
+                    val cp = aaCropParams!!
+                    val tierAR = cp.tierWidth.toFloat() / cp.tierHeight.toFloat()
+                    if (cp.cropLeft > 0) {
+                        val oversizedWidthDp = with(density) { (maxHeight.toPx() * tierAR).toInt().toDp() }
+                        Modifier
+                            .fillMaxHeight()
+                            .requiredWidth(oversizedWidthDp)
+                            .align(Alignment.Center)
+                    } else {
+                        val oversizedHeightDp = with(density) { (maxWidth.toPx() / tierAR).toInt().toDp() }
+                        Modifier
+                            .fillMaxWidth()
+                            .requiredHeight(oversizedHeightDp)
+                            .align(Alignment.Center)
+                    }
                 } else {
                     Modifier.fillMaxSize()
                 }
 
+            // Key the VideoSurface on (manager identity, displayMode) so any reinit
+            // path (display-mode change, resolution change, Reset Connection via the
+            // manager-rebuild path) drops the AndroidView composition slot, disposing
+            // the old VideoSurfaceView and releasing its HWC overlay plane. A fresh
+            // SurfaceView is then inflated against the current window rect — the only
+            // reliable way to migrate the HWC plane when system insets change post-boot.
+            // Parent-size deltas alone are NOT included here: they would rebuild the
+            // SurfaceView on every transient resize (e.g. bar animation frames) and
+            // cause video flicker. Only identity-level changes force recreation.
+            key(carlinkManager, displayMode) {
             VideoSurface(
                 modifier = surfaceModifier,
                 onSurfaceAvailable = { surface, width, height ->
@@ -232,7 +272,7 @@ fun MainScreen(
                     // the pre-computed val `isUserInteractingWithProjection`.
                     // This lambda is captured once in AndroidView's factory block;
                     // a pre-computed val would snapshot DISCONNECTED permanently.
-                    if (state == CarlinkManager.State.STREAMING) {
+                    if (connectionState == CarlinkManager.State.STREAMING) {
                         if (BuildConfig.DEBUG) {
                             val now = System.currentTimeMillis()
                             if (now - lastTouchTime > 1000) {
@@ -252,12 +292,14 @@ fun MainScreen(
                             carlinkManager,
                             surfaceState.width,
                             surfaceState.height,
+                            containerSize.width,
                             containerSize.height,
                         )
                     }
                     true
                 },
             )
+            } // end key(carlinkManager, displayMode)
         }
 
         // Loading overlay
@@ -331,11 +373,25 @@ fun MainScreen(
                     onClick = {
                         if (!isResetting) {
                             isResetting = true
-                            scope.launch {
-                                try {
-                                    carlinkManager.restart()
-                                } finally {
-                                    isResetting = false
+                            // Prefer the Activity-level manager-rebuild path when wired
+                            // (it recreates the SurfaceView against fresh WindowMetrics and
+                            // renegotiates Open() with current dims — deterministic repair).
+                            // Fall back to in-manager restart() for callers that don't plumb
+                            // the callback (e.g. tests/previews).
+                            val reset = onResetConnection
+                            if (reset != null) {
+                                reset()
+                                // Activity releases the old manager; Compose key(carlinkManager, ...)
+                                // will drop this subtree shortly. Clear the spinner promptly so
+                                // the UI doesn't flash a stale "resetting" state during teardown.
+                                isResetting = false
+                            } else {
+                                scope.launch {
+                                    try {
+                                        carlinkManager.restart()
+                                    } finally {
+                                        isResetting = false
+                                    }
                                 }
                             }
                         }
@@ -386,6 +442,7 @@ fun MainScreen(
     }
 }
 
+/** In-memory per-pointer touch record (normalized 0..1 coords + last action) for deduping MOVE spam. */
 private data class TouchPoint(
     val x: Float,
     val y: Float,
@@ -409,9 +466,10 @@ private fun handleTouchEvent(
     carlinkManager: CarlinkManager,
     surfaceWidth: Int,
     surfaceHeight: Int,
+    containerWidth: Int,
     containerHeight: Int,
 ) {
-    if (surfaceWidth == 0 || surfaceHeight == 0 || containerHeight == 0) return
+    if (surfaceWidth == 0 || surfaceHeight == 0 || containerWidth == 0 || containerHeight == 0) return
 
     val pointerIndex = event.actionIndex
     val pointerId = event.getPointerId(pointerIndex)
@@ -424,15 +482,22 @@ private fun handleTouchEvent(
             else -> return
         }
 
-    // Crop offset: how many SurfaceView pixels are hidden above the visible area.
-    // For CarPlay (no oversize): surfaceHeight == containerHeight → cropTop = 0.
-    // For AA (oversized to tier AR): e.g. (1350 - 960) / 2 = 195.
+    // Crop offset: how many SurfaceView pixels are hidden outside the visible area.
+    // Two-way fit oversizes exactly ONE axis, so one offset is >0 and the other is 0:
+    //   vertical oversize   → surfaceHeight > containerHeight → cropTopY  > 0, cropLeftX = 0
+    //   horizontal oversize → surfaceWidth  > containerWidth  → cropLeftX > 0, cropTopY  = 0
+    // CarPlay (no oversize): both 0. (POTATO 2026-04-20 shows harmless off-by-1 drift between
+    // container and surface dims, inside MotionEvent rounding.)
     val cropTopY = (surfaceHeight - containerHeight) / 2f
+    val cropLeftX = (surfaceWidth - containerWidth) / 2f
 
-    // Normalize to 0..1 of the oversized surface (matches AutoKit's scaled_height denominator).
-    // X: surface width == container width (no horizontal oversize), simple division.
-    // Y: subtract crop offset, divide by SURFACE height (not container) so AA range maps correctly.
-    val x = event.getX(pointerIndex) / surfaceWidth
+    // Normalize to 0..1 of the OVERSIZED surface (matches AutoKit's scaled_width/scaled_height
+    // denominators): subtract the crop offset on the oversized axis, divide by the surface dim.
+    // Confirmed against AutoKit: its AA touch path uses `(x * 10000) / scaled_width` and
+    // `(y * 10000) / scaled_height`, where scaled_* are the OVERSIZED post-resize view dims (not
+    // the visible content box). The visible area then normalizes to 0..(container/surface) on the
+    // oversized axis; AA side scales 0..1 → 0..10000 at CarlinkManager.kt (sendMultiTouch).
+    val x = (event.getX(pointerIndex) - cropLeftX) / surfaceWidth
     val y = (event.getY(pointerIndex) - cropTopY) / surfaceHeight
 
     when (action) {
@@ -443,9 +508,13 @@ private fun handleTouchEvent(
         MultiTouchAction.MOVE -> {
             for (i in 0 until event.pointerCount) {
                 val id = event.getPointerId(i)
-                val px = event.getX(i) / surfaceWidth
+                val px = (event.getX(i) - cropLeftX) / surfaceWidth
                 val py = (event.getY(i) - cropTopY) / surfaceHeight
                 activeTouches[id]?.let { existing ->
+                    // Deadband: delta is normalized 0..1, multiplied by 1000 then compared against 3.
+                    // Effective threshold ≈ 0.003 of the normalized surface (~0.3%), i.e. ~30 units
+                    // on AA's 0..10000 scale, ~7 px horizontal / ~4 px vertical on a 2400x1350 AA
+                    // surface. Suppresses sub-pixel MOVE spam without losing real drags.
                     val dx = kotlin.math.abs(existing.x - px) * 1000
                     val dy = kotlin.math.abs(existing.y - py) * 1000
                     if (dx > 3 || dy > 3) activeTouches[id] = TouchPoint(px, py, MultiTouchAction.MOVE)
@@ -457,6 +526,9 @@ private fun handleTouchEvent(
             activeTouches[pointerId] = TouchPoint(x, y, action)
         }
 
+        // Dead / defensive: the when at L447-451 only yields DOWN/MOVE/UP (other MotionEvent
+        // actions early-return). This branch exists to satisfy exhaustiveness and guard against
+        // future MultiTouchAction additions. Intentionally a no-op.
         else -> {}
     }
 

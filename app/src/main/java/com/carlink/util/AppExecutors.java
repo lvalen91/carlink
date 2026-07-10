@@ -1,22 +1,5 @@
 package com.carlink.util;
 
-/**
-   * AppExecutors - Centralized Thread Management for Carlink Android Plugin
-   *
-   * PURPOSE:
-   * Manages concurrent execution contexts for H.264 video decoding
-   * during Android Auto/CarPlay projection with the CPC200-CCPA adapter.
-   *
-   * THREAD POOL:
-   * - mediaCodec1: Multi-threaded pool for H.264 decode pipeline
-   *
-   * OPTIMIZATION:
-   * MediaCodec thread pool is tuned for the GM Infotainment (IOK) hardware:
-   * - Intel Atom x7-A3960 quad-core processor
-   * - Dynamic scaling: 2 core threads, up to 4 max threads
-   * - THREAD_PRIORITY_DISPLAY for low-latency video rendering
-   * - 128-task queue sized for 6GB RAM environment
-   */
 import android.os.Process;
 
 import androidx.annotation.NonNull;
@@ -26,9 +9,27 @@ import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
 
+/**
+ * Centralized background executor for H.264 {@code MediaCodec} work during Android
+ * Auto / CarPlay projection with the CPC200-CCPA adapter.
+ *
+ * Currently owns a single pool, {@link #mediaCodec1()}, used by {@code H264Renderer}
+ * for off-main-thread codec resets and reactive keyframe-request callbacks.
+ *
+ * Pool sizing is parametric on {@code Runtime.getRuntime().availableProcessors()}:
+ * core = {@code max(1, cores/2)}, max = {@code cores}. Threads run at
+ * {@code THREAD_PRIORITY_DISPLAY} for low-latency video. Defaults are chosen with
+ * the GM IOK target (Intel Atom x7 / Apollo Lake, quad-core, ~6GB RAM) in mind, but
+ * nothing here probes or pins to that hardware.
+ */
 public class AppExecutors
 {
-    // Optimized thread pool for Intel Atom x7-A3960 quad-core
+    /**
+     * {@link ThreadPoolExecutor} wrapper that applies an Android thread priority once
+     * per worker thread. {@code Process.setThreadPriority} must run on the target
+     * thread, so it's invoked from the task wrapper; a {@link ThreadLocal} flag avoids
+     * repeating the syscall on every subsequent task that lands on the same worker.
+     */
     private static class OptimizedMediaCodecExecutor implements Executor {
         private final ThreadPoolExecutor executor;
         private final int androidPriority;
@@ -37,30 +38,23 @@ public class AppExecutors
         private final ThreadLocal<Boolean> prioritySet = ThreadLocal.withInitial(() -> false);
 
         private OptimizedMediaCodecExecutor(String executorName, int androidPriority) {
-            // Get available CPU cores for Intel Atom x7-A3960 (should be 4)
             int numberOfCores = Runtime.getRuntime().availableProcessors();
 
-            // Create optimized thread pool based on Android best practices
-            // Core pool: half cores, Max pool: all cores to utilize quad-core efficiently
             this.executor = new ThreadPoolExecutor(
-                    Math.max(1, numberOfCores / 2), // corePoolSize - utilize half cores initially
-                    numberOfCores, // maximumPoolSize - can scale to all cores under load
-                    60L, // keepAliveTime - standard Android recommendation
+                    Math.max(1, numberOfCores / 2), // corePoolSize: half the cores (min 1)
+                    numberOfCores,                  // maximumPoolSize: scale up to all cores under load
+                    60L,                            // keepAliveTime
                     TimeUnit.SECONDS,
-                    new LinkedBlockingQueue<>(128), // Larger queue for 6GB RAM system
-                    r -> {
-                        Thread t = new Thread(r, executorName);
-                        return t;
-                    }
+                    new LinkedBlockingQueue<>(128),
+                    r -> new Thread(r, executorName)
             );
-            this.executor.allowCoreThreadTimeOut(true); // Allow core threads to timeout for efficiency
+            this.executor.allowCoreThreadTimeOut(true); // let idle core threads die back
             this.androidPriority = androidPriority;
         }
 
         @Override
         public void execute(@NonNull Runnable command) {
             executor.execute(() -> {
-                // Set thread priority only once per thread (avoids syscall overhead)
                 if (!prioritySet.get()) {
                     Process.setThreadPriority(androidPriority);
                     prioritySet.set(true);
@@ -78,7 +72,6 @@ public class AppExecutors
 
     public AppExecutors()
     {
-        // MediaCodec executor optimized according to Android MediaCodec best practices
         mediaCodec1 = new OptimizedMediaCodecExecutor("MediaCodec-Input", Process.THREAD_PRIORITY_DISPLAY);
     }
 
@@ -87,8 +80,9 @@ public class AppExecutors
     }
 
     /**
-     * Shutdown executor following Android threading guidelines.
-     * Should be called when the plugin is detached to prevent memory leaks.
+     * Shut down the underlying pool. Intended to be called from a teardown path to
+     * release worker threads; currently no caller invokes this, so the pool lives
+     * for the process lifetime.
      */
     public void shutdown() {
         try {

@@ -1,10 +1,16 @@
 // Document each versionCode revision that is tested/compiled. To keep a history of modifications the entries should be brief, but informative.
-// Line formatting, [versionCode] :: <Brief but information Description. Pushed <DDMMYY HH:MM AM/PM
+// Line formatting, [versionCode] :: <Brief headline>
+//   - <sub-change> (optional bullet points for complex entries)
+//   Pushed <DDMMYY HH:MM AM/PM
 //
 // START EXAMPLE
 //
 // [34] :: Troubleshooting 'AudioAttributes.USAGE' support in AAOS for the different Audio streams. Pushed: 26NOV25 11:30PM
 // [35] :: Issue: Audio Distortion. Attempting fix by increasing buffer size. Pushed: 26NOV25 12:53PM
+// [36] :: Phone call and navigation audio rework.
+//   - Separate AudioTrack per stream purpose (media, call, nav, siri)
+//   - Fixed AAOS volume group routing for USAGE_VOICE_COMMUNICATION
+//   Pushed: 27NOV25 2:15PM
 //
 // END EXAMPLE
 //
@@ -44,15 +50,29 @@
 [29] :: Ktlint and Detekt fixes. Refactored File Export
 [30] :: Video Code change TESTING. Seems unstable or long to recover, too aggressive and compounding recovery logic.
 
-[31] :: FIX: Progressive video quality degradation. Root cause: PacketRingByteBuffer.readPacket() used zero-copy ByteBuffer.wrap() sharing memory with ring buffer. Race condition allowed USB writes to overwrite data before MediaCodec consumed it, corrupting H.264 reference frames. Fix: Safe copy via System.arraycopy() before returning ByteBuffer. Periodic keyframes didn't help because they were also corrupted; only reset() worked because it cleared the buffer first.
-[32] :: OPTIMIZATION: Eliminated double-copy in video pipeline. Added readPacketInto(ByteBuffer) method that copies directly from ring buffer to MediaCodec input buffer, eliminating intermediate byte[] allocation. Reduces GC pressure by ~3600 allocations/minute at 60fps and ~2-3% CPU overhead.
-[33] :: DualStreamAudioManager.kt WRITE_NON_BLOCKING for all streams Prevents thread starvation during multi-stream playback. minBufferLevelMs reduced. AudioConfig.kt Buffer multiplier reduced across all platforms. Pre-fill threshold reduced.
+[31] :: FIX: Progressive video quality degradation.
+   - Root cause: PacketRingByteBuffer.readPacket() used zero-copy ByteBuffer.wrap() sharing memory with ring buffer
+   - Race condition allowed USB writes to overwrite data before MediaCodec consumed it, corrupting H.264 reference frames
+   - Fix: Safe copy via System.arraycopy() before returning ByteBuffer
+   - Periodic keyframes didn't help because they were also corrupted; only reset() worked (cleared buffer first)
+
+[32] :: Eliminated double-copy in video pipeline.
+   - Added readPacketInto(ByteBuffer) that copies directly from ring buffer to MediaCodec input buffer
+   - Eliminates intermediate byte[] allocation
+   - Reduces GC pressure by ~3600 allocations/minute at 60fps and ~2-3% CPU overhead
+
+[33] :: Audio buffer tuning.
+   - DualStreamAudioManager WRITE_NON_BLOCKING for all streams, prevents thread starvation during multi-stream playback
+   - minBufferLevelMs reduced
+   - AudioConfig.kt buffer multiplier reduced across all platforms, pre-fill threshold reduced
 [34] :: Testing why oemIcon in CarPlay does not have label.
 [35] :: Navigation Audio changes.
 [36] :: XDA@RWerksman mainscreen.kt fix for GM EV or non rectangular display and edge runoff. Some code cleanup, unused imports.
 [37] :: Fixed App file logging not working. Added Video logging of frames for weird degradation overtime of video stream
 [38] :: Code and comment cleanup
-[39] :: Fixed Cluster Media info (Missing Code) Removed unnecessary permissions. car.template_host forced GPlayServices and Store to be enabled. Some users disable to free up sys resources.
+[39] :: Fixed Cluster Media info (missing code).
+   - Removed unnecessary permissions
+   - car.template_host forced GPlayServices and Store to be enabled, some users disable to free up sys resources
 [40] :: Testing Video Code caching of keyframe used as reference for P-Frames. Shorting IDR request from 5 to 2 seconds.
 
 [41] :: More Video code changes from USB capture of video data.
@@ -64,13 +84,29 @@
 [47] :: Session Record Function Testing and some Settings UI reorganization.
 [48] :: Turned off App Integrity in Play Console.
 [49]:: the reset to adapter defaults resetToDefaults() now clears/forces a full init on next launch. Added log events for control UI button uses. Also testing single boxName string for all labels
-[50] :: Premature Microphone release when Siri is used to start a call. Session managent will not attempt to keep microphone open when SIRI_STOP is received when a PHONECALL_START is also received.
+[50] :: Premature microphone release fix.
+   - Siri-initiated phone call: mic was released on SIRI_STOP even though PHONECALL_START was already active
+   - Session management now keeps mic open when SIRI_STOP received while PHONECALL_START is active
 
-[51] :: Video; Skip Prepending When SPS Already Present, Add Diagnostic Logging for Corruption Analysis, Updated Incorrect Comment about once per session SPS+PPS. Its every frame, Increased Search Limit on IDR Frame check.
-[52] :: Some more Video tweaks. If Intel platform will attempt FULL flush, destroy, recreate of codec. Video issues might be faulty General Motor + Intel Software Design on gminfo3.7 - 3.8 hardware.
+[51] :: Video SPS/PPS handling fixes.
+   - Skip prepending when SPS already present in frame
+   - Added diagnostic logging for corruption analysis
+   - Corrected comment: SPS+PPS is sent every frame, not once per session
+   - Increased search limit on IDR frame check
+
+[52] :: Video codec recovery for Intel platform.
+   - If Intel platform, attempt FULL flush, destroy, recreate of codec
+   - Video issues might be faulty GM + Intel software design on gminfo3.7-3.8 hardware
 [53] :: Hid logs and session capture tabs behind a toggle. Removed Audio Sample Rate Option
-[54] :: GM AAOS (gminfo3.7) optimization testing. Use Video PTS instead of synthetic timing, lower buffer sizes. Airplay.conf changes (dam icon label). Audio Thread priority change
-[55] :: Audio Types based on recvd protocol command grouping for GM AAOS independent volume control via their own track. Video Code changes
+[54] :: GM AAOS (gminfo3.7) optimization testing.
+   - Use video PTS instead of synthetic timing, lower buffer sizes
+   - Airplay.conf changes (OEM icon label)
+   - Audio thread priority change
+
+[55] :: Audio stream type separation for GM AAOS volume control.
+   - Audio types based on received protocol command grouping
+   - Each type gets own track for independent AAOS volume control
+   - Video code changes
 [56] :: MAJOR RESTRUCTURE: Projection Video Model. "Buffer for stability, not completeness." CarPlay/Android Auto is live interactive UI, not cinema playback.
        BUFFER: Reduced from 2-4MB to 192KB jitter buffer. Packet limit 120→12 (~200ms).
        STALENESS: Frames >150ms old discarded at entry. Skip-to-newest-IDR on overflow.
@@ -79,25 +115,14 @@
        DECODER DISCIPLINE: IDR gate (don't decode P-frames until first IDR). Stall timeout (reset+keyframe request if no output for 500ms).
        PacketRingByteBuffer: Added peekNalType(), skipToNewestIdr() methods.
        USB CAPTURE ANALYSIS: Confirmed adapter sends SPS+PPS+IDR at start, periodic IDRs (~1.4s) on request.
-[57] :: CRITICAL FIX: Decoder Poisoning / Staleness Time Base Bug
-       ROOT CAUSE: Staleness check compared System.currentTimeMillis() (epoch ~1.7T ms) to
-       sourcePtsMs (stream-relative ~32K ms) - incompatible time bases producing meaningless results.
-       All frames appeared "stale" and only passed when buffer was empty (race condition).
-       This caused IDR frames to be discarded, preventing decoder recovery.
-
-       FIX 1: DISABLED staleness check entirely - it was harmful, not just incomplete.
-              Recovery now relies on: IDR gating, stall detection, buffer overflow handling.
-       FIX 2: Reduced STALL_TIMEOUT_MS from 500ms to 200ms for faster recovery.
-              "One reset is cheaper than ten corrupted frames."
-       FIX 3: Added corruption detection via IDR tracking.
-              Tracks IDRs decoded vs frames output. If multiple IDRs decoded but low output,
-              decoder is "poisoned" - triggers reset. Implements concepts.txt principle:
-              "If corruption survives one IDR, your decoder state is poisoned. Reset immediately."
-
-       USB CAPTURE ANALYSIS: Verified adapter sends correct data (88 IDRs over 169s, all bundled
-       with SPS+PPS, ~1.4s interval). Problem was app-side, not adapter-side.
-       ADAPTER LOG ANALYSIS: Confirmed PTS is stream-relative (media time), not epoch time.
-       Average frame delay from adapter: 7.85ms (well within spec).
+[57] :: CRITICAL FIX: Decoder poisoning from staleness time base bug.
+   - Root cause: staleness check compared epoch time (~1.7T ms) to stream-relative PTS (~32K ms)
+   - Incompatible time bases made all frames appear "stale", IDR frames discarded, preventing decoder recovery
+   - Fix 1: Disabled staleness check entirely (harmful, not just incomplete)
+   - Fix 2: Reduced STALL_TIMEOUT_MS 500ms to 200ms for faster recovery
+   - Fix 3: Added corruption detection via IDR tracking (IDRs decoded vs frames output, triggers reset if poisoned)
+   - USB capture verified adapter sends correct data (88 IDRs/169s, all bundled with SPS+PPS)
+   - Confirmed PTS is stream-relative, not epoch. Average adapter frame delay: 7.85ms
 [58] :: H264Renderer.java stall detection fix:
        - Was: lastOutputTimeMs = 0 after reset (disabled stall detection)
        - Now: lastOutputTimeMs = System.currentTimeMillis() (enables stall detection after reset)
@@ -109,18 +134,10 @@
        - IDR gate drop count
        - Audio underrun count (public method for audio manager)
 
-[59] :: H264Renderer.java telemetry fixes:
-       BUG 1: Queue depth tracking was in deprecated processDataDirect() method.
-              Production uses processDataDirectWithPts() which had no tracking.
-       FIX 1: Added queue depth tracking to processDataDirectWithPts().
-
-       BUG 2: IDR interval tracking was inside queueIdrWithSpsPps() success block.
-              But adapter sends SPS+PPS with every IDR, so queueIdrWithSpsPps() returns
-              false (line 2109: "Packet already has SPS - queue as-is without prepending").
-              Result: IDR interval telemetry never recorded for live adapter streaming.
-       FIX 2: Moved IDR tracking outside queueIdrWithSpsPps() success block.
-              Now tracks ALL IDR frames regardless of whether SPS/PPS injection happens.
-              Applied to both tryQueueToCodec() and feedCodecFromBuffer() code paths.
+[59] :: H264Renderer.java telemetry fixes.
+   - Queue depth tracking was in deprecated processDataDirect(), moved to processDataDirectWithPts()
+   - IDR interval tracking was inside queueIdrWithSpsPps() success block, but adapter sends SPS+PPS with every IDR so that block never executed
+   - Moved IDR tracking to fire on all IDR frames regardless of SPS/PPS injection path
 [60] :: Select different resolution
 
 [61] :: Video Code refactoring. Basically revert back to abuharsky app simplicity. Code cleanup elsewhere. Documentation updates
@@ -128,7 +145,12 @@
 [63] :: More Video Log to logcat. Trying to narrow down root cause of video issues observed on gminfo3.7
 [64] :: H264Renderer.java MAX_BUFFER_PACKETS from 10 to 2
 [65] :: Dependency Updates
-[66] :: Video Direct Handoff to MediaCodec, no buffering. Codec is fed inline on the USB thread. NAL Type 30s logcat logging. Back to two audio output streams (Nav + Everything else) for simplification. Audio zero-copy, buffer tuning. Microphone cleanup. Just a bunch of cleaning up. Added media delay option to adapter config
+[66] :: Video direct handoff and audio simplification.
+   - Video: Direct handoff to MediaCodec, no buffering. Codec fed inline on USB thread
+   - NAL type 30s logcat logging
+   - Audio: Back to two output streams (Nav + Everything else) for simplification
+   - Audio zero-copy, buffer tuning, microphone cleanup
+   - Added media delay option to adapter config
 [67] :: Decoupling (Single-Slot Handoff) Video-Audio to allow interrupted Video and Audio if GC Pressure occurs.
 [68] :: Some Code cleanup
 [69] :: Nice. More cleanup. Testing cmd inject for oemIconLabel
@@ -136,37 +158,551 @@
 
 [71] :: Testing GM Cluster Nav Metadata integration. AOSP/Vanilla AOSP works fine, but not GM AAOS.
 [72] :: Stale Nav Icons and Name fix test
-[73] :: Duplicate trip code. Location access and forwarding to CPC200-CCPA adapter. Set needed firmware settings via command injection
-[74] :: Log code cleanup. Curved Display in Widescreen SafeArea Code Testing. OS Sets cutout bounds, app calculates padding for SafeArea if user selects a non-default DisplayMode in App Settings (hide status or immersive).
-[75] :: Attempt Pre-stage of MediaCodec with cached decoder values from previous session. Split first [SPS+PPS]+IDR Keyframe to prevent first corrupted appearance. Bundled KeyFrame caused corrupted IDR rendering. Audio underun fix testing.
-[76] :: Extra logging for inbound messages (cataloging). UI reorganization (I tried) and new Adapter Reboot button. (Actual reboot. Different from connection Reset)
-[77] :: Phase 0 state-gate fix, code cleanup. Phase 13 stop = iPhone Rejected CarPlay Config. Graceful Session closure on User changes to Adapter Config and App restart. Closure = Save new adapter values > Send Disconnect Phone CMD > Send Reboot Command > Close App. Rebooting the adapter not just reset/refresh.
-[78] :: Code Cleanup. New 'Reset Cluster' to refresh Nav Metadata service if issues arise. App Settings Page accounts for cutout/curve for control placement. Fixed custom resolution + Safe Area not working properly.
-[79] :: Force Full Adapter Init on version change. CarApp Component toggle (Controls Nav Metadata), default is now OFF. Warning about OFF state if 'Reset Cluster' button is pressed. New Display Mode that hides Dock Only, leaving Status Bar visible.
-[80] :: Removed surface-based config override, Testing for 'Squishing' of SurfaceView Fix. Curved Displays with Hidden SystemUI should scale properly.
+[73] :: GNSS forwarding to adapter.
+   - Location access and forwarding to CPC200-CCPA adapter
+   - Set needed firmware settings via command injection
+
+[74] :: SafeArea for curved/widescreen displays.
+   - OS sets cutout bounds, app calculates padding for SafeArea
+   - Applies when user selects non-default DisplayMode (hide status or immersive)
+   - Log code cleanup
+
+[75] :: MediaCodec pre-staging and keyframe split.
+   - Attempt pre-stage of MediaCodec with cached decoder values from previous session
+   - Split first [SPS+PPS]+IDR keyframe to prevent corrupted first frame appearance
+   - Bundled keyframe caused corrupted IDR rendering
+   - Audio underrun fix testing
+
+[76] :: Inbound message logging and UI changes.
+   - Extra logging for inbound messages (cataloging)
+   - UI reorganization and new Adapter Reboot button (actual reboot, different from connection Reset)
+
+[77] :: Graceful session closure on config changes.
+   - Phase 0 state-gate fix, code cleanup
+   - Phase 13 stop = iPhone rejected CarPlay config
+   - Closure sequence: Save new adapter values > Disconnect Phone CMD > Reboot Command > Close App
+
+[78] :: Cluster reset and SafeArea fixes.
+   - New 'Reset Cluster' to refresh Nav Metadata service
+   - Settings page accounts for cutout/curve for control placement
+   - Fixed custom resolution + SafeArea not working properly
+
+[79] :: Version-gated init and display mode additions.
+   - Force full adapter init on version change
+   - CarApp Component toggle (controls Nav Metadata), default now OFF
+   - Warning about OFF state if 'Reset Cluster' pressed
+   - New Display Mode: hides Dock only, leaving Status Bar visible
+
+[80] :: SurfaceView scaling fix for curved displays.
+   - Removed surface-based config override
+   - Curved displays with hidden SystemUI should scale properly without squishing
 
 [81] :: New Nav Icons
 [82] :: Instr Cluster Nav Code Cleanup
 [83] :: Icon Thrashing fix, and more code cleanup
 [84] :: Log File export fixes
-[85] :: Testing Debug APK Only: Make app category 'HomeScreen' to replace GM Homescreen and freeup resources on GM Intel AAOS. Release APK: Instrument Cluster log level added
-[86] :: Single Keyframe Req for AA to correct anomaly at start of session. Fixed Android Auto scaling and touch coordination issues. Some code cleanup and other video related fixes.
+[85] :: Debug APK and cluster logging.
+   - Debug APK: Make app category 'HomeScreen' to replace GM Homescreen and free up resources on GM Intel AAOS
+   - Release APK: Instrument Cluster log level added
+
+[86] :: Android Auto video and touch fixes.
+   - Single keyframe request for AA to correct anomaly at session start
+   - Fixed AA scaling and touch coordination issues
+   - Code cleanup and other video related fixes
 [87] :: AA fixes from 86 affected CarPlay. Those issues have been fixed.
 [88] :: Some cleanup and static tool checks.
 [89] :: Another attempt at multiple AudioFocus for the various audio stream types For AAOS routing.
-[90] :: Android Auto Does use Adapter BT for Phone Call Audio. Specifically the microphone. Fixed so on AA sessions properly forward 8Khz instead of 16 to the adapter for proper forwarding over BT to the connected Android device. Tested using Google Meets VOIP call which appears to use the same Android services as a traditional Cellular call.
+[90] :: Android Auto phone call microphone fix.
+   - AA uses adapter BT for phone call audio (specifically the microphone)
+   - Fixed to forward 8kHz instead of 16kHz on AA sessions for proper BT forwarding to Android device
+   - Tested using Google Meet VoIP call (uses same Android services as cellular call)
 
 [91] :: Mostly Documentation updates, ferry icon fix
 [92] :: Android Auto Cluster Maneuver Icon correction tests. Trying to Match the known CP Manuver indicators to the Android Auto movements.
-[93] :: A lot... Microphone Source set back to only on full init or on change. Not minimal. Change the reconnection logic to attempt to disconnect and close dongle before attempting to recover. Issue found Adapter processes get hung up. Three pattern checks; Adapter USB write dead, Adapter alive but phone not connecting, and Unstable rapid cycling. Some adapter config changes weren't setting properly, testing a fix. Be aware that Android Auto on Pixel stays 'connected' long after the adapter has disconnected. Literally hold the adapter in my hands disconnected and Pixel showed AA 'connected' for up to a minute.... Good Job Google.
-[94] :: NAVI_IMAGE(201) data found. Only Android Auto provides Navigation Icons and adapter forwards instead of discarding. So it will be used while AA is active with Navigation. Instead of the Apps internal vector graphics designed for CarPlay.
-[95] :: Testing GM AAOS fix of possible missing Manuver Icon on AA Nav. Will not set maneuver to 'UNKNOWN' but will use the provided maneuver enum. Regardless if right or wrong, but will use the provided IMAGE. If the image is not record' then the assumed correct Vector graphic will be used. Also testing Detection code by 'metheos' to check if Template Host ContentProvider is available to claim.
-[96] :: Added Android Auto Album Art fix by metheos. App logging adjusted, it will log unknown data received from the adapter. Along with a hex preview of the contents for identification.
-[97] :: Reduced some Video log noise.
-[98] :: H264Renderer rewritten from async MediaCodec (setCallback) to sync mode (dequeueInputBuffer/dequeueOutputBuffer), matching the original Autokit AvcDecoder pattern. Stripped all MediaFormat extras (KEY_LOW_LATENCY, KEY_PRIORITY, KEY_MAX_INPUT_SIZE, csd-0/csd-1 pre-warming). All frames now fed with flags=0 — no BUFFER_FLAG_CODEC_CONFIG split-feed. PTS changed from monotonic counter to elapsed-time microseconds. Autokit was repackaged for x86_64 (jiagu removed, native stubs patched) and tested on both emulator and real GM gminfo3.7 — clean video, no P-frame corruption. The sync codec approach is the key differentiator: every open-source reimplementation uses async mode, only the proprietary Autokit uses sync, and only the Autokit avoids decoder poisoning. SPSC staging buffer, watchdog, AA frame cache, and 2s keyframe interval preserved unchanged.
-[99] :: Testing DisplayMode/Resolution and adapter configuration changes without needing full app closure. Only the 'Misc' option require full app closure and adapter restart (some rely on cmd injections).
-[100] :: Pre-allocate dedicated AudioTracks per purpose at startup. Route PCM by format match and state flags, not by currentStreamPurpose. Current code is one AudioTrack that switches between the various audio types. Some dead code cleanup. For Emulator Testing; Another app is contained within with instructions that allows MediaMeta on the 'ClusterHome'
+[93] :: Reconnection logic overhaul and mic source fix.
+   - Microphone source set back to only on full init or on change (not minimal)
+   - Reconnection now disconnects and closes dongle before attempting recovery
+   - Three failure pattern checks: USB write dead, adapter alive but phone not connecting, unstable rapid cycling
+   - Some adapter config changes weren't setting properly, testing fix
+   - Note: Android Auto on Pixel stays 'connected' up to a minute after adapter is physically disconnected
 
-[101] :: CarPlay Keyframe Request Changes. Removed original #1 at PLUGGED event. Why? It was sent too soon and iPhone ignored it. #2 Was a duplicate that never fired because the guard prevented it because #1 had fired. Removed #2 on first frame detection. The natural bundle(SPS+PPS+IDR) was what triggered #2 to fire. #1 and #2 have been replaced with a new #1 (lol). A single delayed keyframe request ~2-3s after first frame decoded. At this point a decoder should be active with Frames, but a Keyframe bundle early in the session should prevent a potential poisoned decoder from cascading.
-[102] :: Phones tab in Settings. Horizontal card UI for adapter's paired device list. Tap card to connect/disconnect, Remove button to forget. Protocol: AUTO_CONNECT_BY_BT_ADDRESS(0x11), FORGET_BLUETOOTH_ADDR(0x22), GET_BT_ONLINE_LIST(1013). Disconnect sends 0x0F, waits for UNPLUGGED, then overrides wifiConnect timer with targeted 0x11. BluetoothPairedList(0x12) now parsed with MAC-pattern splitting (adapter sends entries without null separators). Connected device MAC inferred from PLUGGED phoneType when PeerBluetoothAddress(0x23) not sent. Firmware bug found: ForgetBluetoothAddr removes from DevList but does not clear LastConnectedDevice in riddle.conf. Dead code cleanup.
-[103] :: Moved injected riddleBoxCfg as BoxSettings. Command injection was causing segmentation fault. This fault resulted in a crashed state that needed a re-enum of the adapter. Which could easily be recovered by using apps 'Reset Device'. Enough of an inconvenience but not detrimental.
+[94] :: Android Auto navigation icons.
+   - NAVI_IMAGE(201) data found, only AA provides navigation icons via adapter forwarding
+   - Used for AA active navigation instead of app's internal vector graphics (designed for CarPlay)
+
+[95] :: AA maneuver icon and Template Host fixes.
+   - Will not set maneuver to 'UNKNOWN', uses provided maneuver enum regardless
+   - Uses provided IMAGE if available, falls back to vector graphic if not
+   - Testing 'metheos' detection code to check if Template Host ContentProvider is available to claim
+
+[96] :: AA album art fix and unknown data logging.
+   - Added Android Auto album art fix by metheos
+   - App now logs unknown data received from adapter with hex preview for identification
+[97] :: Reduced some Video log noise.
+[98] :: H264Renderer rewrite: async to sync MediaCodec.
+   - Rewritten from setCallback async to dequeueInputBuffer/dequeueOutputBuffer sync mode
+   - Matches original Autokit AvcDecoder pattern (only implementation that avoids decoder poisoning)
+   - Stripped all MediaFormat extras (KEY_LOW_LATENCY, KEY_PRIORITY, KEY_MAX_INPUT_SIZE, csd-0/csd-1)
+   - All frames fed with flags=0, no BUFFER_FLAG_CODEC_CONFIG split-feed
+   - PTS changed from monotonic counter to elapsed-time microseconds
+   - Autokit repackaged for x86_64 (jiagu removed, native stubs patched), tested on emulator and GM gminfo3.7
+   - SPSC staging buffer, watchdog, AA frame cache, 2s keyframe interval preserved
+
+[99] :: Live adapter config changes without full app closure.
+   - DisplayMode/Resolution changes apply without restart
+   - Only 'Misc' options require full app closure and adapter restart
+
+[100] :: Per-purpose AudioTrack pre-allocation.
+   - Pre-allocate dedicated AudioTracks per purpose at startup (media, siri, phone, alert)
+   - Route PCM by format match and state flags, not by currentStreamPurpose
+   - Replaces single AudioTrack that switched between audio types
+   - Dead code cleanup
+   - Emulator testing: bundled helper app for MediaMeta on ClusterHome
+
+[101] :: CarPlay keyframe request rework.
+   - Removed #1 at PLUGGED event (sent too soon, iPhone ignored it)
+   - Removed #2 on first frame detection (duplicate, guard prevented it from ever firing)
+   - Replaced with single delayed keyframe request ~2-3s after first frame decoded
+   - Decoder should be active with frames by then, early IDR bundle prevents poisoned decoder cascade
+
+[102] :: Phones tab in Settings. Paired device management UI.
+   - Horizontal card UI for adapter's paired device list. Tap to connect/disconnect, Remove to forget
+   - Protocol: AUTO_CONNECT_BY_BT_ADDRESS(0x11), FORGET_BLUETOOTH_ADDR(0x22), GET_BT_ONLINE_LIST(1013)
+   - Disconnect sends 0x0F, waits for UNPLUGGED, overrides wifiConnect timer with targeted 0x11
+   - BluetoothPairedList(0x12) parsed with MAC-pattern splitting (adapter sends entries without null separators)
+   - Connected device MAC inferred from PLUGGED phoneType when PeerBluetoothAddress(0x23) not sent
+   - Firmware bug: ForgetBluetoothAddr removes from DevList but does not clear LastConnectedDevice in riddle.conf
+   - Dead code cleanup
+
+[103] :: Moved injected riddleBoxCfg to BoxSettings.
+   - Command injection was causing segmentation fault on the adapter
+   - Crashed state needed re-enum, recoverable via app's 'Reset Device'
+
+[104] :: Static analysis check and corrections.
+   - H264Renderer: Added volatile boolean stopped field. stop() sets it, delegates to stopInternal(). start() checks stopped at entry. Retry timer checks stopped before scheduling. reset()/resume() call stopInternal() (no permanent flag)
+   - DualStreamAudioManager: resolveTargetSlot() return type to PurposeSlot?, removed all 4 !! assertions. Call site adds ?: return 0. Added Handler(Looper.getMainLooper()) to setOnAudioFocusChangeListener()
+   - NavigationStateManager: Dropped ?. to . on providerInfo.packageName and providerInfo.exported (compiler smart-casts through local boolean)
+   - CarlinkManager: Changed callback?.onPhoneTypeChanged() to finalCallback.onPhoneTypeChanged() (already null-checked local val)
+   - Other dead code, unused imports, wrong comments cleaned up
+
+[105] :: MediaSession reset button and phone call audio routing fix.
+   - Reset session button for GM AAOS to clear stale Media Meta on Cluster-Music App
+   - Broadened phone call format check: sampleRate <= 8000 to sampleRate == 8000 || sampleRate == 16000
+   - Should properly route AA 8kHz and CarPlay 16kHz phone call audio to USAGE_VOICE_COMMUNICATION track
+   - focusDuckLevel reset: after requestAudioFocus() returns GRANTED, reset to 1.0f and call applyEffectiveVolume()
+   - Attempted fix for intermittent AA post-phone-call media silence
+
+[106] :: On resume video fix. 104 broke it.
+
+[107] :: Audio clipping fix and focus listener rework.
+   - DualStreamAudioManager minBufferLevelMs = 50 to 0
+   - Write silence for MEDIA instead of pause (keeps AudioTrack PLAYING)
+   - Separate focus listeners per purpose (AAOS CarAudioFocus uses listener as identity key)
+   - Move filter before format in Logger.log()
+   - Gate logcat behind BuildConfig.DEBUG
+   - Static analysis formatting corrections
+
+[108] :: Audio ducking fix, CallQuality removal, CMD_BOX_INFO cleanup.
+   - Audio ducking: duckLevel default 0.2f to 1.0f (was never set by adapter, stayed at init value)
+   - applyEffectiveVolume() now respects isDucked flag (only applies adapter duck when explicitly requested)
+   - AUDIO_MEDIA_START resets adapter ducking as safety net on media resume
+   - Removed Call Quality UI option from app settings and adapter website
+   - Firmware VoiceQuality=2/CallQuality=2 enables 24kHz mic but adapter input buffer hardcoded for 640B (16kHz)
+   - Adapter logs "Pop input Audio buffer not enough: 640!" when receiving 960B (24kHz) frames
+   - App hardcodes CallQuality=1 and VoiceQuality=1 in CMD_BOX_INFO as defensive measure
+   - Removed duplicate lowercase wifiChannel (WiFiChannel with capital W uses hardcoded handler with wifi restart)
+   - Removed OemName from CMD_BOX_INFO (persists to dead storage, airplay.conf oemIconLabel is the actual source)
+   - Documented CMD_BOX_INFO transform table: 28 entries, 5 keys missing (CallQuality, VoiceQuality, autoPlay, wifiChannel, OemName)
+
+[109] :: In-App option to Close/Kill the app.
+
+[110]:: Audio focus leak, stale session reset, alert routing, Close App teardown.
+   - Media silent after phone call: Removed setPurpose(RINGTONE) from INCOMING_CALL_INIT (no protocol STOP exists, focus was never abandoned). Added endPurpose(RINGTONE) safety nets in PHONECALL_START, ALERT_STOP, MEDIA_START.
+   - "Waiting for phone" after force-kill: Send 0x0F+0x15 after USB open in CarlinkManager.start() to clear stale adapter session. Fixed Close App button: added stop() before finishAffinity(), removed killProcess().
+   - Ringtone silent during incoming call: ALERT routing now matches on isAlertActive only, dropped 24kHz/mono format check. 48kHz stereo alert audio was falling through to muted MEDIA slot. ensureSlotFormat() recreates ALERT track to match incoming format.
+
+[111] :: Documentation Corrections and Unknown firmware messages documented.
+   - 0x0F Turn-by-Turn Start arrives before NAVI_START. Used as an additional trigger for Nav Audio start before actual audio packets.
+   - 0x2A DashboardInfo also contains Call information as JSON sub type 100. In/Outgoing Call information rcvd by adapter. Not implemented (sys perm restricted).
+
+[112] :: MediaSession rework, Maybe fix inconsistent GM AAOS. AUDIO_ROUTE log cleanup.
+   - automotive_app_desc.xml: added <uses name="media"/> so AAOS enumerates the app as a media source
+   - CarlinkMediaBrowserService: typed ServiceCompat.startForeground(MEDIA_PLAYBACK|CONNECTED_DEVICE) for Android 14+ compliance
+   - MessageParser: safeWrap() clamps header.length to payload.size — truncated USB frames no longer crash the read loop
+   - MessageParser: JSON media branch uses trimEnd('\u0000') instead of hardcoded -5 (firmware variants omit trailing NUL)
+   - CarlinkManager.processMediaMetadata: dedup predicate now includes artist/album/appName/duration so AA's split incremental metadata (title-then-artist) isn't dropped
+   - Album art: new AlbumArtCache writes downscaled JPEGs to a FileProvider-backed cache. Inline METADATA_KEY_ALBUM_ART Bitmap is PRIMARY; ALBUM_ART_URI/ART_URI/DISPLAY_ICON_URI keys additive ONLY after disk write confirmed.
+   - AUDIO_ROUTE only logs on route change (purpose, sample rate, or channel count) with 30-second summaries. Prior: logged on every audio packet.
+
+[113] :: Cold-start inset race fix attempt (SYSTEM_UI_VISIBLE stretch/cutout). Seen on AAOS emulator + VCUNH1. Not on gminfo
+   - themes.xml: dropped windowFullscreen + inline cutout mode.
+   - applyDisplayMode: per-mode setDecorFitsSystemWindows + layoutInDisplayCutoutMode. SystemUI > (true, DEFAULT); immersive modes > (false, ALWAYS).
+   - onCreate: initializeCarlinkManager deferred via decorView.post so WindowMetrics reflects post-clip rect on first read.
+   - MainScreen: VideoSurface wrapped in key(carlinkManager, displayMode) — reinit paths drop the AndroidView slot and release the HWC plane.
+   - Reset Connection: rebuilds manager via reinitializeForDisplayMode(currentDisplayMode) instead of in-place restart().
+   - Verified: SurfaceView 2400x788 on first create (was 2400x864 transient). Tested on Emulator with Display size of 13.2 at 2400x960.
+
+[114] :: MediaSession and Instrument Cluster Code changes. Volume adjust based on type.
+   - MediaSessionManager.kt added/updated URI_GRANT_CONSUMERS list, a helper, and pre-grant publishMetadata.
+   - DualStreamAudioManager.kt stop Phone Call track from pausing on perceived idle time. Prevents GM AAOS from flipping between vgroup 1 (Phone Call) and vgroup 3 (Media) during an active Phone Call volume adjust.
+
+[115] :: Testing and troubleshooting Volume Adjust based on type. DualStreamAudioManager.kt
+   - pause + flush the phoneCallSlot AudioTrack and reset slot state. Mirrors stopNavTrack() 
+   - AUDIO_PHONECALL_STOP branch — call stopPhoneCallTrack() before endPurpose() so the track leaves PLAYSTATE_PLAYING before focus is abandoned
+   - added SIRI to the silence-write branch (no more mid-prompt idle-pause flap).
+   - new stopSiriTrack() mirroring stopPhoneCallTrack()
+   - AUDIO_SIRI_STOP branch — calls audioManager?.stopSiriTrack() unconditionally before the branch split, so the USAGE_ASSISTANT player signal is released whether or not a phone call is taking over
+
+[116] :: Troubleshooting Alert Routing for Volume Control
+   - MediaSessionManager.kt setPlaybackToLocal(STREAM_MUSIC) in initialize() so the default routing target is documented (rather than implicit). new setRingtoneRouting() (> STREAM_RING > USAGE_NOTIFICATION_RINGTONE) and setMediaRouting() ( > STREAM_MUSIC) methods
+   - CarlinkManager.kt AUDIO_ALERT_START calls setRingtoneRouting() before setPurpose(ALERT), and AUDIO_ALERT_STOP calls setMediaRouting() before endPurpose(ALERT).
+
+[117] :: Revert 116 changes. Blocked Voice Assistant Volume adjust without improving ringtone control.
+   - DualStreamAudioManager.kt Attempting to use GM AAOS vgroup2 BUS_CALL_RING, without Telecomm code.
+
+[118] :: Code Comment Updates across the entire project. Some code cleanup.
+
+[119] :: Media3 migration for MediaSession.
+   - androidx.media:media:1.7.1 -> androidx.media3:media3-session:1.10.0 + media3-common:1.10.0
+   - New UsbAdapterPlayer (SimpleBasePlayer) and MediaLibrarySession replace MediaBrowserServiceCompat path
+   - Dual intent-filter (MediaLibraryService + legacy MediaBrowserService) covers both controller generations
+   - androidx.car.app.launchable=true on MBS for AAOS homescreen card opt-in. Side effect: duplicate app-grid tile (com.gm.homescreen.visibility=HIDDEN not honored on GM).
+
+[120] :: Media3 correctness pass. Verified against GM AAOS logs + decompiled GMCarMediaService/CarMediaApp; no GM behavior change, portability fix for pure-Media3 controllers.
+   - MediaSessionManager.kt revokeUriFromConsumers() mirror to grantUriToConsumers. Fires on URI rotation, setStateStopped(), release(). Prior path never revoked; grants persisted until reboot.
+   - MediaSessionManager.kt release() now calls player.release() before mediaSession.release() per Media3 serve-content docs. Session.release() does NOT release the Player.
+   - MediaSessionManager.kt getMediaLibrarySession() snapshots mediaSession under sessionLock. Closes @Volatile race where release() could null session mid-lookup (permanent onGetSession reject).
+   - MediaSessionManager.kt onGetItem(ROOT_ID) returns the root MediaItem (was unconditional RESULT_ERROR_NOT_SUPPORTED). Non-root IDs return RESULT_ERROR_BAD_VALUE.
+   - MediaSessionManager.kt session-activity Intent adds FLAG_ACTIVITY_NEW_TASK — required by PendingIntent.getActivity when launched outside an Activity context.
+   - UsbAdapterPlayer.kt setPlayWhenReady uses PLAY_WHEN_READY_CHANGE_REASON_REMOTE (was USER_REQUEST). REMOTE is the documented reason for mirror Players driven by external transport.
+   - UsbAdapterPlayer.kt MediaItemData.uid derived from title^artist^album hash via itemUidFor(). Fixes suppressed Player.Listener.onMediaItemTransition on track change. GM unaffected (legacy MediaControllerCompat.onMetadataChanged).
+   - UsbAdapterPlayer.kt removed COMMAND_SET_MEDIA_ITEM + handleSetMediaItems override (was silent no-op reporting false success to controllers).
+   - UsbAdapterPlayer.kt postToMain adds DEBUG check(Looper.myLooper() == applicationLooper). POTATO log TID analysis: 100% updates on USB-ReadLoop — assert catches regressions.
+   - AlbumArtCache.kt authority now "${BuildConfig.APPLICATION_ID}.albumart" — matches manifest. Future applicationIdSuffix would diverge from context.packageName and break getUriForFile.
+
+[121] :: Triple-agent verification cleanup + protocol hardening + projection-state session gate + AAOS stale-card deficiency documented.
+   - MessageSerializer.kt removed duplicate androidWorkMode send from addFullSettings. Single write per connection via generateInitSequence minimal block.
+   - MessageSerializer.kt androidWorkMode now written UNCONDITIONALLY with current config value (was guarded by `if true`). Fixes stale `1` in /etc/android_work_mode after user opt-out mid-connection.
+   - MessageTypes.kt dual-direction wire IDs (0x88/0xBB/0xCD/0xCE/0xF0/0xFD) documented. Enum names reflect inbound only; outbound callers (serializeRebootAdapter/serializeUsbReset) piggy-back on enum entries for wire encoding.
+   - MediaSessionManager.kt mediaControlCallback now @Volatile. Public setter contradicted prior "set once at init" claim; volatile codifies cross-thread visibility.
+   - MediaSessionManager.kt:266 stale comment fixed (said NOT_SUPPORTED; code returns RESULT_ERROR_BAD_VALUE since [120]).
+   - UsbAdapterPlayer.kt itemUidFor now hashes "T|title|A|artist|B|album" instead of XOR of per-field hashes. Eliminates field-permutation collision edge case.
+   - CarlinkMediaBrowserService.kt KDoc corrected: Media3 constant is DEFAULT_NOTIFICATION_ID, not NOTIFICATION_ID (value 1001 unchanged).
+   - UsbAdapterPlayer.kt adds isSessionActive gate; getState() returns empty playlist + STATE_IDLE when false.
+   - MediaSessionManager.kt setProjectionActive()/setInactive() replace setStateConnecting/setStateStopped. Session toggles on PLUGGED event, not app lifecycle.
+   - MediaSessionManager.kt initialize() no longer publishes placeholder metadata. Session starts inactive so other apps can promote freely.
+   - CarlinkManager.kt updateMediaSessionState wires DEVICE_CONNECTED → setProjectionActive(), CONNECTING/DISCONNECTED → setInactive(). Tracks true projection state.
+   - KDoc across MediaSessionManager/CarlinkManager/UsbAdapterPlayer documents confirmed AAOS CarLauncher stale-card bug after force-stop.
+   - Apple Music 5.2.1 reproduced the same stale card — platform limitation, not app-side. No app workaround exists.
+
+[122] :: riddleBoxCfg injection + MediaSession ownership refactor (blank homescreen card) + [PROBE] diagnostics.
+   - MessageSerializer.kt injects riddleBoxCfg CallQuality=1/VoiceQuality=1 via unsanitized-sed escape; persists to /etc/riddle.conf before BoxSettings.
+   - MainActivity.kt owns MediaSessionManager at app-scope. Created once per ADAPTER-mode init, released only from onDestroy.
+   - CarlinkManager.kt takes injectedMediaSessionManager via constructor. initialize() only attaches callback; release() only detaches — never releases.
+   - Fixes blank CarLauncher homescreen card after AdapterConfigurationDialog Apply. Tier-2 rebuild no longer recreates the MediaSession token.
+   - Root cause: release+init gap fired onSessionDestroyed; CarLauncher MediaControllerCompat did not rebind to the new token.
+   - MediaSessionManager.kt libraryCallback gains [PROBE] logs on onConnect/onDisconnected/onGetLibraryRoot/onGetChildren/onGetItem/onSubscribe. BuildConfig.DEBUG-gated, R8-stripped in release.
+
+[123] :: Code Cleanup
+
+[124] :: Media3 Code changes and some GM AAOS Code testing
+
+[125] :: Media3 debug code added for testing.
+
+[126] :: GM cluster regression fix + OS native media browser placeholder.
+   - UsbAdapterPlayer.kt getState() inactive branch now returns a placeholder MediaItem at STATE_READY, not empty timeline + STATE_IDLE.
+   - Restores v99 always-visible session contract; platform MediaSession.isActive stays true through GM's 88s lazy-bind window.
+   - PLACEHOLDER_METADATA companion constant ("Carlink"/"Not connected") added to UsbAdapterPlayer.kt.
+   - MediaSessionManager.setInactive() publishes placeholder metadata + STATE_READY instead of MediaMetadata.EMPTY + STATE_IDLE.
+   - MediaLibrarySession.Callback.onGetChildren returns one non-playable info item: "Browsing not available — open the app for projection".
+   - Replaces indefinite "Loading..." spinner shown by AAOS Media Center / AVRCP browse on empty library result.
+   - onGetItem resolves BROWSE_INFO_ITEM_ID so legacy MediaBrowserCompat clients fetching by id get the same metadata. 
+
+[127] :: Media3 audit-driven correctness fixes — observations against Media3 1.10.0 source (2026-05-03); see in-tree KDoc for re-verify advisories.
+   - CarlinkMediaBrowserService.kt onTaskRemoved override added: stopSelf() while FGS held, skips default pauseAllPlayersAndStopSelf() cascade.
+   - Avoids spurious USB PAUSE when swiping app during CONNECTING (STATE_BUFFERING did not satisfy isAnySessionPlaying() in observed Media3 1.10.0).
+   - CarlinkMediaBrowserService.kt buildNotification adds setGroup(DefaultMediaNotificationProvider.GROUP_KEY) — aligns manual FGS with Media3 auto-FGS group "media3_group_key".
+   - MediaSessionManager.kt onConnect uses controller.isTrusted instead of hand-rolled isTrustedController + hasMediaContentControlPermission helpers.
+   - Trust gate now also covers STATUS_BAR_SERVICE and enabled notification listeners — prior hand-rolled check missed those cases.
+   - MediaSessionManager.kt removed unused android.content.pm.PackageManager and android.os.Process imports after helper removal.
+   - MediaSessionManager.kt rootExtras putInt uses MediaConstants.EXTRAS_VALUE_CONTENT_STYLE_LIST_ITEM constant (=1) instead of magic-number literal.
+   - MediaSessionManager.kt onSubscribe gains KDoc documenting super-reject of BROWSE_INFO_ITEM_ID (intentional; non-browsable info-item not a subscribe target).
+   - MediaSessionManager.kt onGetChildren gains comment documenting deliberate deviation from Media3 doc preference for empty list.
+   - Empirical AAOS spinner-on-empty-list behavior justifies single info-row return.
+   - MediaSessionManager.kt LegacyConversions citation no longer references brittle line numbers — line ranges drift across releases.
+   - UsbAdapterPlayer.kt + MediaSessionManager.kt KDoc corrected: Media3 observed to call setActive(true) once at MediaSessionLegacyStub.start() — never via player-state predicate.
+   - Cluster regression cause re-attributed: downstream consumer metadata-visibility evaluation, not platform isActive flipping. Code behavior unchanged.
+   - UsbAdapterPlayer.kt setSessionActive KDoc + playbackState field comment cleaned of stale isActive-derivation claims.
+   - app/build.gradle.kts extracted val media3Version = "1.10.0"; both implementation lines reference $media3Version. Eliminates version drift risk.
+   - GmBrokerPermissionTest.kt KDoc + assertion message updated to reference MediaSession.ControllerInfo.isTrusted() after helper removal.
+   - AndroidManifest.xml FileProvider comment corrected: zero grantUriPermission calls observed in androidx.media3.session sources on 2026-05-03; Media3 does not auto-grant.
+   - Manual MediaSessionManager.grantUriToConsumers() is the actual mechanism; session resolves artworkUri server-side via BitmapLoader and ships decoded Bitmap.
+   - MediaSessionManager.kt KNOWN OS DEFICIENCY KDoc corrected against AOSP source observations 2026-05-03.
+   - PlaybackViewModel re-located: lives in car-media-common (not CarLauncher); CarLauncher consumes it via homescreen/audio/MediaViewModel.
+   - "Rebinds to cached-but-stale controller" framing inverted: controller is nulled at onSessionDestroyed and never replaced (three layered ComponentName-equality guards).
+   - SharedPreferences path /data/user/0/com.android.car/ marked unverified; only the file name "com.android.car.media.car_media_service" is confirmed.
+   - In-tree TODO at PlaybackViewModel.java:306 cited as AOSP-side acknowledgment of the orphaned-controller-resurrection gap.
+   - Audit-cycle KDoc/comment reframing: blocks authored this cycle now use observation-framed language with date stamps and re-verify advisories.
+   - Replaces hard claims with dated observations — prevents future sessions trusting stale assertions as Media3 or AOSP contracts.
+   - Affected: CarlinkMediaBrowserService.kt, UsbAdapterPlayer.kt, MediaSessionManager.kt, AndroidManifest.xml, GmBrokerPermissionTest.kt.
+
+[128] :: Play Store distribution split — play/sideload product flavors resolve issue #6 ClusterIconContentProvider authority collision on AAB upload.
+   - app/build.gradle.kts adds distribution flavor dimension: sideload (GM literal authority) and play (zeno.carlink.ClusterIconContentProvider).
+   - manifestPlaceholders["clusterIconAuthority"] + buildConfigField CLUSTER_ICON_AUTHORITY drive the per-variant authority value.
+   - androidComponents.beforeVariants disables playDebug — Play Console rejects debuggable bundles, so the variant has no purpose.
+   - Net build matrix: sideloadDebug (APK), sideloadRelease (APK), playRelease (AAB). Three rows in Build Variants and Generate Signed wizard.
+   - AndroidManifest.xml ClusterIconShimProvider authority now ${clusterIconAuthority} placeholder; resolved per flavor at manifest merge time.
+   - ClusterIconShimProvider.kt AUTHORITY switched from const literal to BuildConfig.CLUSTER_ICON_AUTHORITY (val, since BuildConfig is not const).
+   - URI building (content://$AUTHORITY/img/...) and onCreate log line both pick up the per-flavor authority transparently.
+   - NavigationStateManager.kt CLUSTER_ICON_PROVIDER_AUTHORITY intentionally left literal — runtime guard must probe the actual Templates Host call target.
+   - Inline comment warns future contributors NOT to template the probe for symmetry; would convert graceful fallback into silent failure.
+   - playRelease behavior: Play Console accepts upload, resolveContentProvider(GM) returns null, isAccessible=false, dropCurrentManeuverIcon() runs, type-based icons render.
+   - sideload behavior unchanged: shim claims GM authority, Templates Host calls land on it, AA bitmap maneuver icons render in cluster.
+   - Path 2 chosen over strict-issue-fix (templating all three references) after analysis of canUseAaManeuverIcon() consumer chain.
+   - Affected: app/build.gradle.kts, AndroidManifest.xml, ClusterIconShimProvider.kt, NavigationStateManager.kt.
+
+[129] :: Cluster blank-card fixes — CountDownLatch bind-race mitigation, explicit placeholder publish at init, state-aware adapter-lifecycle text.
+   - MediaSessionManager.kt companion adds initLatch (CountDownLatch) and awaitInitialized(timeoutMs); reset in release().
+   - CarlinkMediaBrowserService.onGetSession blocks up to 1500ms on awaitInitialized when session null instead of permanent reject.
+   - Addresses Silv MediaSourceViewModel.java:117-125 single-shot null-token check that permanently fails the cluster bind.
+   - MediaSessionManager.initialize() now explicitly pushes placeholder via updatePlaybackState + updateMediaMetadata before initLatch.countDown().
+   - Forces Media3 legacy bridge to propagate placeholder to MediaSessionCompat synchronously, eliminating null-mmdCompat window.
+   - Addresses Silv processMetadata smali :cond_4b3 silent "un handled response" log when MediaController.getMetadata() returns null.
+   - buildPlaceholderMetadata(artist) helper added; sets Title, DisplayTitle, Artist, Subtitle so all consumer fallback chains render same text.
+   - setProjectionActive(connectingPhase) overload added; setInactive and setProjectionActive() route through buildPlaceholderMetadata.
+   - CarlinkManager.updateMediaSessionState passes connectingPhase=true on CONNECTING and connectingPhase=false on DEVICE_CONNECTED.
+   - Phase-aware placeholder text: "Not connected", "Connecting to phone...", "Waiting for media..." across adapter lifecycle.
+   - Static analysis verified Media3 1.10.0 MediaSessionImpl wires platformToken synchronously in constructor — no Approach B forcing needed.
+   - MediaSessionManager.updatePlaceholderArtist(text) added; refreshes only metadata, leaves PlaybackState and isSessionActive untouched.
+   - CarlinkManager.setStatusText now mirrors UI status text to MediaSession placeholder when state != STREAMING.
+   - Cluster, cardview, and CarMediaApp surfaces show the same curated state strings the main app UI shows as adapter transitions.
+   - Reuses existing 19+ user-facing status messages (Searching for adapter, Initializing, Waiting for phone, Reconnecting, etc.).
+   - Eliminates duplication between hardcoded MediaSession placeholders and main-UI status — single source of truth.
+   - Streaming gate prevents status text from clobbering live CarPlay/AA track metadata during active playback.
+   - Affected: MediaSessionManager.kt, CarlinkMediaBrowserService.kt, CarlinkManager.kt.
+
+[130] :: Boot-race fix — MediaSession ownership moved from MainActivity to CarlinkMediaBrowserService.onCreate; closes blank-card window at AAOS auto-launch.
+   - MediaSessionManager.kt companion adds getOrCreate(context, log), instance(), releaseInstance() singleton API; old initLatch + awaitInitialized removed.
+   - CarlinkMediaBrowserService.onCreate now calls getOrCreate(applicationContext, serviceLogCallback).initialize() so session exists before any binder dispatch.
+   - onGetSession simplified to one-liner returning getMediaLibrarySession() — no latch wait, no null-on-timeout permanent rejection.
+   - CarlinkMediaBrowserService.onDestroy now calls releaseInstance() — single shutdown path; MainActivity no longer responsible for session release.
+   - serviceLogCallback companion routes MEDIA_SESSION events through top-level logInfo so file logs capture boot-time session activity.
+   - MainActivity.applyAudioTransferModeToMediaSession reads singleton via instance(); defensive getOrCreate fallback if MBS unstarted (am-start path).
+   - Defensive bootstrap fires "[MEDIA_SESSION] singleton missing — bootstrapped from Activity (unexpected)" warning; should be unreachable in normal boot flow.
+   - BLUETOOTH audio mode toggle now calls setInactive() instead of release() — preserves session token, avoids triggering AOSP rebind gap.
+   - MainActivity.onDestroy no longer calls mediaSessionManager.release() — Activity drops local reference, MBS owns full lifecycle.
+   - Pre-fix boot test: onGetSession at +43ms, MediaSessionManager init at +4515ms, init timeout fired, CarLauncher home card blank.
+   - Post-fix boot test: MediaSessionManager init at +160-219ms, onGetSession at +1ms after init, GM/AAOS observer bound succeeds, card populates.
+   - Two reboot tests confirmed fix: card shows placeholder ("Phone rejected configuration") then real track metadata once phone connects.
+   - Force-stop+relaunch case still hits documented AOSP rebind gap (PlaybackViewModel.java:306 orphaned-controller TODO) — not addressable app-side.
+   - Affected: MediaSessionManager.kt, CarlinkMediaBrowserService.kt, MainActivity.kt.
+
+[131] :: minSdk 32 → 29 — AAOS 10 (Android 10) support for gminfo3.7 head units stuck on sdk29.
+   - New WindowMetricsCompat.kt: currentWindowMetrics + WindowInsets are API 30, crash on API 29.
+   - Helper uses currentWindowMetrics on API 30+, falls back to getRealMetrics + WindowInsetsCompat on API 29.
+   - MainActivity, PlatformDetector, AdapterConfigurationDialog route window bounds/insets through the helper.
+   - Fixes guaranteed NoSuchMethodError launch crash — not caught by existing catch(Exception), it is an Error.
+   - applyDisplayMode guards LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS (API 30), uses SHORT_EDGES (API 28) on API 29.
+   - UsbDeviceWrapper guards PendingIntent.FLAG_MUTABLE (API 31); pre-31 PendingIntents are mutable by default.
+   - API 30+ runtime paths unchanged — zero behavior change on existing AAOS 12 fleet, only API 29 differs.
+   - Verified by 4 agents against official Android docs; no dependency exceeds minSdk 29 (highest is 23).
+   - Build clean: sideloadDebug APK, sideloadRelease APK, playRelease AAB; lintVitalRelease passed, no NewApi errors.
+   - Affected: app/build.gradle.kts, WindowMetricsCompat.kt (new), MainActivity.kt, PlatformDetector.kt, AdapterConfigurationDialog.kt, UsbDeviceWrapper.kt.
+
+[132] :: Removed command injection from MessageSerializer.kt
+
+[133] :: Adapter binary patches — CarPlay nav metadata recovery and Android Auto NMEA GPS fix. 60FPS default. Platform-conditional GM defaults.
+   - ARMiPhoneIAP2 on adapter strips/nulls rich navigation iAP2 messages — persistent on-disk patch restores full forwarding.
+   - Patch recovers 0x5201 RouteGuidance and 0x5202 maneuver burst, forwarded to App as NaviJSON _iap2/_iap2m fields.
+   - ARMAndroidAuto factory binary has 4-byte NMEA divisor bug — uses 600000.0 instead of 60.0, snapping GPS to ~1.85km grid.
+   - aa_gps_fix.sh watcher patches the binary in-memory via /proc/PID/mem at vaddr 0x55f04 on each new AA PID.
+   - Watcher auto-launched via /etc/init.d/rcS hook so fix survives reboot, USB removal, and AA respawns.
+   - Debug APK now logs the full navigation JSON received so the patched iAP2 binary can be verified end-to-end.
+   - Set 60FPS as the default video frame rate, replacing prior 30FPS default.
+   - DisplayMode default is now platform-conditional via PlatformDetector.requiresImmersiveDefaults() (gminfo37 + AAOS emulator → FULLSCREEN_IMMERSIVE; all other platforms → SYSTEM_UI_VISIBLE as before). User's prior persisted choice still wins; only first-install / post-uninstall defaults change.
+   - oemIcon hidden by default on the same platform set — MessageSerializer.generateAirplayConfig now honors AdapterConfig.oemIconVisible (was a constant "1"); MainActivity sets it to !requiresImmersiveDefaults().
+   - Platform check for gminfo3.7 hides CarPlay OEMicon and defaults DisplayMode to Fullscreen on that platform.
+
+[134] :: Attempting to generate CarPlay Nav Icons with in-app compose based on rcvd iAP2 information.
+
+[135] :: AAOS Emulator Only. With custom ClusterHome pro-app, integrate Nav Video into emulator cluster.
+
+[136] :: Compose icon feature wrap-up: LEFT_TURN bbox-centering fix + Bug A solved via iAP2 0x5201 parsing.
+   - Bug A (cluster maneuver out of sync with iPhone): five prior attempts v1-v5 inferred cursor from sparse signals.
+   - Root: patched ARMiPhoneIAP2 (133) forwards full 21-field 0x5201 as _iap2 hex; app logged but never parsed it.
+   - Cursor lived in field 0x000d (RouteGuidanceManeuverCurrentList per Apple R14G17 SDK) on every ~1Hz tick.
+   - v6.1 fix: new Iap2StateParser.kt parses _iap2 hex; NavigationStateManager reads cursor authoritatively, no inference needed.
+   - CarlinkManager.kt sets parsed state via setLastIap2State before onNaviJson; nulls on absent _iap2 or parse failure.
+   - v6.1 cursor body inserted between burst block and existing v5 Tier C body; v5 remains as fallback.
+   - v5 fallback covers len=2 _iap2 frames (depart and arrival) and non-Apple-Maps apps that omit _iap2 field.
+   - Reset lastIap2State on flush (NaviStatus 0|2) and clear() — prevents stale-cursor reuse after route end.
+   - maneuverCount sanity check: v6.1 skips when iap2 ManeuverCount disagrees with loaded route plan size.
+   - Zero LAG_DETECTED across both routes; zero V6_DISCREPANCY events; cluster maneuver now matches iPhone exactly.
+   - LEFT_TURN icon centering fix shipped earlier this cycle: IconBitmapRenderer.kt bbox-centers union of paths.
+   - Apple LEFT_TURN bbox center_x = -21.07 (49pt left of canvas center); old (28,28) translation caused severe clipping.
+   - Documented full 0x5201 + 0x5202 field catalog with Apple R14G17 SDK names; saved to /tmp/iap2_message_catalog.md.
+   - Discovered 7 new maneuverType integers used by Apple Maps: 14 (continue on road), 24/25 (arrival on left/right).
+   - Also seen: 29 (post-roundabout multi-direction), 30 (roundabout take-Nth-exit), 49 (slight left), 50 (slight right).
+   - Affected: Iap2StateParser.kt (new), NavigationStateManager.kt, CarlinkManager.kt, IconBitmapRenderer.kt.
+
+[137] :: Roundabout icons solved + cursor-stuck fix + finer (36-way) continuous arrows with real-arm spokes.
+   - Root cause: AppleManeuverPaths.roundaboutMap was corrupt — 144 cells but only 7 distinct arrow strings.
+   - Bucket index was uncorrelated with exit direction — bucket 8 / "straight" drew a sharp-right.
+   - Verified 3/3 independent agents + 5 parsers; old table had 362/1080 direction inversions, straight in 0/9 groups.
+   - Apple RE MapKit: MKJunction getRoundaboutArrowPath: SNAPS the exit to 8 cardinal 45° slots.
+   - Entry pinned at bottom, drawn endAngle = slot*45-90.
+   - Core primitive roundaboutArrowWithSize:metrics:outerRadius:endAngle:pivot: draws ANY continuous angle (measured bearing = 90 - endAngle°).
+   - Apple ships no static roundabout assets — all runtime vector.
+   - iAP2 angle convention live-verified (3-agent, captured _iap2m).
+   - 0x000b JunctionElementExitAngle = signed int16 driver-relative degrees (0=straight, +90=right, -90=left, ±180=back).
+   - 0x000a JunctionElementAngle = the other arms in the same frame.
+   - Refutes the adapter-doc "-90=right / relative-to-entry" claim and the prior "subtract the entry arm" hypothesis.
+   - The wire angle is fed straight in.
+   - CarPlay's own card also snaps: measured from iPhone screenshots, exits -6/-13/-3 all drew an identical straight-up arrow.
+   - Per user preference the cluster is intentionally rendered FINER than Apple's card.
+   - Regenerated roundaboutMap from genuine MapKit output, then went finer: 36-way (10°) buckets.
+   - White exit arrow = continuous core-primitive render (AppleManeuverPaths.kt, 324 cells).
+   - roundaboutPaths() bucket math changed 22.5°/16 → 10°/36.
+   - Ring + spokes now drawn at RUNTIME from the REAL junction arms, not a generic snapped schematic.
+   - ManeuverComposer.buildRingAndSpokes consumes iAP2 entryAngles.
+   - The white arrow shows entry (stem) + exit (head), so no grey exit-stub diverges from the fine arrow.
+   - AA-seam fix: ring donut + spoke quads overlapped.
+   - IconBitmapRenderer fills the background as one anti-aliased drawPath, leaving a notch where the ring's outer edge crossed each spoke.
+   - Path.op(UNION) merges ring+spokes into a single outline (no internal edges, no seam).
+   - Cursor-stuck fix (Bug A on len-2 routes): Iap2StateParser assigned a length-2 0x000d value to nextManeuverIdx.
+   - Leaving currentManeuverIdx null → v6.1 gate failed → cluster stranded on a stuck Tier C fallback.
+   - Live data proved the len-2 single value IS the current maneuver index.
+   - 0x000d=6 matched CarPlay's current idx6 @1.4mi; monotonic 3→10; depart=len-4 [0,1], arrival=len-2 [last].
+   - Fixed to currentManeuverIdx; 3/3 verified, len-4 path byte-identical, never out of bounds across 961 frames.
+   - Live-validated on Carmel routes: Veterans Way / Arbor Dr through City Center, S Guilford, W Carmel.
+   - Also E Main / E 116th and Hazel Dell roundabouts.
+   - Correct exit directions, fine 10° arrows, real-arm grey spokes.
+   - Cursor now tracks CarPlay through every roundabout (V6_FIRED cursor 3→4→5→6→7).
+   - Caveat: iAP2 frequently sends an INCOMPLETE arm list (cp29/30 often report 1-2 arms for 3-4-arm junctions).
+   - So spokes show only the arms present on the wire.
+   - Affected: AppleManeuverPaths.kt (regenerated table + 36-way bucket math), ManeuverComposer.kt (runtime ring/spokes from real arms + Path.op union).
+   - Also Iap2StateParser.kt (len-2 0x000d = current), NavigationStateManager.kt (gate comment), ManeuverComposerTest.kt (real-arm render test).
+
+[138] :: Video pipeline cleanup — removed dead AA frame-cache replay, allocation-free input buffers, IDR-aware pool-drain drop. Analysis-driven.
+   - Deep video-code analysis surfaced six findings; verified by 30 agents (five per finding), all CONFIRMED 5/5.
+   - Finding A: AA frame-cache replay was dead code — start() clears cache before reset()/resume() ever call replayFrameCache().
+   - replayFrameCache() always hit its frameCacheCount==0 early-return; per-frame cacheFrame() arraycopy and ~15MB allocation did nothing.
+   - Real AA recovery is the adapter-side FRAME keyframe request (Intel decoder reset) at session start and background return.
+   - Removed entire subsystem: 7 fields, 4 methods (init/clear/cache/replayFrameCache), 5 call sites, stale docs. File 1202→1036 lines.
+   - findNalOffset retained — still used by extractAndCacheCsd; first-frame skip, scaling mode, keyframe-callback recovery all left intact.
+   - Finding C: decodeFrame() hot path switched deprecated getInputBuffers()[index] to allocation-free getInputBuffer(index) (API 21+, minSdk 29).
+   - Finding D: feedDirect() pool-drain drop (wf==null) was silent and IDR-blind versus the queue-full path.
+   - Now symmetric: increments stagingDropCount, sets stagingOverwriteDetected, reads NAL from source data, counts and logs IDR drops.
+   - Reads getNalType(data, offset, length) from source params — wf is null, so no NPE; fires cooldown-bounded reactive keyframe.
+   - Each of the three modifications confirmed by 3 independent agents (control-flow, adversarial/NPE, syntax) — all CORRECT, 9/9.
+   - Whole-file brace balance verified 172/172; zero dangling frame-cache references; no other methods altered.
+   - Finding B left as-is: AA FRAME at session start and resume is intended preventive Intel decoder reset.
+   - Residual: watchdog-triggered mid-session reset still sends FRAME for AA; rare by design, not addressed this cycle.
+   - Affected: H264Renderer.java.
+
+[139] :: Off-thread CarPlay nav-icon composition — fixes USB-read-thread blocking that corrupted video on gminfo37 at navigation start.
+   - Root cause (logcat + code verified, 3/3 agents): ComposedIconStore.populateFromIap2m composed every maneuver's 512×512 bitmap synchronously on the USB read thread.
+   - That thread also reads video frames; while composing it stops reading, so frames back up and overflow staging on resume.
+   - Per-maneuver render: ~5.7ms on emulator, ~80ms on the saturated Intel Atom (14.1× slower) — measured from four route loads.
+   - Each compose burst blocked video reads ~2s (28 maneuvers); processVideoDirect showed a zero-frame gap, then STAGE[drop] + corruption.
+   - Live-measured Key West→Prudhoe Bay route = 183 maneuvers in one burst → ~14.6s gminfo37 block, past the adapter's ~14s watchdog.
+   - Fix: parse stays inline on read thread (publishes routeData synchronously for onNaviJson); compose+render dispatched to a background worker.
+   - New single daemon thread "IconComposer" at THREAD_PRIORITY_BACKGROUND — yields to video/audio; not parallelized (would starve the saturated Atom worse).
+   - iconByKey cleared on populate so lookup() can't return a stale route's bitmap; worker re-publishes once the new route's icons finish.
+   - lookup() falls back to the static AVD while the background fill is in progress — routeData-based Tier-C state unaffected.
+   - Dedup BEFORE render (was after): work is now O(unique) not O(total) — 183→118 (−35%), 28→15 (−47%).
+   - Supersede via composeGeneration (AtomicLong) under publishLock: a re-route or clear() aborts the in-flight compose and recycles partial bitmaps.
+   - Net on gminfo37: the ~14.6s read-thread block becomes 0; video never stalls regardless of route length.
+   - Roundabout icons unchanged in correctness (same first-wins key); they benefit most as the heaviest renders move off the read thread.
+   - Graphics ops were already off-main-thread; single worker = zero compose concurrency, all Path/Paint function-local. Builds clean, installed versionCode 139.
+   - Affected: ComposedIconStore.kt (parse-inline + background worker + dedup + supersede), CarlinkManager.kt (call-site comment + log text).
+
+[140] :: Android Auto portrait + any-AR support — two-way aspect-fit fills every display at native AR, no crop or stretch.
+   - Root: AA tier table was landscape-only; portrait or narrow displays collapsed to a wrong 16:9 tier, cropping content.
+   - Ported AutoKit C0797c0.m6106c two-way fit (macOS client reference): rendered content AR always equals display AR.
+   - The non-binding tier edge shrinks; phone bakes black bars on that axis, host oversizes/clips to remove them.
+   - MessageSerializer.kt: orientation-aware tiers (portrait 480x800, 720x1280, 1080x1920) plus two-way emit binding the constrained edge.
+   - CarlinkManager.kt getAaCropParams now axis-aware: AaCropParams gains contentWidth/cropLeft for left/right bars on tall displays.
+   - MainScreen.kt oversizes width or height by crop axis; touch normalization adds a symmetric cropLeftX offset.
+   - Landscape and CarPlay unchanged: displayAR>=tierAR path identical; CarPlay still uses serializeOpen, untouched.
+   - Live AAOS emulator 1440x1920 portrait with phone: was tier=1280x720 aaSize=1280x720 crop=null (stretched).
+   - Now tier=1080x1920 aaSize=1080x1440 cropTop=240; surface oversized 1440x2560, clipped to fill display at correct AR.
+   - Horizontal-crop (cropLeft) path implemented but not yet hardware-validated; needs a portrait display taller than 9:16.
+   - Affected: MessageSerializer.kt, CarlinkManager.kt, MainScreen.kt.
+
+[141] :: Cluster maneuver mapping — WITH_ANGLE roundabouts, VCU platform-gate for dead bitmap work, firmware-verified CT5 cluster pipeline.
+   - ManeuverMapper roundabouts now use TYPE_ROUNDABOUT_ENTER_AND_EXIT_*_WITH_ANGLE + setRoundaboutExitAngle from iAP2 0x000b / AA NaviTurnAngle.
+   - iAP2 driver-relative exit angle converted to androidx swept-angle: CCW=(180-a)mod360, CW=(180+a)mod360, 0 maps to 360.
+   - PlatformDetector.isVcuCluster() detects VCU (device burmese / Build.ID prefix VCU); best-effort, untested, no VCUNH1 hardware.
+   - On VCU, ComposedIconStore bitmap compose and the AA cluster-icon shim are skipped; both are masked there anyway.
+   - Firmware-verified (4-agent OS-image sweep): CT5 cluster rendered by QNX HMIC (Altia GMModel), Android blind to pixels.
+   - Handoff is enum-only over inter-VM Automotive Ethernet (NFSA/FSA); no bitmap/URI consumer exists on the CT5 cluster path.
+   - CT5 Altia atlas lacks directional roundabout glyphs, so WITH_ANGLE has no visible CT5 effect; kept for gminfo37-neutral correctness.
+   - Non-roundabout maneuvers already render correct GM glyphs; rich-iAP2 cluster improvement is gminfo3.7-only.
+   - gminfo3.7 behavior unchanged; assembleSideloadDebug and ktlintCheck pass.
+   - Affected: ManeuverMapper.kt, NavigationStateManager.kt, TripBuilder.kt, PlatformDetector.kt, ComposedIconStore.kt, CarlinkManager.kt.
+
+[142] :: Video staging buffer fix — AA/CarPlay pixelation from oversized-frame drops.
+   - STAGED_FRAME_CAPACITY raised 512KB -> 2MB. Affected: H264Renderer.java.
+   - Root cause: staging slot (512KB) too small for legit 1080p map frames.
+   - Frames hit 690-887KB, rejected by the feedDirect oversized guard.
+   - That drop breaks the H.264 reference chain, so the picture corrupts.
+   - AA sends ~1 IDR per session, so a dropped frame stays pixelated.
+   - Recovery: a lucky natural IDR, or manual navigate-away/back (resumeVideo teardown + FRAME).
+   - Diagnosed via live emulator logcat: oversized-drop count correlated 1:1 with pixelation.
+   - oversized:6/1 -> pixelated; oversized:0 -> clean; self-cleared when a fitting natural IDR arrived.
+   - Fix covers AA 1080p (~1.5MB) and CarPlay up to 2400x960 (~1.7MB).
+   - KNOWN LIMIT: 2MB does NOT cover CarPlay 4K (~3-6MB frames).
+   - Frame size = resolution x content complexity; heavy 4K motion still exceeds 2MB.
+   - Complete fix (future): resolution-derived capacity from negotiated WxH at initCodec.
+   - Plus reactive keyframe on oversized drop, instead of waiting on luck.
+   - Envelope confirmed via AA APK 16.9.666314 decompile plus prior ADB trace.
+   - H.264-only (CPC200 adapter hard limit); AA capped at 1080p; CarPlay up to 4K.
+   - Gearhead VIDEO_1440x2560 / 3840x2160 enums are stubs; never drive the encoder.
+   - Tested AA 1080x1920 and CarPlay 3840x2160: 0 oversized, clean decode (Rx==Dec).
+   - NOT stress-validated: neither session crossed 512KB; peaks 318KB and 147KB.
+   - Emulator c2.goldfish software decoder kept up with 4K under light load.
+
+[143] :: Play AAOS compliance Attempt: add templates_host + ACCESS_SURFACE. Cluster Integration auto-on for debug emulator.
+   - Context: Google "Approved with Issues" a Closed-Beta vc140 — Automotive Support + App category not permitted.
+   - Manifest: added uses-feature android.software.car.templates_host required=true; cluster CarAppService depends on Templates Host.
+   - Manifest: added uses-permission androidx.car.app.ACCESS_SURFACE; host provisions a render surface to the CarAppService.
+   - Manifest: usb.host required=false — gminfo37 lacks the feature flag; required=true filtered the truck off AAOS track.
+   - Verified on emulator: host binds CarlinkClusterService, provisions virtual display, ContentProvider authority still claimed.
+   - Not added: APP_MAPS — cluster bound on vc139 and vc142 without it. Carlink projects phone maps.
+   - appCategory="audio" already present; notice example was false. To appeal, not fix.
+   - Kept by design: MainActivity stays distractionOptimized (projection surface); CarAppActivity stays hidden non-launcher binding stub.
+   - AdapterConfigPreference: Cluster Integration defaults ON when BuildConfig.DEBUG and isAaosEmulator(); production and hardware stay OFF.
+   - Clean install verified: component auto-enables, host binds, no manual toggle needed.
+   - Affected: AndroidManifest.xml, ui/settings/AdapterConfigPreference.kt
+
+[144] :: SYSTEM_UI_VISIBLE inset double-count fix + projection-size divergence WARN. Emulator immersive default removed.
+   - Root cause: applyDisplayMode SYSTEM_UI_VISIBLE set decorFitsSystemWindows(true); Compose windowInsetsPadding subtracted the same system bars again.
+   - Window pre-clipped to 788, Compose pad then gave 616; codec stayed 788 from stable WindowMetrics.
+   - On-screen surface 172px (top 76 + bottom 96) shorter than decoded frame; bottom content clipped.
+   - AA letterbox-cushioned the gap; CarPlay fillMaxSize would squish directly (unverified, no CarPlay 616 repro reached).
+   - Fix: MainActivity.kt decorFitsSystemWindows(window, false) for SYSTEM_UI_VISIBLE; only Compose subtracts insets now.
+   - Trigger intermittent: display-off/on (lock/unlock) on a soaked emulator; plain app toggles never armed it.
+   - Once latched, persists across activity restarts until process death; cold boot and reboot clear it.
+   - NOT deterministically validated: post-reboot the bug stops arming; fix rests on mechanism, not repeatable repro.
+   - Added CarlinkManager.kt post-debounce WARN: fires when stabilized surface != pre-computed codec resolution.
+   - Gated past SURFACE_DEBOUNCE so startup/relayout transients are ignored; only settled divergence logs.
+   - Verified fixed build: cold start, lock/unlock, AA oversize, CarPlay render all correct, zero WARNs.
+   - Immersive mode structurally immune (no windowInsetsPadding); codec=container=960, AA tested 5/5 clean post-reboot.
+   - PlatformDetector.requiresImmersiveDefaults() dropped isAaosEmulator(); AAOS emulator no longer defaults to FULLSCREEN_IMMERSIVE.
+   - Side effect: OEM Exit icon now visible on emulator; gminfo37 immersive + hidden-icon defaults unchanged.
+   - Corrected false comments: currentWindowMetrics.bounds is full 2400x960, not post-clip 788; decorFits=true not required for surface geometry.
+   - Affected: MainActivity.kt, CarlinkManager.kt, PlatformDetector.kt, DisplayModePreference.kt, AdapterConfigPreference.kt
+
+[145] :: CPU: de-spin H264 feeder (park/unpark) and pace the audio playback loop. Verified on live gminfo37.
+   - Video: H264Renderer feederLoop parkNanos(1ms) busy-spin replaced with blocking park(); feedDirect unparks feeder after each stagingOffer.
+   - stopStaging already unparks for shutdown; unpark(null) is a no-op, so the start/stop window stays safe.
+   - park() consumes a permit, so an enqueue racing the park returns immediately — no frame lost.
+   - Measured: H264-Feeder idle-spin removed; 0% idle, ~1.5-3% at full 60fps (feed work only), was ~6%.
+   - Audio: DualStreamAudioManager playback loop now sleeps 5ms every pass, not only when fully idle.
+   - Per-pass capacity ~100ms/slot into 750ms ring plus AudioTrack buffer; 5ms cadence cannot underfeed at 1x.
+   - Removes the active-playback busy-spin; didWork is now vestigial (assigned, unread) — harmless, compiler warning only.
+   - Both threads are downstream consumers; no change to USB read, heartbeat, or session paths.
+   - Live wired CarPlay: Urun:0 across windows, Resets:0, zero frame drops, no regressions.
+   - Wireless churned every ~11s (adapter USB-IN went silent); wired stable — Wi-Fi link, not these changes.
+   - Affected: video/H264Renderer.java, audio/DualStreamAudioManager.kt

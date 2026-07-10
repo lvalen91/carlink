@@ -1,10 +1,28 @@
 package com.carlink.logging
 
 import android.util.Log
+import com.carlink.BuildConfig
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CopyOnWriteArrayList
 
-/** Centralized logging with tag-based filtering and multiple output destinations. */
+/**
+ * Centralized logging facade for the app.
+ *
+ * Responsibilities:
+ *  - Uniform call surface (v/d/i/w/e plus top-level logDebug/logInfo/logWarn/logError).
+ *  - Tag filtering (27 tags in [Tags]) with a default-ENABLED policy for unregistered tags
+ *    — callers must use presets to disable tags they don't want.
+ *  - Level filtering via [LogLevel] presets, with a derived [minLevel] fast-path.
+ *  - [LogListener] fan-out for persistence. Today [FileLogManager] is the sole listener.
+ *  - Debug-build-only mirroring to android.util.Log; release builds route exclusively
+ *    through listeners to avoid per-packet Log.d() overhead on the GM AAOS Intel Atom.
+ *  - [Tags.PROTO_UNKNOWN] bypass so protocol anomalies always reach persistence.
+ *  - Inline [logDebugOnly] family with lambda message builders for zero-cost call sites
+ *    when a tag is disabled.
+ *
+ * Threading: [log] dispatches to listeners SYNCHRONOUSLY on the caller's thread. That
+ * is the load-bearing invariant [FileLogManager.onLog] is engineered around.
+ */
 object Logger {
     private const val TAG = "CARLINK"
 
@@ -18,7 +36,9 @@ object Logger {
         ERROR(Log.ERROR),
     }
 
-    /** LogPreset-compatible log levels. */
+    /** LogPreset-compatible log levels. Intentionally omits VERBOSE — presets cannot
+     *  filter VERBOSE and no call site uses [Logger.v] today; it exists as a logcat-only
+     *  escape hatch. */
     enum class LogLevel {
         DEBUG,
         INFO,
@@ -114,6 +134,10 @@ object Logger {
         enabledTags[tag] = false
     }
 
+    // Default-ENABLED: unregistered tags pass the filter. LogPreset.apply() always
+    // explicitly configures the full set (via enableAllTags/disableAllTags followed by
+    // setTagsEnabled), so the default only governs transient states before a preset
+    // runs and one-off tags added without a preset update.
     fun isTagEnabled(tag: String): Boolean = enabledTags[tag] ?: true
 
     fun setMinLevel(level: Level) {
@@ -134,6 +158,12 @@ object Logger {
         recalculateMinLevel()
     }
 
+    // Picks the lowest enabled level as minLevel — i.e., the cutoff passed at
+    // log() line ~262. This ASSUMES contiguous preset masks (e.g., INFO+WARN+ERROR).
+    // A non-contiguous mask (e.g., INFO=on, WARN=off, ERROR=on) would compute
+    // minLevel=INFO and silently let WARN through. All 11 LogPresets use contiguous
+    // ranges today; if that ever changes, upgrade the fast-path to check the per-level
+    // map instead of just minLevel.priority.
     private fun recalculateMinLevel() {
         minLevel =
             when {
@@ -200,6 +230,10 @@ object Logger {
         }
     }
 
+    // Listeners are dispatched SYNCHRONOUSLY on the caller's thread inside log().
+    // Re-entrancy hazard: a listener that calls back into Logger.d/i/w/e on every
+    // onLog() will recurse until StackOverflow. Either queue-then-flush (as
+    // FileLogManager does) or explicitly gate self-logging behind a reentry flag.
     fun addListener(listener: LogListener) {
         listeners.add(listener)
     }
@@ -240,31 +274,36 @@ object Logger {
         message: String,
         throwable: Throwable? = null,
     ) {
-        val timestamp = System.currentTimeMillis()
-        val formattedMessage = if (tag != null) "[$tag] $message" else message
-
-        // Always emit to Logcat regardless of app settings (enables adb logcat capture)
-        when (level) {
-            Level.VERBOSE -> Log.v(TAG, formattedMessage, throwable)
-            Level.DEBUG -> Log.d(TAG, formattedMessage, throwable)
-            Level.INFO -> Log.i(TAG, formattedMessage, throwable)
-            Level.WARN -> Log.w(TAG, formattedMessage, throwable)
-            Level.ERROR -> Log.e(TAG, formattedMessage, throwable)
+        // Emit to system logcat only in debug builds (adb logcat capture during development).
+        // Release builds route exclusively through listeners (app file logging) to avoid
+        // per-packet Log.d() overhead on constrained hardware (GM AAOS Intel Atom).
+        if (BuildConfig.DEBUG) {
+            val formattedMessage = if (tag != null) "[$tag] $message" else message
+            when (level) {
+                Level.VERBOSE -> Log.v(TAG, formattedMessage, throwable)
+                Level.DEBUG -> Log.d(TAG, formattedMessage, throwable)
+                Level.INFO -> Log.i(TAG, formattedMessage, throwable)
+                Level.WARN -> Log.w(TAG, formattedMessage, throwable)
+                Level.ERROR -> Log.e(TAG, formattedMessage, throwable)
+            }
         }
 
-        // Apply filtering only for listeners (file logging, etc.)
-        // NEVER filter protocol-unknown messages — they must always reach file logs
+        // Filter before any further work — skip timestamp + listener dispatch if filtered out.
+        // NEVER filter protocol-unknown messages — they must always reach file logs.
         val bypassFilter = tag == Tags.PROTO_UNKNOWN
         if (!bypassFilter) {
             if (level.priority < minLevel.priority) return
             if (tag != null && !isTagEnabled(tag)) return
         }
 
+        if (listeners.isEmpty()) return
+
+        val timestamp = System.currentTimeMillis()
         for (listener in listeners) {
             try {
                 listener.onLog(level, tag, message, timestamp)
             } catch (e: Exception) {
-                Log.e(TAG, "Error in log listener: ${e.message}")
+                if (BuildConfig.DEBUG) Log.e(TAG, "Error in log listener: ${e.message}")
             }
         }
     }
@@ -292,6 +331,8 @@ fun logError(
     throwable: Throwable? = null,
 ) = Logger.e(message, tag, throwable)
 
+// Legacy short-name alias for Logger.d(). Shadows kotlin.math.log in files that
+// import both — prefer logDebug() for new code.
 fun log(
     message: String,
     tag: String? = null,
@@ -299,7 +340,11 @@ fun log(
 
 fun isTagEnabled(tag: String): Boolean = Logger.isTagEnabled(tag)
 
-// Debug-only logging - no-op in release builds (avoids string concatenation overhead)
+// Zero-cost debug logging: the message lambda is only invoked if both
+// debugLoggingEnabled AND the tag are enabled. debugLoggingEnabled defaults to true
+// and is wired to BuildConfig.DEBUG by MainActivity.initializeLogging() at startup —
+// so in release builds this compiles down to a no-op at every call site. Any other
+// entry point that forgets to call setDebugLoggingEnabled(false) will pay full cost.
 inline fun logDebugOnly(
     tag: String,
     message: () -> String,

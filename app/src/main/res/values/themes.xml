@@ -7,10 +7,13 @@
         <item name="android:windowBackground">@android:color/black</item>
     </style>
 
-    <!-- Fullscreen theme for main activity -->
+    <!-- Fullscreen theme for main activity.
+         windowFullscreen removed: it conflicts with per-mode decorFitsSystemWindows
+         control in applyDisplayMode() and causes cold-start SystemUI visibility races.
+         layoutInDisplayCutoutMode is set at runtime per DisplayMode instead of
+         hard-coded here, so SYSTEM_UI_VISIBLE respects the cutout envelope while
+         immersive modes extend into it. -->
     <style name="Theme.CarlinkNative.Fullscreen" parent="Theme.CarlinkNative">
-        <item name="android:windowFullscreen">true</item>
         <item name="android:windowContentOverlay">@null</item>
-        <item name="android:windowLayoutInDisplayCutoutMode">shortEdges</item>
     </style>
 </resources>

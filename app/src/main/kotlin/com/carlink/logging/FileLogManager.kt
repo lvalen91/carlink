@@ -3,6 +3,7 @@ package com.carlink.logging
 import android.content.Context
 import java.io.File
 import java.io.FileOutputStream
+import java.io.IOException
 import java.io.OutputStreamWriter
 import java.time.Instant
 import java.time.ZoneId
@@ -17,7 +18,22 @@ import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.locks.ReentrantLock
 import kotlin.concurrent.withLock
 
-/** Persistent log storage with 5MB rotation, 7-day retention, and async writes. */
+/**
+ * Persistent log storage with size-based rotation and async writes.
+ *
+ * - Rotation: ~5 MiB soft cap. The size check is post-write, so a single flush batch
+ *   can push the file over the threshold before rotation triggers — expect occasional
+ *   files up to a few MiB above MAX_FILE_SIZE. Intentional: the alternative is
+ *   pre-computing batch size or splitting writes, neither worth the complexity.
+ * - Retention: 7 days, enforced only at enable() via cleanOldLogs(). In a long-running
+ *   session (>24 h without a disable/enable cycle) retention is NOT re-applied — old
+ *   files will accumulate until the next enable() call. See cleanOldLogs() for the
+ *   scheduling caveat.
+ * - Writes: 1 Hz async flush from a single-threaded ScheduledExecutorService;
+ *   producers (any thread) enqueue via onLog() with O(1) backpressure.
+ */
+// Singleton stores appContext (applicationContext), not an Activity, so the
+// static-field-leak rule's concern doesn't apply here.
 @Suppress("StaticFieldLeak")
 class FileLogManager internal constructor(
     context: Context,
@@ -34,9 +50,11 @@ class FileLogManager internal constructor(
         private const val SHUTDOWN_TIMEOUT_MS = 2000L
 
         // Producer-side backpressure: drop messages when queue exceeds this size.
-        // Prevents unbounded memory growth under DEBUG/VIDEO_PIPELINE presets
-        // (~350 bytes/msg × 5000 = ~1.7MB max queue footprint). Uses O(1)
-        // AtomicInteger check instead of ConcurrentLinkedQueue.size() which is O(n).
+        // Prevents unbounded memory growth under DEBUG/VIDEO_PIPELINE presets.
+        // Footprint estimate: typical line is 80-150 bytes, worst case ~350 bytes
+        // (long tag + long message), so 5000 entries is ~400 KiB typical, ~1.7 MiB
+        // absolute worst case. Uses O(1) AtomicInteger check instead of
+        // ConcurrentLinkedQueue.size() which is O(n).
         private const val MAX_QUEUE_SIZE = 5000
 
         @Volatile
@@ -119,6 +137,9 @@ class FileLogManager internal constructor(
 
     fun release() {
         android.util.Log.i("CARLINK", "[FILE_LOG] Releasing — shutting down executor")
+        // Window between disable() returning and executor.shutdown() running: the 1 Hz
+        // scheduled task may still fire once. Safe — isEnabled is false (early return in
+        // flushQueueInternal) and currentWriter is null (post-disable). No action needed.
         disable()
         executor.shutdown()
         try {
@@ -150,7 +171,7 @@ class FileLogManager internal constructor(
                 } else {
                     file.delete()
                 }
-            } catch (e: Exception) {
+            } catch (e: IOException) {
                 logError("Failed to delete log file: ${e.message}", tag = Logger.Tags.FILE_LOG)
                 false
             }
@@ -169,6 +190,10 @@ class FileLogManager internal constructor(
         flushQueueInternal()
     }
 
+    // Called synchronously by Logger.log() on the caller's thread — can be ANY thread
+    // (main, video decoder, audio, USB I/O, etc.). The ConcurrentLinkedQueue +
+    // AtomicInteger pair handles the multi-producer case; the single flush executor is
+    // the sole consumer.
     override fun onLog(
         level: Logger.Level,
         tag: String?,
@@ -222,6 +247,10 @@ class FileLogManager internal constructor(
                     writer.flush()
 
                     currentLogFile?.let { file ->
+                        // Post-write size check — the batch that triggers rotation is
+                        // already on disk, so files can exceed MAX_FILE_SIZE by up to one
+                        // batch (~400 KiB typical, up to ~1.7 MiB in a worst-case burst
+                        // that drained a full queue). Accepted as the simpler design.
                         if (file.length() > MAX_FILE_SIZE) {
                             closeWriterLocked()
                             createNewLogFileLocked()
@@ -230,7 +259,7 @@ class FileLogManager internal constructor(
                         }
                     }
                 }
-            } catch (e: Exception) {
+            } catch (e: IOException) {
                 android.util.Log.e("CARLINK", "[FILE_LOG] Failed to flush log queue: ${e.message}")
             }
         }
@@ -249,7 +278,11 @@ class FileLogManager internal constructor(
                     FileOutputStream(currentLogFile, true),
                     Charsets.UTF_8,
                 )
-        } catch (e: Exception) {
+        } catch (e: IOException) {
+            // On open failure the manager degrades to a silent drop-all state:
+            // flushQueueInternal returns at the `currentWriter ?: return` guard and
+            // queued lines are lost. Intentional — we never want logging failures to
+            // break the app. Recovery requires a disable()/enable() cycle.
             logError("Failed to create log file: ${e.message}", tag = Logger.Tags.FILE_LOG)
             currentLogFile = null
         }
@@ -273,7 +306,7 @@ class FileLogManager internal constructor(
         try {
             currentWriter?.write(header)
             currentWriter?.flush()
-        } catch (e: Exception) {
+        } catch (e: IOException) {
             logError("Failed to write log header: ${e.message}", tag = Logger.Tags.FILE_LOG)
         }
     }
@@ -283,12 +316,16 @@ class FileLogManager internal constructor(
         try {
             currentWriter?.flush()
             currentWriter?.close()
-        } catch (e: Exception) {
+        } catch (e: IOException) {
             android.util.Log.w("CARLINK", "[FILE_LOG] Writer close error: ${e.message}")
         }
         currentWriter = null
     }
 
+    // Invoked only from enable() — retention is NOT re-applied during a long-running
+    // session. If the app stays enabled for >24 h without a disable/enable cycle,
+    // files older than RETENTION_DAYS will persist until the next enable() call.
+    // Fix if it matters: schedule this in the executor (e.g., every N flushes).
     private fun cleanOldLogs() {
         val cutoffTime = System.currentTimeMillis() - (RETENTION_DAYS * 24 * 60 * 60 * 1000L)
 
@@ -301,7 +338,7 @@ class FileLogManager internal constructor(
                         file.delete()
                         logInfo("Deleted old log file: ${file.name}", tag = Logger.Tags.FILE_LOG)
                     }
-                } catch (e: Exception) {
+                } catch (e: IOException) {
                     logError("Failed to delete old log: ${e.message}", tag = Logger.Tags.FILE_LOG)
                 }
             }

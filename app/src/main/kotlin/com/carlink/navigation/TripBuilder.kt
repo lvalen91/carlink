@@ -13,8 +13,21 @@ import java.time.ZonedDateTime
  * Shared Trip builder for cluster navigation display.
  *
  * Builds a [Trip] with the current maneuver step and, when the adapter firmware sends
- * a double-maneuver burst, an additional next step. Trip steps are ordered — the first
+ * a double-maneuver burst (see NavigationStateManager burst-detection window,
+ * BURST_THRESHOLD_MS = 50), an additional next step. Trip steps are ordered — the first
  * is what the driver needs to do now, the second is what comes after.
+ *
+ * Used by both cluster session implementations (ClusterMainSession for GM AAOS,
+ * CarlinkClusterSession for non-GM AAOS) so the Trip payload handed to
+ * NavigationManager.updateTrip is identical across platforms.
+ *
+ * ETA caveat: the adapter exposes only a single timeToDestination (seconds to final
+ * destination). The same computed `eta` is reused for per-step TravelEstimates, which
+ * is semantically incorrect (step ETAs ≠ destination ETA) but accepted because the
+ * cluster UIs surface step DISTANCE, not step ETA. See the inline note at the first
+ * TravelEstimate construction.
+ *
+ * No tests. Add coverage if step/ETA semantics change.
  */
 object TripBuilder {
     fun buildTrip(
@@ -22,6 +35,9 @@ object TripBuilder {
         context: Context,
     ): Trip {
         val tripBuilder = Trip.Builder()
+        // Single ETA reused across the current step, the next step, and the destination.
+        // Only the destination estimate is actually "arrival time" — step ETAs are the
+        // same value because the adapter doesn't expose per-step timing. See class KDoc.
         val eta = ZonedDateTime.now().plus(Duration.ofSeconds(state.timeToDestination.toLong()))
 
         // Current step
@@ -46,6 +62,7 @@ object TripBuilder {
                     state.nextManeuverType!!,
                     state.turnSide,
                     context,
+                    exitAngle = state.nextExitAngle,
                 )
             val nextStepBuilder = Step.Builder()
             nextStepBuilder.setManeuver(nextManeuver)
@@ -69,6 +86,9 @@ object TripBuilder {
         }
 
         if (state.destinationName != null || state.distanceToDestination > 0) {
+            // Destination.Builder().setName is optional — if destinationName is null
+            // we still add a nameless Destination when distanceToDestination > 0 so
+            // the cluster has something to render (typical display: "— 0.3 mi").
             val destBuilder = Destination.Builder()
             state.destinationName?.let { destBuilder.setName(it) }
 
@@ -82,6 +102,8 @@ object TripBuilder {
             tripBuilder.addDestination(destBuilder.build(), destEstimate)
         }
 
+        // Not ceremonial: GM's OnStarTurnByTurnManager renders a spinner instead of
+        // the turn-card while a Trip is in the loading state. Always set false here.
         tripBuilder.setLoading(false)
 
         return tripBuilder.build()

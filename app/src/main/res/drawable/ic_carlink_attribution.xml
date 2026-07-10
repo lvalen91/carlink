@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    AAOS Tintable Attribution Icon (referenced by androidx.car.app.TintableAttributionIcon
+    meta-data in AndroidManifest.xml). Used by AAOS Media Center / system UI on media
+    cards and similar surfaces where the system applies its own tint.
+
+    Contract per developer.android.com/training/cars/media/configure-manifest:
+      - Monochrome (single-channel mask).
+      - Vector drawable (avoids blur across screen densities).
+      - White fill so the system tint shader produces the correct foreground color.
+-->
+<!--
+    No `android:tint` is set: the fillColor below is white (#FFFFFFFF), which the
+    AAOS Media Center / system UI tints at render time per surface. Setting an
+    explicit tint here would either pin the color (bad — host can't theme it) or
+    reference an attr (e.g. ?attr/colorControlNormal) that doesn't exist in this
+    project's pure-Compose-Material3 theme tree.
+-->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="24"
+    android:viewportHeight="24">
+
+    <!-- Phone body -->
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M9,2 L15,2 C16.1,2 17,2.9 17,4 L17,20 C17,21.1 16.1,22 15,22 L9,22 C7.9,22 7,21.1 7,20 L7,4 C7,2.9 7.9,2 9,2 Z M9,4 L9,18 L15,18 L15,4 L9,4 Z"/>
+    <!-- Link / projection arc -->
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M18.5,8 C19.88,9.38 19.88,11.62 18.5,13 L17.09,11.59 C17.66,11.02 17.66,10.05 17.09,9.41 L18.5,8 Z M21.07,5.5 C23.64,8.07 23.64,12.43 21.07,15 L19.66,13.59 C21.45,11.79 21.45,8.71 19.66,6.91 L21.07,5.5 Z"/>
+</vector>

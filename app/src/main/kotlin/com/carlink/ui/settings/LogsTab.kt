@@ -83,6 +83,16 @@ import java.util.Locale
 /**
  * Content for the Logs tab in SettingsScreen.
  * Provides controls for file logging, log level selection, and log file management.
+ *
+ * Known hazards (documented for future cleanup — do not silently fix):
+ *  - Main-thread disk I/O: enable()/disable()/flush()/deleteLogFile() and size queries
+ *    run on AndroidUiDispatcher.Main via rememberCoroutineScope(). ANR risk on slow
+ *    storage. Fix: wrap in withContext(Dispatchers.IO). See call sites L207-221,
+ *    L272-273, L403-407, L581-585.
+ *  - LogLevelSelectorDialog uses a hardcoded 2x5 chip grid (L616-631). Adding an
+ *    11th LogPreset silently drops it (no exhaustiveness check). Fix: drive from
+ *    LogPreset.entries.chunked(5) or similar.
+ *  - formatBytes vs formatFileSize are inconsistent (L938 vs L945) — see their docs.
  */
 @Composable
 internal fun LogsTabContent(
@@ -108,6 +118,7 @@ internal fun LogsTabContent(
                 scope.launch {
                     val result = FileExportService.writeFileToUri(context, uri, fileToExport)
                     result
+                        // TODO(cleanup): bytesWritten is unused — rename to `_` in a future cleanup.
                         .onSuccess { bytesWritten ->
                             Toast.makeText(context, "Exported: ${fileToExport.name}", Toast.LENGTH_SHORT).show()
                         }.onFailure { error ->
@@ -128,6 +139,7 @@ internal fun LogsTabContent(
     val isLoggingEnabled by loggingPreferences.loggingEnabledFlow.collectAsStateWithLifecycle(initialValue = false)
     val currentLogLevel by loggingPreferences.logLevelFlow.collectAsStateWithLifecycle(initialValue = LogPreset.SILENT)
 
+    // remember{} with no key is correct: the debuggable flag is immutable for the process lifetime.
     val isDebugBuild =
         remember {
             try {
@@ -141,6 +153,10 @@ internal fun LogsTabContent(
 
     val dateFormat = remember { SimpleDateFormat("dd/MM/yyyy HH:mm", Locale.getDefault()) }
 
+    // Seeds once per fileLogManager instance (stable for process lifetime). Subsequent
+    // file-list changes driven elsewhere in FileLogManager (e.g. rotation) will NOT
+    // re-run this effect, so `logFiles.size` can lag behind the live size readouts
+    // at L272-273. Fix: observe a StateFlow from FileLogManager if staleness matters.
     LaunchedEffect(fileLogManager) {
         logFiles = fileLogManager?.getLogFiles() ?: emptyList()
     }
@@ -205,6 +221,12 @@ internal fun LogsTabContent(
                     Switch(
                         checked = isLoggingEnabled,
                         onCheckedChange = { enabled ->
+                            // HAZARD: scope is AndroidUiDispatcher.Main. enable() acquires
+                            // writerLock, opens FileOutputStream, writes header, and runs
+                            // cleanOldLogs() (iterates + deletes). disable() flushes + closes.
+                            // getLogFiles() stats the log dir. All synchronous disk I/O on the
+                            // main thread — ANR risk on slow storage. Fix: wrap each call in
+                            // withContext(Dispatchers.IO).
                             scope.launch {
                                 if (enabled && isDebugBuild) {
                                     showDebugWarningDialog = true
@@ -269,6 +291,11 @@ internal fun LogsTabContent(
                     }
                 }
 
+                // PERF SMELL: recomputed every recomposition on the main thread.
+                // getTotalLogSize() stats every file in the log dir; getCurrentLogFileSize()
+                // contends with the 1 Hz flush executor's writerLock. Fix: hoist behind a
+                // StateFlow updated on a background dispatcher, or cache via remember with
+                // an explicit invalidation key.
                 val totalSize = fileLogManager.getTotalLogSize()
                 val currentFileSize = fileLogManager.getCurrentLogFileSize()
 
@@ -335,10 +362,17 @@ internal fun LogsTabContent(
                                         return@LogFileItem
                                     }
 
+                                    // SOFT-GATE RACE: `isExporting = true` is set synchronously,
+                                    // but the IconButton's `enabled` flag only flips after
+                                    // recomposition. A second fast tap in that window can
+                                    // stomp `pendingExportFile`. Fix: gate the SAF launcher
+                                    // itself (e.g. a MutexOrAtomicRef) instead of the button.
                                     pendingExportFile = file
                                     isExporting = true
 
-                                    // Flush pending writes off main thread, then launch picker
+                                    // flush() is synchronous — wrap in Dispatchers.IO to keep
+                                    // main responsive. Drains the queue before SAF handoff so
+                                    // the exported file reflects latest writes.
                                     scope.launch {
                                         withContext(Dispatchers.IO) {
                                             fileLogManager.flush()
@@ -400,6 +434,9 @@ internal fun LogsTabContent(
             confirmButton = {
                 Button(
                     onClick = {
+                        // HAZARD: same main-thread I/O as the Switch handler above —
+                        // enable() + getLogFiles() run synchronously on the UI dispatcher.
+                        // Fix: wrap in withContext(Dispatchers.IO).
                         scope.launch {
                             loggingPreferences.setLoggingEnabled(true)
                             fileLogManager.enable()
@@ -578,6 +615,10 @@ internal fun LogsTabContent(
                             Text("Cancel")
                         }
                         Button(
+                            // HAZARD: deleteLogFile() and getLogFiles() run directly on the
+                            // main thread (no scope.launch wrapper). File.delete() + dir
+                            // listing is synchronous disk I/O. Fix: wrap in
+                            // scope.launch { withContext(Dispatchers.IO) { ... } }.
                             onClick = {
                                 fileLogManager.deleteLogFile(file)
                                 logFiles = fileLogManager.getLogFiles()
@@ -605,6 +646,16 @@ internal fun LogsTabContent(
     }
 }
 
+/**
+ * Modal dialog presenting available [LogPreset]s as a 2-column chip grid.
+ *
+ * HAZARD: the column lists below are hand-maintained against the 10 current
+ * LogPreset values. Adding an 11th preset will silently drop it from the UI —
+ * there is no compile-time exhaustiveness check (a `when` over LogPreset would
+ * fail; two hardcoded lists will not). Fix: drive the grid from
+ * `LogPreset.entries.chunked(5)` (or chunked(ceil(n/2))) so new presets are
+ * picked up automatically.
+ */
 @Composable
 private fun LogLevelSelectorDialog(
     currentLevel: LogPreset,
@@ -613,6 +664,7 @@ private fun LogLevelSelectorDialog(
 ) {
     val colorScheme = MaterialTheme.colorScheme
 
+    // WARNING: hand-enumerated — must be kept in sync with LogPreset. See KDoc above.
     val leftColumn =
         listOf(
             LogPreset.SILENT,
@@ -708,6 +760,10 @@ private fun LogLevelSelectorDialog(
     }
 }
 
+/**
+ * Single selectable chip inside [LogLevelSelectorDialog].
+ * Displays the preset's display name, description, and color-coded selection state.
+ */
 @Composable
 private fun LogPresetChip(
     preset: LogPreset,
@@ -781,7 +837,9 @@ private fun LogPresetChip(
 }
 
 /**
- * Material 3 Logging Control Card container
+ * Material 3 card container used as a section wrapper inside the Logs tab.
+ * Renders an icon + title header followed by caller-provided [content] in a
+ * padded column. Used for both the "File Logging" and "Log Files" sections.
  */
 @Composable
 private fun LoggingControlCard(
@@ -829,6 +887,11 @@ private fun LoggingControlCard(
     }
 }
 
+/**
+ * Single row in the Log Files list. Shows filename, size + last-modified timestamp,
+ * and export/delete icon buttons. `isExportEnabled` is the soft gate driven by
+ * the parent's `isExporting` flag — see race note at the call site.
+ */
 @Composable
 private fun LogFileItem(
     file: File,
@@ -904,6 +967,10 @@ private fun LogFileItem(
     }
 }
 
+/**
+ * Label/value row used in the Status panel (logging state, file count, sizes).
+ * Spaces label and value to opposite ends of the available width.
+ */
 @Composable
 private fun FileLoggingStatusRow(
     label: String,
@@ -935,6 +1002,7 @@ private fun FileLoggingStatusRow(
 
 // ==================== UTILITY FUNCTIONS ====================
 
+/** Human-readable size with unit auto-selected (B / KB / MB). Preferred formatter. */
 private fun formatBytes(bytes: Long): String =
     when {
         bytes >= 1024 * 1024 -> String.format(Locale.US, "%.2f MB", bytes / (1024.0 * 1024.0))
@@ -942,6 +1010,12 @@ private fun formatBytes(bytes: Long): String =
         else -> "$bytes B"
     }
 
+/**
+ * Legacy: always renders in KB regardless of magnitude (e.g. a 5 MB file reads as
+ * "5120.0 KB"). Kept only to avoid a UX diff at call sites L428 and L875.
+ *
+ * TODO(cleanup): consolidate on [formatBytes] and delete this function.
+ */
 private fun formatFileSize(bytes: Long): String {
     val kb = bytes / 1024.0
     return "${String.format(Locale.US, "%.1f", kb)} KB"

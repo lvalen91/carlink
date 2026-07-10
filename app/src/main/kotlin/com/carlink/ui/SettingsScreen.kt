@@ -30,6 +30,7 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.DisplaySettings
 import androidx.compose.material.icons.filled.Fullscreen
 import androidx.compose.material.icons.filled.FullscreenExit
@@ -122,6 +123,9 @@ fun SettingsScreen(
                 val packageInfo = context.packageManager.getPackageInfo(context.packageName, 0)
                 "${packageInfo.versionName}+${packageInfo.longVersionCode}"
             } catch (e: PackageManager.NameNotFoundException) {
+                // NOTE: inconsistent log tag — all other logWarn/logInfo sites in this file pass
+                // tag = "UI". This call omits it and falls back to the default tag. Flagged for
+                // a future fix; left as-is to keep this pass comment-only.
                 logWarn("[SettingsScreen] Failed to get package info: ${e.message}")
                 "Unknown"
             }
@@ -148,6 +152,9 @@ fun SettingsScreen(
                 ) {
                     FilledTonalIconButton(
                         onClick = {
+                            // KEYBOARD_TAP is the project convention for settings-surface clicks
+                            // (back / tab / close). Kept uniform across this screen; alternatives
+                            // like CONTEXT_CLICK or VIRTUAL_KEY were not chosen.
                             view.performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP)
                             onNavigateBack()
                         },
@@ -172,6 +179,8 @@ fun SettingsScreen(
                         NavigationRailItem(
                             selected = selectedTab == tab,
                             onClick = {
+                                // KEYBOARD_TAP chosen for tab switches to match the project's
+                                // settings-surface convention (see back button above).
                                 view.performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP)
                                 selectedTab = tab
                             },
@@ -188,13 +197,65 @@ fun SettingsScreen(
                     Spacer(modifier = Modifier.weight(1f))
                 }
 
-                // App version at bottom - always visible after NavigationRail
-                Row(
-                    modifier = Modifier.padding(20.dp),
-                    verticalAlignment = Alignment.CenterVertically,
+                // Close app button + version at bottom
+                Column(
+                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
+                    horizontalAlignment = Alignment.CenterHorizontally,
                 ) {
+                    var showCloseConfirm by remember { mutableStateOf(false) }
+
+                    FilledTonalIconButton(
+                        onClick = {
+                            // KEYBOARD_TAP: see settings-surface haptic convention note above.
+                            view.performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP)
+                            showCloseConfirm = true
+                        },
+                        modifier = Modifier.size(AutomotiveDimens.ButtonMinHeight),
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.Close,
+                            contentDescription = "Close App",
+                            modifier = Modifier.size(AutomotiveDimens.IconSize),
+                            tint = colorScheme.error,
+                        )
+                    }
+
+                    if (showCloseConfirm) {
+                        AlertDialog(
+                            onDismissRequest = { showCloseConfirm = false },
+                            title = { Text("Close App?") },
+                            text = { Text("This will stop all connections and close the app.") },
+                            confirmButton = {
+                                TextButton(
+                                    onClick = {
+                                        logWarn("[UI_ACTION] Close App confirmed", tag = "UI")
+                                        // Graceful teardown: sends 0x0F+0x15 to adapter (see
+                                        // AdapterDriver.kt:309-311 + MessageSerializer.kt:297-301).
+                                        carlinkManager.stop()
+                                        // HAZARD: silent no-op if LocalContext.current is not an
+                                        // Activity (e.g. wrapped ContextWrapper). In that case
+                                        // stop() still runs but the app window is not closed.
+                                        // SettingsScreen is always hosted by MainActivity today, so
+                                        // this is a known-safe cast; keep in mind if the hosting
+                                        // model changes.
+                                        (context as? android.app.Activity)?.finishAffinity()
+                                    },
+                                ) {
+                                    Text("Close", color = colorScheme.error)
+                                }
+                            },
+                            dismissButton = {
+                                TextButton(onClick = { showCloseConfirm = false }) {
+                                    Text("Cancel")
+                                }
+                            },
+                        )
+                    }
+
+                    Spacer(modifier = Modifier.height(8.dp))
+
                     Text(
-                        text = "Version: ",
+                        text = "Version:",
                         style = MaterialTheme.typography.bodySmall,
                         color = colorScheme.onSurfaceVariant,
                     )
@@ -226,11 +287,31 @@ fun SettingsScreen(
     }
 }
 
+/**
+ * Visual severity class for [ControlButton]. Drives container/content colors only — does not
+ * affect behavior or confirmation flow (callers still own any "are you sure?" dialogs).
+ *
+ * NOTE: the `when(severity)` blocks in [ControlButton] (L631+) are intentionally non-exhaustive
+ * on a semantic level but exhaustive on this enum (only two values). Adding a new severity
+ * requires extending both `when` arms.
+ */
 private enum class ButtonSeverity {
     WARNING, // Warning action (tertiary/amber)
     DESTRUCTIVE, // Destructive action (error/red)
 }
 
+/**
+ * Control tab content: adapter configuration + app control (display mode, reset buttons,
+ * reset-connection). Hosts several dialogs (reset-cluster confirm, cluster-nav-off info,
+ * adapter-config, display-mode) driven by local state.
+ *
+ * KNOWN LIMITATIONS (documented at the relevant lines below):
+ *   1. `clusterNavigationEnabled` is a one-shot snapshot (L300) — can go stale vs. the
+ *      adapter-config dialog's toggle.
+ *   2. `isProcessing` is a single shared flag across 4 actions but only Reset Connection flips
+ *      it — the other 3 buttons gate on it but never raise it themselves (UX: spinner appears
+ *      on all of them when Reset Connection runs; no per-action progress indicator).
+ */
 @Composable
 private fun ControlTabContent(
     carlinkManager: CarlinkManager,
@@ -240,24 +321,50 @@ private fun ControlTabContent(
     val scope = rememberCoroutineScope()
     val context = LocalContext.current
     val colorScheme = MaterialTheme.colorScheme
+    // KNOWN UX LIMITATION: `isProcessing` is shared across Disconnect Phone, Disconnect Adapter,
+    // Reset Decoder, Reset Cluster, and Reset Connection — but only the Reset Connection
+    // onClick actually sets it true (L456/461 below). The other four buttons read it to gate
+    // `enabled` and to swap in the spinner, so when Reset Connection is running they all show
+    // the spinner and go disabled. They never show their own progress. Fix would be per-action
+    // processing flags (e.g. `isResettingConnection`, `isDisconnectingPhone`, …), but that is
+    // deliberately out of scope for this pass.
     var isProcessing by remember { mutableStateOf(false) }
     var showResetClusterDialog by remember { mutableStateOf(false) }
     var showClusterNavOffDialog by remember { mutableStateOf(false) }
     val isDeviceConnected = carlinkManager.state != CarlinkManager.State.DISCONNECTED
 
     val displayModePreference = remember { DisplayModePreference.getInstance(context) }
+    // Initial value is the platform-aware default (gminfo37 + AAOS emulator →
+    // FULLSCREEN_IMMERSIVE; else SYSTEM_UI_VISIBLE). Flow will overwrite with any
+    // persisted user choice on the first emission.
+    val displayModeInitial = remember { DisplayMode.platformDefault(context) }
     val currentDisplayMode by displayModePreference.displayModeFlow.collectAsStateWithLifecycle(
-        initialValue = DisplayMode.SYSTEM_UI_VISIBLE,
+        initialValue = displayModeInitial,
     )
     var showDisplayModeDialog by remember { mutableStateOf(false) }
 
     val adapterConfigPreference = remember { AdapterConfigPreference.getInstance(context) }
     var showAdapterConfigDialog by remember { mutableStateOf(false) }
+    // KNOWN STALENESS WINDOW: `remember { … }` with no key captures the value once for the
+    // lifetime of this composition. If the user enables/disables Cluster Navigation in the
+    // AdapterConfigurationDialog (L529-540) while the Control tab is still composed, this
+    // snapshot does not refresh — so the Reset Cluster button at L436 may branch on a stale
+    // value and incorrectly show the "Cluster Navigation Off" dialog after a just-enabled
+    // toggle (or, conversely, proceed to the reset-confirm after a just-disabled toggle).
+    //
+    // FIX: switch to a reactive flow, mirroring `displayModeFlow` on L293:
+    //   val clusterNavigationEnabled by adapterConfigPreference.clusterNavigationFlow
+    //       .collectAsStateWithLifecycle(initialValue = <default>)
+    // (See AdapterConfigPreference.kt:627 for the flow declaration.) Left unchanged in this
+    // pass to keep scope to comments only.
     val clusterNavigationEnabled = remember { adapterConfigPreference.getClusterNavigationSync() }
 
     val windowInfo = LocalWindowInfo.current
     val density = LocalDensity.current
     val containerWidthDp = with(density) { windowInfo.containerSize.width.toDp() }
+    // Sized for 2400px-wide gminfo37 (confirmed 2026-04-20): 75% × 2400 = 1800 → clamped by
+    // 1200.dp ceiling. 400.dp floor only matters for narrow splits not seen on gminfo37.
+    // Retune if a device with container <533dp or >1600dp appears.
     val maxContentWidth = (containerWidthDp * 0.75f).coerceIn(400.dp, 1200.dp)
 
     Box(
@@ -521,7 +628,12 @@ private fun ControlTabContent(
 }
 
 /**
- * Material 3 Control Card container
+ * Material 3 elevated card used as a titled container for groups of control actions
+ * (e.g. "Adapter Configuration", "App Control").
+ *
+ * Renders a leading [icon] + [title] header row, a fixed-height spacer, and then the caller's
+ * [content] in a [ColumnScope]. Callers are responsible for laying out their own buttons and
+ * inter-button spacing inside [content]. Does not manage any state of its own.
  */
 @Composable
 private fun ControlCard(
@@ -570,7 +682,19 @@ private fun ControlCard(
 }
 
 /**
- * Material 3 Control Button with animated state transitions
+ * Material 3 action button used inside a [ControlCard]. Swaps its leading icon for a
+ * [LoadingSpinner] while [isProcessing] is true, with a fade+scale transition.
+ *
+ * Colors are picked from [severity]: DESTRUCTIVE uses error container (solid [Button]);
+ * WARNING uses tertiary container ([FilledTonalButton]). The button fills the available
+ * width and uses [AutomotiveDimens.ButtonMinHeight] to stay within the automotive
+ * touch-target spec.
+ *
+ * Caller contract:
+ *   - [enabled] should already factor in any app-level gating (connection state, etc.);
+ *     see the redundancy note at the `enabled = enabled && !isProcessing` call sites.
+ *   - [isProcessing] controls only the visual swap — this composable does not perform
+ *     the work or manage the flag's lifecycle.
  */
 @Composable
 private fun ControlButton(
@@ -588,6 +712,9 @@ private fun ControlButton(
         ButtonSeverity.DESTRUCTIVE -> {
             Button(
                 onClick = onClick,
+                // Redundant-but-intentional: every call site already passes
+                // `enabled = X && !isProcessing`. Kept as belt-and-suspenders so the
+                // composable is safe against future callers that forget the gate.
                 enabled = enabled && !isProcessing,
                 modifier =
                     modifier
@@ -633,6 +760,7 @@ private fun ControlButton(
         ButtonSeverity.WARNING -> {
             FilledTonalButton(
                 onClick = onClick,
+                // Redundant-but-intentional: see note on the DESTRUCTIVE branch above.
                 enabled = enabled && !isProcessing,
                 modifier =
                     modifier

@@ -4,13 +4,17 @@ package com.carlink.audio
  * Lock-free ring buffer for audio jitter compensation.
  *
  * PURPOSE:
- * Absorbs irregular packet arrival from USB by maintaining a buffer reserve.
+ * Decouples producer from consumer to absorb irregular packet arrival.
  * USB capture analysis shows P99 jitter of ~7ms with max 30ms, so buffer
  * provides significant safety margin for consistent playback.
  *
  * THREAD SAFETY:
- * Designed for single-writer (USB thread), single-reader (audio playback thread).
- * Uses volatile variables for lock-free synchronization.
+ * Designed as single-producer / single-consumer (SPSC). Used in two role
+ * configurations:
+ * - Playback (DualStreamAudioManager): producer = USB ingest, consumer = AudioTrack writer.
+ * - Microphone (MicrophoneCaptureManager): producer = AudioRecord reader, consumer = USB streamer.
+ * Synchronization is via volatile cursors only. See [write] for a documented
+ * SPSC violation in the overflow path.
  *
  * SAMPLE ALIGNMENT:
  * When discarding oldest data during overflow, bytes are aligned to PCM frame
@@ -22,7 +26,10 @@ package com.carlink.audio
  * - Navigation stream: 100-150ms recommended (lower latency for prompts)
  *
  * @param capacityMs Buffer capacity in milliseconds
- * @param sampleRate Audio sample rate (e.g., 48000)
+ * @param sampleRate Audio sample rate (e.g., 48000). [bytesPerMs] is computed via
+ *   integer division — exact for 48000/16000/8000 Hz, but loses sub-byte precision
+ *   for 44100 Hz (~0.2% under-allocation). The app currently pins the adapter to
+ *   48kHz at init, so this is not exercised today.
  * @param channels Number of audio channels (1=mono, 2=stereo)
  */
 class AudioRingBuffer(
@@ -58,7 +65,13 @@ class AudioRingBuffer(
 
     /**
      * Write data to ring buffer (non-blocking, overwrite-oldest when full).
-     * @return Bytes written (always equals length - oldest data discarded if full)
+     *
+     * @return Bytes written. Equals [length] in the normal case (oldest data is
+     *   discarded as needed to make room). If [length] exceeds [capacity] - 1,
+     *   the buffer cannot hold the whole chunk even after a full discard, and the
+     *   return value is capped at [capacity] - 1 (tail of the chunk is dropped).
+     *   Realistic chunks (~30ms) are well under buffer capacity (≥100ms) so this
+     *   edge does not occur in practice.
      */
     fun write(
         data: ByteArray,
@@ -67,7 +80,7 @@ class AudioRingBuffer(
     ): Int {
         var available = availableForWrite()
 
-        // Overwrite-oldest: discard oldest data when full (Session 4 overflow=568 fix)
+        // Overwrite-oldest: discard oldest data when full (prevents buffer-full stalls)
         // Align discard to PCM frame boundary to prevent audio corruption
         // (channel phase shift, clicking/popping artifacts)
         // NOTE: Advancing readPos from the writer violates strict SPSC — if the reader
@@ -143,9 +156,20 @@ class AudioRingBuffer(
 
     fun fillLevel(): Float = availableForRead().toFloat() / capacity
 
+    // bytesPerMs > 0 guard is defensive — unreachable for any realistic audio
+    // config (would require sampleRate * channels * 2 < 1000).
     fun fillLevelMs(): Int = if (bytesPerMs > 0) availableForRead() / bytesPerMs else 0
 
-    /** Clear buffer. Only call when both threads are stopped. */
+    /**
+     * Reset both cursors to 0.
+     *
+     * Best-effort: writes to [writePos] and [readPos] are not atomic relative to
+     * a concurrent [write] or [read], so a concurrent caller may briefly observe
+     * a stale [availableForRead] before stabilizing. Callers in
+     * DualStreamAudioManager invoke this from active paths (slot teardown,
+     * navigation re-plan) accepting that brief inconsistency rather than fully
+     * stopping the consumer thread.
+     */
     fun clear() {
         writePos = 0
         readPos = 0

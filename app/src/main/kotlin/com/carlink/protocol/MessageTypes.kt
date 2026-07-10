@@ -13,17 +13,17 @@ const val PROTOCOL_MAGIC: Int = 0x55aa55aa
 const val HEADER_SIZE: Int = 16
 
 /**
- * USB Communication Encryption Key for SESSION_TOKEN (0xA3) decryption.
+ * Decryption key for the SESSION_TOKEN (0xA3) "encrypted blob" the firmware ships
+ * during session establishment. The blob is AES-128-CBC-encrypted Base64 holding
+ * phone + box telemetry (model, OS, adapter UUID, firmware version, connection
+ * statistics). This key decodes it.
  *
- * The SESSION_TOKEN message contains Base64-encoded, AES-128-CBC encrypted
- * telemetry data sent from the adapter during session establishment.
- *
- * Decryption details:
+ * Decryption recipe:
  * - Algorithm: AES-128-CBC
  * - Key: "W2EC1X1NbZ58TXtn" (16 bytes, ASCII)
- * - IV: First 16 bytes of Base64-decoded payload
- * - Ciphertext: Remaining bytes after IV
- * - Content: JSON with phone/box telemetry
+ * - IV:  first 16 bytes of the Base64-decoded payload
+ * - Ciphertext: remaining bytes after the IV
+ * - Output: JSON blob (example structure below)
  *
  * Decrypted JSON structure:
  * ```json
@@ -46,6 +46,10 @@ const val HEADER_SIZE: Int = 16
  *   }
  * }
  * ```
+ *
+ * Current wire-up: [SessionTokenMessage] stores only the encrypted payload size;
+ * no in-tree caller decrypts yet. When the decrypt path is added, this constant
+ * is the key to use.
  *
  * Reference: documents/reference/firmware/RE_Documention/02_Protocol_Reference/usb_protocol.md
  */
@@ -128,6 +132,10 @@ enum class CommandMapping(
     KNOB_LEFT(111), // CtrlKnobLeft - Knob counter-clockwise
     KNOB_RIGHT(112), // CtrlKnobRight - Knob clockwise
     KNOB_UP(113), // CtrlKnobUp - Knob tilt up
+    // Naming collision note: DOWN here is knob-tilt-down (114); the D-pad down is
+    // DOWN_BUTTON (103). The identifier DOWN was the original D-pad name and got
+    // repurposed when the D-pad was renumbered 100-106; it was NOT renamed because
+    // persisted logs / prior call sites still referenced DOWN.
     DOWN(114), // CtrlKnobDown - Knob tilt down (legacy name kept for compatibility)
 
     // === Media Control Commands (200-205) - All H→A→P ===
@@ -195,6 +203,11 @@ enum class CommandMapping(
     companion object {
         private val idMap = entries.associateBy { it.id }
 
+        // fromId returns a sentinel (INVALID) rather than throwing. This is a
+        // protocol-parsing convention shared across every enum in this file: unknown
+        // on-wire values surface as sentinels so the parser can log them and keep
+        // running rather than crashing the USB read thread. Do not "fix" one fromId
+        // to throw without updating the rest.
         fun fromId(id: Int): CommandMapping = idMap[id] ?: INVALID
     }
 }
@@ -235,7 +248,7 @@ enum class MessageType(
     BLUETOOTH_PAIRED_LIST(0x12),
     MANUFACTURER_INFO(0x14),
     SOFTWARE_VERSION(0xCC),
-    STATUS_VALUE(0xBB), // Status/config value
+    STATUS_VALUE(0xBB), // A→H: Status/config value. H→A: UpdateState (macOS: updateState) — not used here. See dual-direction block below.
 
     // Configuration
     BOX_SETTINGS(0x19),
@@ -271,13 +284,33 @@ enum class MessageType(
     REMOTE_CX_CY(0x1E), // Display resolution broadcast from adapter
     EXTENDED_MFG_INFO(0xA1), // Extended OEM/manufacturer data
     FACTORY_SETTING(0x77), // Factory setting idle notification (A→H: empty) / factory reset (H→A: 4B)
-    ADAPTER_IDLE(0x88), // Adapter idle state notification
-    HEARTBEAT_ECHO(0xCD), // Heartbeat acknowledgment from adapter (every 2s)
-    ERROR_REPORT(0xCE), // Error report from adapter
-    REMOTE_DISPLAY(0xF0), // Remote display parameters / CMD_ENABLE_CRYPT
-    UPDATE_PROGRESS(0xFD), // Firmware update progress
+    // Dual-direction wire IDs. These enum names reflect the INBOUND (adapter→host) meaning,
+    // which is how the Android parser routes them. Firmware reuses the same IDs with
+    // different outbound semantics; OUTBOUND senders (MessageSerializer.serializeRebootAdapter,
+    // serializeUsbReset) piggy-back on the inbound enum entry for wire-type encoding —
+    // the name does NOT reflect what's being sent. Cross-referenced against macOS
+    // carlink_macOS/Protocol/MessageTypes.swift which models each direction separately.
+    //
+    //   0x88  A→H: AdapterIdle state notification           | H→A: DebugTest   (macOS: debugTest)
+    //   0xBB  A→H: Status/config value                      | H→A: UpdateState (macOS: updateState) — not used by Android outbound
+    //   0xCD  A→H: Heartbeat ack (every 2s)                 | H→A: Reboot adapter — USED OUTBOUND via serializeRebootAdapter (MessageSerializer.kt:291)
+    //   0xCE  A→H: Error report                             | H→A: USB reset   — USED OUTBOUND via serializeUsbReset     (MessageSerializer.kt:296)
+    //   0xF0  A→H: Remote display parameters                | H→A: Enable crypt (CMD_ENABLE_CRYPT)
+    //   0xFD  A→H: Firmware update progress                 | H→A: Display ready (macOS: displayReady) — not used by Android outbound
+    //
+    // When adding an outbound-only message with one of these IDs, prefer a named helper in
+    // MessageSerializer (like serializeRebootAdapter) over a direct enum reference, so the
+    // call-site documents intent.
+    ADAPTER_IDLE(0x88),     // A→H name; H→A = debugTest (not used here)
+    HEARTBEAT_ECHO(0xCD),   // A→H name; H→A = rebootAdapter (MessageSerializer.serializeRebootAdapter)
+    ERROR_REPORT(0xCE),     // A→H name; H→A = resetUSB     (MessageSerializer.serializeUsbReset)
+    REMOTE_DISPLAY(0xF0),   // A→H name; H→A = enableCrypt (not used here)
+    UPDATE_PROGRESS(0xFD),  // A→H name; H→A = displayReady (not used here)
     DEBUG_TRACE(0xFF), // Debug/trace data from adapter
 
+    // Unrecognised on-wire type ID surfaces here; MessageParser routes these into
+    // UnknownMessage, which CarlinkManager logs under Logger.Tags.PROTO_UNKNOWN so
+    // they always reach file logs regardless of preset.
     UNKNOWN(-1),
     ;
 
@@ -318,6 +351,7 @@ enum class AudioCommand(
     AUDIO_ALERT_START(12),
     AUDIO_ALERT_STOP(13),
     AUDIO_INCOMING_CALL_INIT(14),
+    AUDIO_TBT_START(15),
     AUDIO_NAVI_COMPLETE(16),
     UNKNOWN(-1),
     ;
@@ -427,6 +461,7 @@ enum class MediaType(
     DATA(1),
     ALBUM_COVER_AA(2), // Android Auto album art — PNG at offset +4 (subtype 2)
     ALBUM_COVER(3),    // CarPlay album art — JPEG at offset +4 (subtype 3)
+    CALL_STATUS(100),  // iAP2 CallStateEngine — JSON: CallStatus/CallDirection/CallID/CallName/CallNumber
     NAVI_JSON(200),
     NAVI_IMAGE(201),
     UNKNOWN(-1),
@@ -441,6 +476,11 @@ enum class MediaType(
 
 /**
  * Multi-touch action types.
+ *
+ * The `.id` values (0/1/2) are the CarPlay multi-touch (0x17) codes. Android Auto
+ * single-touch (0x05) uses a DIFFERENT code space (14=DOWN, 15=MOVE, 16=UP);
+ * [MessageSerializer.serializeSingleTouch] maps this enum into those codes at
+ * serialization time. Don't assume `.id` is the universal wire value.
  */
 enum class MultiTouchAction(
     val id: Int,
@@ -459,14 +499,18 @@ enum class MultiTouchAction(
 }
 
 /**
- * Known Carlinkit USB device identifiers.
+ * Known Carlinkit USB device identifiers (vendorId, productId).
+ *
+ * Sourced from USB captures and observed CPC200-CCPA variants. Consumed
+ * by UsbDeviceWrapper.isKnownDevice at attach time; only these VID/PID pairs are
+ * accepted. Add new pairs here if a newer adapter SKU ships with a different ID.
  */
 object KnownDevices {
     val DEVICES =
         listOf(
-            Pair(0x1314, 0x1520),
-            Pair(0x1314, 0x1521),
-            Pair(0x08E4, 0x01C0), // Alternate
+            Pair(0x1314, 0x1520),        // CPC200-CCPA primary
+            Pair(0x1314, 0x1521),        // CPC200-CCPA variant
+            Pair(0x08E4, 0x01C0),        // Alternate SKU observed in captures
         )
 
     fun isKnownDevice(
@@ -520,11 +564,33 @@ data class AdapterConfig(
     val viewAreaData: ByteArray? = null,
     /** SafeArea binary data (20B) for adapter — always sent */
     val safeAreaData: ByteArray? = null,
+    /** Bundled aa_gps_fix.sh content (NMEA divisor in-memory patcher). Pushed to
+     *  /tmp/aa_gps_fix.sh on every init (full + minimal) because adapter power-cycle
+     *  between sessions wipes /tmp. Placement only — invocation is a separate step. */
+    val gpsFixScriptData: ByteArray? = null,
+    /** Bundled patched ARMiPhoneIAP2 (NaviJSON _iap2 + _iap2m roundabout recovery).
+     *  Pushed to /tmp/bin/ARMiPhoneIAP2 on every init to preempt phone_link_deamon's
+     *  factory-copy step, so the next CarPlay session execs our patched binary.
+     *  Atomic rename means a session in progress is unaffected (running iAP2 keeps
+     *  the old inode via mmap; next respawn picks up the new file). */
+    val patchedIap2BinaryData: ByteArray? = null,
 ) {
     companion object {
         val DEFAULT = AdapterConfig()
     }
 
+    // equals/hashCode are PARTIAL by design: they cover only the fields whose
+    // change triggers a display-mode-level re-init (resolution, DPI, format, box
+    // name, icon assets, view/safe area). Fields that affect only BoxSettings-level
+    // config (audioTransferMode, sampleRate, wifiType, micType, callQuality,
+    // oemIconVisible, androidWorkMode, handDriveMode, gpsForwarding, mediaDelay,
+    // iBoxVersion, packetMax, phoneWorkMode, userSelectedResolution) are tracked
+    // separately via AdapterConfigPreference's pendingChanges set and MINIMAL_PLUS_CHANGES
+    // init mode — they don't need to invalidate AdapterConfig equality to propagate.
+    //
+    // Consequence: two AdapterConfigs differing only in those config fields will be
+    // equal() and produce the same hashCode(). Do NOT use AdapterConfig as a HashMap
+    // key or HashSet member expecting full-field distinction.
     override fun equals(other: Any?): Boolean {
         if (this === other) return true
         if (javaClass != other?.javaClass) return false

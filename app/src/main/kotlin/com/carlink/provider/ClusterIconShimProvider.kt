@@ -10,6 +10,7 @@ import android.net.Uri
 import android.os.ParcelFileDescriptor
 import androidx.core.graphics.scale
 import androidx.core.net.toUri
+import com.carlink.BuildConfig
 import com.carlink.logging.Logger
 import java.io.ByteArrayOutputStream
 import java.util.Collections
@@ -28,15 +29,34 @@ import java.util.LinkedHashMap
  * - insert(): cache PNG bytes keyed by iconId
  * - query(): return contentUri + aspectRatio metadata
  * - openFile(): serve cached PNG via pipe (with optional scaling)
+ *
+ * Security posture: [AndroidManifest.xml] declares this provider exported=true with
+ * grantUriPermissions=true because Templates Host runs in a different UID. The
+ * authority string is not secret, but cached content is limited to maneuver-icon
+ * PNGs (adapter-forwarded) and external callers can only read what Templates Host
+ * has already inserted. delete/update are no-ops.
+ *
+ * Process scope: ContentProvider is a per-process singleton, so [iconCache] is
+ * effectively process-global. Cache resets on app process death; Templates Host
+ * then re-inserts on next icon use.
  */
 class ClusterIconShimProvider : ContentProvider() {
     companion object {
         private const val TAG = Logger.Tags.ICON_SHIM
-        private const val AUTHORITY =
-            "cc.funkemunky.carlink.ClusterIconContentProvider"
+        // Per-flavor (BuildConfig.CLUSTER_ICON_AUTHORITY, see app/build.gradle.kts).
+        // Must mirror the manifest's android:authorities so URI building stays
+        // consistent with the registered provider authority for this variant.
+        private val AUTHORITY: String = BuildConfig.CLUSTER_ICON_AUTHORITY
+        // Bounded to cap memory: maneuver-icon diversity per trip is small, so 20
+        // entries is enough to cover a full drive without re-encoding repeats.
+        // At ~10-40 KiB per PNG this caps peak footprint at ~200-800 KiB.
         private const val MAX_CACHE_SIZE = 20
     }
 
+    // access-order LinkedHashMap (third arg=true) wrapped in synchronizedMap: reads AND
+    // writes acquire the intrinsic lock, and the eviction callback runs UNDER that lock.
+    // Don't iterate iconCache directly elsewhere without wrapping in synchronized(iconCache);
+    // and keep the Logger.d in removeEldestEntry cheap — it runs while the lock is held.
     private val iconCache: MutableMap<String, ByteArray> =
         Collections.synchronizedMap(
             object : LinkedHashMap<String, ByteArray>(MAX_CACHE_SIZE, 0.75f, true) {
@@ -55,6 +75,9 @@ class ClusterIconShimProvider : ContentProvider() {
         return true
     }
 
+    // CONTRACT: insert() must NEVER return null. A null return triggers Templates Host's
+    // internal `skipIcons = true` latch for the session, disabling all cluster icons
+    // until the process restarts. Even error paths return a non-null sentinel URI.
     override fun insert(
         uri: Uri,
         values: ContentValues?,
@@ -69,7 +92,6 @@ class ClusterIconShimProvider : ContentProvider() {
 
         if (iconId == null || data == null) {
             Logger.w("insert() missing iconId or data (iconId=$iconId, dataSize=${data?.size})", tag = TAG)
-            // Return a non-null URI to prevent skipIcons = true
             return "content://$AUTHORITY/img/unknown".toUri()
         }
 
@@ -153,6 +175,9 @@ class ClusterIconShimProvider : ContentProvider() {
         val readEnd = pipe[0]
         val writeEnd = pipe[1]
 
+        // One thread per openFile call (not pooled). Simpler than ThreadPoolExecutor
+        // lifecycle for a provider whose caller cadence is a handful per minute during
+        // nav. Swap for a pooled executor if this becomes a hot path.
         Thread({
             try {
                 ParcelFileDescriptor.AutoCloseOutputStream(writeEnd).use { os ->
@@ -180,11 +205,16 @@ class ClusterIconShimProvider : ContentProvider() {
             original.recycle()
             out.toByteArray()
         } catch (e: Exception) {
+            // Silent fallback to unscaled original: decode failure or scale OOM on
+            // anomalous PNG bytes. Logged under ICON_SHIM rather than PROTO_UNKNOWN;
+            // upgrade the tag if malformed adapter PNGs become a forensics target.
             Logger.w("scaleIcon() failed (${w}x$h): ${e.message} — using original", tag = TAG)
             pngData
         }
     }
 
+    // No-ops: Templates Host never calls delete/update on this authority. Returning 0
+    // is the ContentProvider convention for "unsupported / no rows affected".
     override fun delete(
         uri: Uri,
         selection: String?,
@@ -198,5 +228,8 @@ class ClusterIconShimProvider : ContentProvider() {
         selectionArgs: Array<out String>?,
     ): Int = 0
 
+    // Cached content is always PNG: adapter NAVI_IMAGE (subtype 201) ships PNG bytes
+    // and scaleIcon re-encodes as PNG. Change this if a future code path ever caches
+    // a different image format under the same authority.
     override fun getType(uri: Uri): String = "image/png"
 }

@@ -21,6 +21,7 @@ import com.carlink.logging.logWarn
 import com.carlink.navigation.NavigationState
 import com.carlink.navigation.NavigationStateManager
 import com.carlink.navigation.TripBuilder
+import java.util.concurrent.atomic.AtomicReference
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -41,20 +42,30 @@ import kotlinx.coroutines.launch
  * this session would show static text instead of navigation data. See [CarlinkClusterSession]
  * for the standard Car App Library approach needed on those platforms.
  *
- * Primary/secondary multiplexing handles Templates Host creating multiple sessions:
- * - AAOS emulator: creates DISPLAY_TYPE_MAIN + DISPLAY_TYPE_CLUSTER (two sessions)
- * - GM AAOS: creates only DISPLAY_TYPE_MAIN (one session)
- * Only the first (primary) owns NavigationManager. Subsequent sessions are passive.
+ * Primary/secondary multiplexing is defensive against dual-session creation observed
+ * in the AAOS emulator (DISPLAY_TYPE_MAIN + DISPLAY_TYPE_CLUSTER; not documented by
+ * androidx). GM AAOS behavior is STILL UNVERIFIED at runtime — 2026-04-20 POTATO
+ * captures show this session never instantiated on gminfo37 (cluster_navigation_enabled
+ * preference off by default). GM's cluster is actually driven by VMSClusterService +
+ * NavigationClusterService + OnStarTurnByTurnManager (logcat 063729_cluster.txt:659,
+ * 703-705) — not the androidx CarAppService binding chain. Primary-claim logic: first
+ * session obtains NavigationManager and drives the relay; subsequent sessions return
+ * inert RelayScreen.
  */
 class ClusterMainSession : Session() {
     private var navigationManager: NavigationManager? = null
     private var scope: CoroutineScope? = null
     private var isNavigating = false
+
+    // Set once in onCreateScreen; never mutated thereafter. Effectively a val for the
+    // session's lifetime — the onDestroy observer reads it to decide cleanup scope.
     private var isPrimary = false
 
     /** Only call navigationEnded() after we've seen at least one active state transition to idle.
      *  Without this, the initial idle state from NavigationStateManager kills the binding chain
-     *  before Templates Host can create the cluster session (displayType=1). */
+     *  before Templates Host can create the cluster session (displayType=1).
+     *  Never reset to false — acts as a one-way latch for the session's lifetime. If the session
+     *  is ever reused across multiple trips, this flag will need a reset path. */
     private var hasSeenActiveNav = false
 
     /** Pending arrival timeout — fires navigationEnded() if adapter doesn't send NaviStatus=0
@@ -75,17 +86,15 @@ class ClusterMainSession : Session() {
         private const val ARRIVAL_TIMEOUT_MS = 10_000L
 
         /** First live session wins; cleared on destroy so a fresh binding chain can take over. */
-        @Volatile
-        private var primarySession: ClusterMainSession? = null
+        private val primarySession = AtomicReference<ClusterMainSession?>(null)
     }
 
     override fun onCreateScreen(intent: Intent): Screen {
         ClusterBindingState.sessionAlive = true
 
-        // Claim primary role if no other session holds it.
-        isPrimary = primarySession == null
+        // Claim primary role if no other session holds it (atomic CAS — no TOCTOU).
+        isPrimary = primarySession.compareAndSet(null, this)
         if (isPrimary) {
-            primarySession = this
             logInfo("[CLUSTER_MAIN] Primary session created — owns NavigationManager", tag = Logger.Tags.CLUSTER)
         } else {
             logInfo("[CLUSTER_MAIN] Secondary session created — passive (no NavigationManager calls)", tag = Logger.Tags.CLUSTER)
@@ -144,7 +153,7 @@ class ClusterMainSession : Session() {
             object : DefaultLifecycleObserver {
                 override fun onDestroy(owner: LifecycleOwner) {
                     if (isPrimary) {
-                        primarySession = null
+                        primarySession.compareAndSet(this@ClusterMainSession, null)
                         logInfo(
                             "[CLUSTER_MAIN] Primary session destroyed — releasing NavigationManager ownership",
                             tag = Logger.Tags.CLUSTER,
@@ -167,10 +176,10 @@ class ClusterMainSession : Session() {
                         scope?.cancel()
                         scope = null
                         navigationManager = null
+                        ClusterBindingState.sessionAlive = false
                     } else {
                         logInfo("[CLUSTER_MAIN] Secondary session destroyed", tag = Logger.Tags.CLUSTER)
                     }
-                    ClusterBindingState.sessionAlive = false
                 }
             },
         )
@@ -180,6 +189,10 @@ class ClusterMainSession : Session() {
 
     /**
      * Collect navigation state with 200ms debounce.
+     *
+     * collectLatest already cancels the previous suspended block on new emissions, so the
+     * explicit debounceJob?.cancel() is belt-and-suspenders — kept to make the debounce
+     * intent obvious at the call site.
      */
     private suspend fun collectNavigationState() {
         var debounceJob: Job? = null
@@ -205,7 +218,9 @@ class ClusterMainSession : Session() {
         if (state.isActive) {
             hasSeenActiveNav = true
 
-            // Re-start navigation if it was ended by a previous flush
+            // Re-enter navigation if a prior path cleared isNavigating: adapter flush
+            // (isIdle branch below), onStopNavigation callback from the Host, or the
+            // arrival-timeout auto-end. New active data means a fresh trip is starting.
             if (!isNavigating) {
                 logInfo("[CLUSTER_MAIN] navigationStarted() (re-start)", tag = Logger.Tags.CLUSTER)
                 try {
@@ -241,6 +256,8 @@ class ClusterMainSession : Session() {
             // start a grace period. If the adapter doesn't send NaviStatus=0 within the window,
             // end navigation ourselves. Catches firmware gap where arrival is sent without flush.
             if (state.maneuverType in TERMINAL_MANEUVER_TYPES) {
+                // Only start a timeout if none is pending — the window is NOT reset by
+                // subsequent terminal-maneuver updates within the same arrival burst.
                 if (arrivalTimeoutJob?.isActive != true) {
                     logInfo(
                         "[CLUSTER_MAIN] Terminal maneuver (cpType=${state.maneuverType}) — " +
@@ -293,7 +310,13 @@ class ClusterMainSession : Session() {
 
     /**
      * Relay screen — shows a brief identifying message while Templates Host binds
-     * the cluster session. Visible for ~1s before MainActivity returns to front.
+     * the cluster session. Visible for ~1s before MainActivity returns to front
+     * (pinned to the 1000ms postDelayed in MainActivity.launchCarAppActivity).
+     *
+     * On GM AAOS this screen is never rendered — GM's OnStarTurnByTurnManager owns
+     * the cluster display and ignores the Car App Library Screen. The message text
+     * is defensive: it only surfaces on non-GM platforms if this session is ever
+     * returned there (it shouldn't be; CarlinkClusterSession is the correct choice).
      */
     private class RelayScreen(
         carContext: CarContext,

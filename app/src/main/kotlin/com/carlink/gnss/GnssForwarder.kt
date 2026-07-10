@@ -18,11 +18,28 @@ import kotlin.math.min
 /**
  * Forwards Android location data as NMEA sentences to the CPC200-CCPA adapter.
  *
- * The adapter relays NMEA data to CarPlay via iAP2 LocationInformation, enabling
- * CarPlay Maps to use the vehicle's GPS position instead of the phone's.
+ * The adapter repackages NMEA data for the phone: iAP2 LocationInformation on iOS,
+ * the Android Auto location channel (openSDK) on Android.
  *
  * Generates $GPGGA (fix data) and $GPRMC (recommended minimum) sentences at ~1Hz.
- * Firmware buffer limit: NMEA payload must be < 1024 bytes.
+ *
+ * Platform consumption (important — it shapes what "good output" means here):
+ *  - iOS: receives the full NMEA message and compares our reported accuracy against
+ *    its own GPS fusion estimate. Vehicle GPS is used only for non-critical consumers
+ *    (third-party apps, passive location updates) UNLESS our reported accuracy beats
+ *    iOS's internal estimate — only then is it accepted for Maps navigation and the
+ *    phone's own location. So honest HDOP / quality matter: understate accuracy and
+ *    iOS ignores us; overstate and we poison iOS's fusion output.
+ *  - Android Auto: a known bug in the openSDK binary on the CPC200-CCPA adapter
+ *    strips the NMEA accuracy fields and downgrades the delivered position to a fixed
+ *    ~1 km radius that bounces randomly inside that circle. Android accepts the
+ *    degraded position as authoritative for ALL location consumers (including nav).
+ *    There is no phone-side mitigation; the quality of fields we emit here does not
+ *    change what Android Auto ultimately hands to the system location provider.
+ *
+ * Firmware buffer limit: adapter NMEA payload is documented as < 1024 bytes. NOT
+ * enforced here — a GPGGA+GPRMC pair is ~200 bytes, well under the limit. If more
+ * sentence types are added (e.g., $GPGSV), add a length guard in formatNmea().
  */
 class GnssForwarder(
     private val context: Context,
@@ -34,6 +51,8 @@ class GnssForwarder(
     private var locationListener: LocationListener? = null
     private var handlerThread: HandlerThread? = null
 
+    // @Volatile is visibility-only; start()/stop() are serialized by the single caller
+    // (CarlinkManager state transitions), so there's no read-modify-write race to guard.
     @Volatile
     private var isRunning = false
 
@@ -129,9 +148,20 @@ class GnssForwarder(
      *
      * $GPGGA,HHMMSS.SS,DDMM.MMMM,N,DDDMM.MMMM,W,Q,NN,HDOP,ALT,M,GEOID,M,,*XX\r\n
      *
-     * HDOP and satellite count are derived from Location.getAccuracy() when available,
-     * rather than hardcoded, so NMEA reflects actual GPS quality (important for iPhone
-     * fusion engine accuracy comparison).
+     * Derived fields: HDOP (from Location.getAccuracy() via a rough UERE≈5m heuristic)
+     * and satellite count (from Location.extras["satellites"] or estimated from accuracy
+     * buckets). Emitting honest HDOP matters for the iOS fusion comparison described in
+     * the class KDoc.
+     *
+     * Hardcoded fields (known approximations, kept simple because Android Auto strips
+     * accuracy anyway and iOS only needs the HDOP to be directionally correct):
+     *  - Quality indicator: always "1" (GPS fix). No degraded/DGPS path.
+     *  - Geoid separation: "0.0,M". Android's Location.altitude is WGS84-referenced, so
+     *    labelling it as MSL is technically wrong by the local geoid undulation (~±25m),
+     *    but neither consumer uses the altitude field for positioning.
+     *  - Fractional seconds: always ".00" (see formatUtcTime).
+     *  - Satellite count: clamped to 24 (GGA field supports 0-99, but the Location
+     *    extras bundle rarely reports more and iOS doesn't differentiate above ~12).
      */
     private fun formatGpgga(location: Location): String {
         val time = formatUtcTime(location.time)
@@ -139,8 +169,9 @@ class GnssForwarder(
         val (lon, lonDir) = toNmeaLongitude(location.longitude)
         val alt = "%.1f".format(Locale.US, location.altitude)
 
-        // Derive HDOP from accuracy: accuracy ≈ HDOP × UERE (~5m civilian GPS)
-        // Clamp to 0.5-25.0 (valid NMEA range)
+        // Derive HDOP from accuracy: accuracy ≈ HDOP × UERE, with UERE ≈ 5m (rough
+        // civilian-GPS value — modern multi-constellation receivers run closer to 2-3m,
+        // so this slightly over-reports HDOP). Clamp to 0.5-25.0 (valid NMEA range).
         val hdop =
             if (location.hasAccuracy()) {
                 "%.1f".format(Locale.US, min(25.0, max(0.5, location.accuracy / 5.0)))
@@ -176,6 +207,14 @@ class GnssForwarder(
      * Format $GPRMC sentence (Recommended Minimum).
      *
      * $GPRMC,HHMMSS.SS,A,DDMM.MMMM,N,DDDMM.MMMM,W,SPEED,COURSE,DDMMYY,,,A*XX\r\n
+     *
+     * Hardcoded fields:
+     *  - Status: always "A" (active). No "V" (void) path when accuracy is poor — iOS
+     *    ignores the vehicle fix anyway when its own fusion is more accurate.
+     *  - Magnetic variation: empty (",,"). NMEA allows this; iOS/Android Auto don't use it.
+     *  - Course when stationary: "0.0" instead of empty field. Semantically implies
+     *    "heading north" when stopped; NMEA-valid but not strictly correct. Kept because
+     *    neither consumer derives heading from a stationary fix.
      */
     private fun formatGprmc(location: Location): String {
         val time = formatUtcTime(location.time)
@@ -197,6 +236,10 @@ class GnssForwarder(
 
     /**
      * NMEA checksum: XOR of all characters between $ and * (exclusive).
+     *
+     * Uses c.code (UTF-16 code unit), which matches the byte value only for ASCII —
+     * safe here because every formatter in this file emits ASCII-only output. If a
+     * future sentence includes non-ASCII (e.g., road names), switch to .toByte().toInt().
      */
     private fun computeNmeaChecksum(body: String): String {
         var checksum = 0
@@ -230,7 +273,9 @@ class GnssForwarder(
         return Pair(formatted, dir)
     }
 
-    /** Format UTC time as HHMMSS.SS */
+    /** Format UTC time as HHMMSS.SS — fractional seconds are always ".00" (not derived
+     *  from Calendar.MILLISECOND). NMEA-valid; precision loss is ignored by both iOS and
+     *  Android Auto consumers at 1 Hz update rate. */
     private fun formatUtcTime(timeMs: Long): String {
         val cal = Calendar.getInstance(TimeZone.getTimeZone("UTC"))
         cal.timeInMillis = timeMs

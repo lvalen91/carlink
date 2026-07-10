@@ -6,6 +6,8 @@ import android.media.AudioFocusRequest
 import android.media.AudioFormat
 import android.media.AudioManager
 import android.media.AudioTrack
+import android.os.Handler
+import android.os.Looper
 import android.os.Process
 import com.carlink.platform.AudioConfig
 import com.carlink.protocol.AudioRoutingState
@@ -33,27 +35,32 @@ object AudioStreamType {
  * Alert, Navigation), with ring buffers to absorb USB packet jitter.
  *
  * ARCHITECTURE:
+ * Ring-buffer capacities are platform-dependent ([AudioConfig.mediaBufferCapacityMs] /
+ * [AudioConfig.navBufferCapacityMs]); the values shown are typical defaults.
  * ```
  * USB Thread (non-blocking)
  *     │
- *     ├──► Media Ring Buffer (500ms) ──► Media AudioTrack (USAGE_MEDIA)
- *     ├──► Siri Ring Buffer (500ms)  ──► Siri AudioTrack (USAGE_ASSISTANT)
- *     ├──► Call Ring Buffer (500ms)  ──► Call AudioTrack (USAGE_VOICE_COMMUNICATION)
- *     ├──► Alert Ring Buffer (500ms) ──► Alert AudioTrack (USAGE_NOTIFICATION_RINGTONE)
- *     └──► Nav Ring Buffer (200ms)   ──► Nav AudioTrack (USAGE_ASSISTANCE_NAVIGATION_GUIDANCE)
+ *     ├──► Media Ring Buffer (~500ms) ──► Media AudioTrack (USAGE_MEDIA)
+ *     ├──► Siri Ring Buffer  (~500ms) ──► Siri AudioTrack (USAGE_ASSISTANT)
+ *     ├──► Call Ring Buffer  (~500ms) ──► Call AudioTrack (USAGE_VOICE_COMMUNICATION)
+ *     ├──► Alert Ring Buffer (~500ms) ──► Alert AudioTrack (USAGE_VOICE_COMMUNICATION_SIGNALLING)
+ *     └──► Nav Ring Buffer   (~200ms) ──► Nav AudioTrack (USAGE_ASSISTANCE_NAVIGATION_GUIDANCE)
  *     │
  *     └──► Playback Thread (THREAD_PRIORITY_URGENT_AUDIO)
  *             reads from all buffers, writes to AudioTracks
  * ```
+ * ALERT uses USAGE_VOICE_COMMUNICATION_SIGNALLING (not USAGE_NOTIFICATION_RINGTONE) as
+ * a deliberate workaround for GM AAOS bus routing — see [purposeToAttributes].
  *
  * ROUTING:
  * PCM packets are routed by two-factor matching: audio command state flags + format match.
  * This prevents transition artifacts where media PCM briefly routes to the wrong AudioTrack
  * when purpose changes (e.g., SIRI_START arrives but adapter still sends media PCM).
- * - audioType=2 → Navigation (unchanged)
- * - audioType=1 + isPhoneCallActive + 8kHz mono → PhoneCall track
+ * - audioType=2 → Navigation
+ * - audioType=1 + isPhoneCallActive + mono @ 8kHz (AA HFP/SCO) or 16kHz (CarPlay iAP2) → PhoneCall track
  * - audioType=1 + isSiriActive + 16kHz mono → Siri track
- * - audioType=1 + isAlertActive + 24kHz mono → Alert track
+ * - audioType=1 + isAlertActive → Alert track (format-agnostic; ensureSlotFormat handles
+ *     48kHz/2ch CarPlay or 24kHz/1ch AA)
  * - audioType=1 + anything else → Media track (default, catches transition-period packets)
  *
  * THREAD SAFETY:
@@ -84,30 +91,49 @@ class DualStreamAudioManager(
     private var mediaVolume: Float = 1.0f
     private var navVolume: Float = 1.0f
     private var isDucked: Boolean = false
-    private var duckLevel: Float = 0.2f
+    private var duckLevel: Float = 1.0f // 1.0 = no duck; adapter sets lower via volumeDuration packets
 
     // AudioFocus state machine
     private val activeFocusRequests = mutableMapOf<StreamPurpose, AudioFocusRequest>()
     private var focusDuckLevel: Float = 1.0f // system-driven duck (1.0 = none)
 
-    private val focusChangeListener = AudioManager.OnAudioFocusChangeListener { focusChange ->
-        val (newLevel, changeStr) = when (focusChange) {
-            AudioManager.AUDIOFOCUS_GAIN -> 1.0f to "GAIN"
-            AudioManager.AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK -> 0.2f to "LOSS_TRANSIENT_CAN_DUCK"
-            AudioManager.AUDIOFOCUS_LOSS_TRANSIENT -> 0.0f to "LOSS_TRANSIENT"
-            AudioManager.AUDIOFOCUS_LOSS -> 0.0f to "LOSS"
-            else -> focusDuckLevel to "UNKNOWN($focusChange)"
+    /** Per-purpose focus listeners — AAOS CarAudioFocus uses the listener as identity key.
+     *  A single listener cannot hold focus for two different usages simultaneously. */
+    private val focusListeners = mutableMapOf<StreamPurpose, AudioManager.OnAudioFocusChangeListener>()
+    private val focusHandler = Handler(Looper.getMainLooper())
+
+    private fun getOrCreateFocusListener(purpose: StreamPurpose): AudioManager.OnAudioFocusChangeListener =
+        focusListeners.getOrPut(purpose) {
+            AudioManager.OnAudioFocusChangeListener { focusChange ->
+                val changeStr =
+                    when (focusChange) {
+                        AudioManager.AUDIOFOCUS_GAIN -> "GAIN"
+                        AudioManager.AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK -> "LOSS_TRANSIENT_CAN_DUCK"
+                        AudioManager.AUDIOFOCUS_LOSS_TRANSIENT -> "LOSS_TRANSIENT"
+                        AudioManager.AUDIOFOCUS_LOSS -> "LOSS"
+                        else -> "UNKNOWN($focusChange)"
+                    }
+                logDebug("[AUDIO_FOCUS] FocusChange($purpose): $changeStr")
+                // Only MEDIA adjusts volume on duck — other purposes are short-lived
+                // foreground streams that play at full volume.
+                if (purpose == StreamPurpose.MEDIA) {
+                    focusDuckLevel =
+                        when (focusChange) {
+                            AudioManager.AUDIOFOCUS_GAIN -> 1.0f
+                            AudioManager.AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK -> 0.2f
+                            AudioManager.AUDIOFOCUS_LOSS_TRANSIENT -> 0.0f
+                            AudioManager.AUDIOFOCUS_LOSS -> 0.0f
+                            else -> focusDuckLevel
+                        }
+                    applyEffectiveVolume()
+                }
+            }
         }
-        logDebug("[AUDIO_FOCUS] FocusChange: $changeStr → focusDuckLevel=${(newLevel * 100).toInt()}%")
-        focusDuckLevel = newLevel
-        applyEffectiveVolume()
-    }
 
     private var playbackThread: AudioPlaybackThread? = null
     private val isRunning = AtomicBoolean(false)
 
     private var navUnderruns: Int = 0
-    private var zeroPacketsFiltered: Long = 0
 
     // 30s aggregate stats counters (per-window deltas, reset each interval)
     private val statsInterval = 30_000L
@@ -125,7 +151,13 @@ class DualStreamAudioManager(
     private val bufferMultiplier = audioConfig.bufferMultiplier
     private val prefillThresholdMs = audioConfig.prefillThresholdMs
     private val underrunRecoveryThreshold = 10
-    private val minBufferLevelMs = 50 // Reduced from 100ms - USB P99 jitter only 7ms
+    private val minBufferLevelMs = 0 // AudioTrack internal buffer (4x min) provides jitter protection
+
+    // AUDIO_ROUTE dedup: only log when route changes, plus periodic summary
+    private var lastRoutePurpose: StreamPurpose? = null
+    private var lastRouteSampleRate: Int = 0
+    private var lastRouteChannels: Int = 0
+    private var routeRepeatCount: Long = 0
 
     @Volatile private var navStarted = false
 
@@ -157,11 +189,17 @@ class DualStreamAudioManager(
         var idleSince: Long = 0,
     )
 
-    // Pause a playing track after its buffer has been empty for this long.
-    // Prevents AAOS volume keys from being hijacked by stale PLAYING tracks.
+    // After a slot's ring buffer has been empty for this long while playing, take
+    // an idle action. Prevents AAOS volume keys from being hijacked by stale PLAYING
+    // tracks. Action depends on purpose (see playback-thread idle handling at line ~1170):
+    //   - MEDIA, PHONE_CALL, SIRI: write a silence frame to keep the track PLAYING
+    //     (avoids volume-context flap during natural inter-packet gaps).
+    //   - ALERT: actually pause (short bursts with explicit start/end signals).
     private val idlePauseMs = 200L
 
-    // Minimum playback duration before allowing stop (fixes premature cutoff - Sessions 1-2)
+    // Reject NAVI_COMPLETE if the prompt has been audible for less than this many ms
+    // and the buffer still holds >50ms of data — guards against the adapter sending
+    // STOP before the prompt has had time to play.
     private val minNavPlayDurationMs = 300
 
     // Skip warmup noise: mixed 0xFFFF/0x0000/0xFEFF patterns for ~200-400ms after NavStart
@@ -333,7 +371,7 @@ class DualStreamAudioManager(
             }
 
             navEndMarkersDetected++
-            log("[AUDIO] Nav end marker detected, buffers flushed (total: $navEndMarkersDetected)")
+            log("[AUDIO] Nav end marker detected, buffers flushed — discarded=${discardedMs}ms (total: $navEndMarkersDetected)")
         }
     }
 
@@ -351,11 +389,9 @@ class DualStreamAudioManager(
         // Navigation handles zeros separately for consecutive tracking and buffer flush
         val isZeroFilled = isZeroFilledAudio(data, dataOffset, dataLength)
         if (isZeroFilled && audioType != AudioStreamType.NAVIGATION) {
-            zeroPacketsFiltered++
             windowZeroFiltered.incrementAndGet()
             return 0
         }
-
 
         // Route: Navigation → nav track, everything else → per-purpose pre-allocated track
         return when (audioType) {
@@ -363,7 +399,9 @@ class DualStreamAudioManager(
                 // Drop packets after NAVI_STOP (~2s silence before NAVI_COMPLETE per USB captures)
                 if (navStopped) return 0
 
-                // Check end marker before track creation (navStartTime may be 0)
+                // Check end marker before track creation (navStartTime may be 0 — this is
+                // the cold-start path; nav track never allocated in 2026-04-20 POTATO
+                // sessions, Nav[Rx:0] in every AUDIO_PERF log).
                 if (isNavEndMarker(data, dataOffset, dataLength)) {
                     flushNavBuffers()
                     consecutiveNavZeroPackets = 0
@@ -373,7 +411,6 @@ class DualStreamAudioManager(
                 // Consecutive zeros cause resampling noise on GM AAOS (44.1kHz→48kHz)
                 if (isZeroFilled) {
                     consecutiveNavZeroPackets++
-                    zeroPacketsFiltered++
                     windowZeroFiltered.incrementAndGet()
                     if (consecutiveNavZeroPackets >= navZeroFlushThreshold) {
                         flushNavBuffers()
@@ -414,7 +451,7 @@ class DualStreamAudioManager(
                 // Two-factor routing: state flags + format match → pre-allocated slot
                 windowMediaRx.incrementAndGet()
                 val format = AudioFormats.fromDecodeType(decodeType)
-                val targetSlot = resolveTargetSlot(format, routingState)
+                val targetSlot = resolveTargetSlot(format, routingState) ?: return 0
                 ensureSlotFormat(targetSlot, format)
                 // Activate slot if track is not yet playing (pre-allocated slots start in STOPPED)
                 if (!targetSlot.pendingPlay && targetSlot.track?.playState != AudioTrack.PLAYSTATE_PLAYING) {
@@ -442,14 +479,17 @@ class DualStreamAudioManager(
         }
     }
 
-    /** Combine adapter ducking and system focus ducking, apply to media slot only. */
+    /** Combine adapter ducking and system focus ducking, apply to media slot only.
+     *  Adapter duck (duckLevel) only applies when explicitly set via volumeDuration packet (isDucked=true).
+     *  System focus duck (focusDuckLevel) always applies — it tracks Android AudioFocus state. */
     private fun applyEffectiveVolume() {
-        val effectiveVolume = mediaVolume * minOf(duckLevel, focusDuckLevel)
+        val adapterFactor = if (isDucked) duckLevel else 1.0f
+        val effectiveVolume = mediaVolume * minOf(adapterFactor, focusDuckLevel)
         mediaSlot?.track?.setVolume(effectiveVolume)
         // Non-media purpose slots (PHONE_CALL, SIRI, ALERT) stay at full volume
         logDebug(
             "[AUDIO_FOCUS] Volume: effective=${(effectiveVolume * 100).toInt()}% " +
-                "(media=${(mediaVolume * 100).toInt()}% adapterDuck=${(duckLevel * 100).toInt()}% " +
+                "(media=${(mediaVolume * 100).toInt()}% adapterDuck=${if (isDucked) "${(duckLevel * 100).toInt()}%" else "off"} " +
                 "focusDuck=${(focusDuckLevel * 100).toInt()}%)",
         )
     }
@@ -457,41 +497,55 @@ class DualStreamAudioManager(
     /** Request AudioFocus for a stream purpose. */
     fun onPurposeChanged(purpose: StreamPurpose) {
         synchronized(lock) {
-            val gainType = when (purpose) {
-                StreamPurpose.MEDIA -> AudioManager.AUDIOFOCUS_GAIN
-                StreamPurpose.PHONE_CALL -> AudioManager.AUDIOFOCUS_GAIN_TRANSIENT
-                StreamPurpose.SIRI -> AudioManager.AUDIOFOCUS_GAIN_TRANSIENT
-                StreamPurpose.ALERT, StreamPurpose.RINGTONE -> AudioManager.AUDIOFOCUS_GAIN_TRANSIENT
-                StreamPurpose.NAVIGATION -> AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_MAY_DUCK
-            }
+            val gainType =
+                when (purpose) {
+                    StreamPurpose.MEDIA -> AudioManager.AUDIOFOCUS_GAIN
+                    StreamPurpose.PHONE_CALL -> AudioManager.AUDIOFOCUS_GAIN_TRANSIENT
+                    StreamPurpose.SIRI -> AudioManager.AUDIOFOCUS_GAIN_TRANSIENT
+                    StreamPurpose.ALERT, StreamPurpose.RINGTONE -> AudioManager.AUDIOFOCUS_GAIN_TRANSIENT
+                    StreamPurpose.NAVIGATION -> AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_MAY_DUCK
+                }
 
             val (usage, contentType) = purposeToAttributes(purpose)
 
-            val focusRequest = AudioFocusRequest.Builder(gainType)
-                .setAudioAttributes(
-                    AudioAttributes.Builder()
-                        .setUsage(usage)
-                        .setContentType(contentType)
-                        .build(),
-                )
-                .setOnAudioFocusChangeListener(focusChangeListener)
-                .build()
+            val focusRequest =
+                AudioFocusRequest
+                    .Builder(gainType)
+                    .setAudioAttributes(
+                        AudioAttributes
+                            .Builder()
+                            .setUsage(usage)
+                            .setContentType(contentType)
+                            .build(),
+                    ).setOnAudioFocusChangeListener(getOrCreateFocusListener(purpose), focusHandler)
+                    .build()
 
             val result = systemAudioManager.requestAudioFocus(focusRequest)
             activeFocusRequests[purpose] = focusRequest
 
-            val resultStr = when (result) {
-                AudioManager.AUDIOFOCUS_REQUEST_GRANTED -> "GRANTED"
-                AudioManager.AUDIOFOCUS_REQUEST_DELAYED -> "DELAYED"
-                AudioManager.AUDIOFOCUS_REQUEST_FAILED -> "FAILED"
-                else -> "UNKNOWN($result)"
+            // Reset focusDuckLevel when MEDIA focus is granted. With per-purpose listeners,
+            // MEDIA's listener gets proper GAIN callbacks when unblocked, but the sync reset
+            // handles the case where MEDIA focus was re-requested after abandonment.
+            if (purpose == StreamPurpose.MEDIA && result == AudioManager.AUDIOFOCUS_REQUEST_GRANTED && focusDuckLevel != 1.0f) {
+                logDebug("[AUDIO_FOCUS] Reset focusDuckLevel=100% (MEDIA focus granted)")
+                focusDuckLevel = 1.0f
+                applyEffectiveVolume()
             }
-            val gainStr = when (gainType) {
-                AudioManager.AUDIOFOCUS_GAIN -> "GAIN"
-                AudioManager.AUDIOFOCUS_GAIN_TRANSIENT -> "GAIN_TRANSIENT"
-                AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_MAY_DUCK -> "GAIN_TRANSIENT_MAY_DUCK"
-                else -> "UNKNOWN($gainType)"
-            }
+
+            val resultStr =
+                when (result) {
+                    AudioManager.AUDIOFOCUS_REQUEST_GRANTED -> "GRANTED"
+                    AudioManager.AUDIOFOCUS_REQUEST_DELAYED -> "DELAYED"
+                    AudioManager.AUDIOFOCUS_REQUEST_FAILED -> "FAILED"
+                    else -> "UNKNOWN($result)"
+                }
+            val gainStr =
+                when (gainType) {
+                    AudioManager.AUDIOFOCUS_GAIN -> "GAIN"
+                    AudioManager.AUDIOFOCUS_GAIN_TRANSIENT -> "GAIN_TRANSIENT"
+                    AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_MAY_DUCK -> "GAIN_TRANSIENT_MAY_DUCK"
+                    else -> "UNKNOWN($gainType)"
+                }
             logDebug("[AUDIO_FOCUS] Request $purpose: gain=$gainStr → $resultStr")
         }
     }
@@ -503,17 +557,27 @@ class DualStreamAudioManager(
                 systemAudioManager.abandonAudioFocusRequest(request)
                 logDebug("[AUDIO_FOCUS] Abandon $purpose")
             }
+            focusListeners.remove(purpose)
         }
     }
 
-    private fun purposeToAttributes(purpose: StreamPurpose): Pair<Int, Int> = when (purpose) {
-        StreamPurpose.MEDIA -> Pair(AudioAttributes.USAGE_MEDIA, AudioAttributes.CONTENT_TYPE_MUSIC)
-        StreamPurpose.PHONE_CALL -> Pair(AudioAttributes.USAGE_VOICE_COMMUNICATION, AudioAttributes.CONTENT_TYPE_SPEECH)
-        StreamPurpose.SIRI -> Pair(AudioAttributes.USAGE_ASSISTANT, AudioAttributes.CONTENT_TYPE_SPEECH)
-        StreamPurpose.ALERT -> Pair(AudioAttributes.USAGE_NOTIFICATION_RINGTONE, AudioAttributes.CONTENT_TYPE_MUSIC)
-        StreamPurpose.RINGTONE -> Pair(AudioAttributes.USAGE_NOTIFICATION_RINGTONE, AudioAttributes.CONTENT_TYPE_MUSIC)
-        StreamPurpose.NAVIGATION -> Pair(AudioAttributes.USAGE_ASSISTANCE_NAVIGATION_GUIDANCE, AudioAttributes.CONTENT_TYPE_SPEECH)
-    }
+    private fun purposeToAttributes(purpose: StreamPurpose): Pair<Int, Int> =
+        when (purpose) {
+            StreamPurpose.MEDIA -> Pair(AudioAttributes.USAGE_MEDIA, AudioAttributes.CONTENT_TYPE_MUSIC)
+            StreamPurpose.PHONE_CALL -> Pair(AudioAttributes.USAGE_VOICE_COMMUNICATION, AudioAttributes.CONTENT_TYPE_SPEECH)
+            StreamPurpose.SIRI -> Pair(AudioAttributes.USAGE_ASSISTANT, AudioAttributes.CONTENT_TYPE_SPEECH)
+            // ALERT (incoming-call ringtone): try USAGE_VOICE_COMMUNICATION_SIGNALLING
+            // to attempt routing onto BUS_CALL_RING → vgroup 2 (RING) on GM AAOS.
+            // Standard AOSP maps USAGE_NOTIFICATION_RINGTONE to CALL_RING context, but
+            // GM's carAudioContexts.xml on this head unit remaps it to BUS_NOTIFICATION
+            // (vgroup 6 SYSTEM) — not adjustable, not on the right physical bus.
+            // SIGNALLING is the closest usage that semantically belongs to the telephony
+            // group and may map to BUS_CALL_RING in GM's config without requiring a
+            // Telecom ConnectionService. Fallback: USAGE_NOTIFICATION_RINGTONE.
+            StreamPurpose.ALERT -> Pair(AudioAttributes.USAGE_VOICE_COMMUNICATION_SIGNALLING, AudioAttributes.CONTENT_TYPE_SONIFICATION)
+            StreamPurpose.RINGTONE -> Pair(AudioAttributes.USAGE_VOICE_COMMUNICATION_SIGNALLING, AudioAttributes.CONTENT_TYPE_SONIFICATION)
+            StreamPurpose.NAVIGATION -> Pair(AudioAttributes.USAGE_ASSISTANCE_NAVIGATION_GUIDANCE, AudioAttributes.CONTENT_TYPE_SPEECH)
+        }
 
     // ========== Stream Stop Methods ==========
     //
@@ -596,6 +660,7 @@ class DualStreamAudioManager(
             navStopped = false // Reset stopped state for next nav session
             navPackets = 0 // Reset packet counter for next nav prompt
             navUnderruns = 0 // Reset underrun counter for next nav prompt
+            navWarmupFramesSkipped = 0 // Reset per-prompt warmup skip counter
             // Abandon nav focus
             onPurposeEnded(StreamPurpose.NAVIGATION)
             logDebug("[AUDIO_FOCUS] Nav focus abandoned (stopNavTrack)")
@@ -603,6 +668,82 @@ class DualStreamAudioManager(
     }
 
     private var navPackets: Long = 0
+
+    /**
+     * Pause the SIRI track on AUDIO_SIRI_STOP. Same rationale as stopPhoneCallTrack:
+     * SIRI now writes silence on idle gaps (TTS inter-utterance pauses) to prevent
+     * mid-session volume-context flap, so it needs an explicit pause at end-of-session
+     * to release the USAGE_ASSISTANT active-player signal back to AAOS.
+     */
+    fun stopSiriTrack() {
+        log("[SIRI_STOP] stopSiriTrack() called")
+        synchronized(lock) {
+            val slot = siriSlot ?: run {
+                log("[SIRI_STOP] siriSlot is null, nothing to stop")
+                return
+            }
+            slot.track?.let { track ->
+                if (track.playState == AudioTrack.PLAYSTATE_PLAYING) {
+                    try {
+                        track.pause()
+                        track.flush()
+                    } catch (e: Exception) {
+                        log("[SIRI_STOP] pause/flush failed: ${e.message}")
+                    }
+                    log("[SIRI_STOP] SIRI track paused+flushed")
+                } else {
+                    log("[SIRI_STOP] Track not playing (state=${track.playState}), skipping pause")
+                }
+            }
+            slot.started = false
+            slot.idleSince = 0
+            slot.residualOffset = 0
+            slot.residualCount = 0
+            slot.buffer.clear()
+        }
+    }
+
+    /**
+     * Pause the phone-call track on AUDIO_PHONECALL_STOP.
+     *
+     * Required because the idle-pause path no longer pauses PHONE_CALL — it writes
+     * silence to keep the track PLAYING across natural inter-packet gaps (VAD/silence
+     * frames). Without an explicit pause at end-of-call, the AudioTrack stays in
+     * PLAYSTATE_PLAYING with USAGE_VOICE_COMMUNICATION and AAOS keeps routing volume
+     * keys to the CALL group while ducking MEDIA/SIRI to inaudibility — symptom is
+     * "post-call silence: media plays internally but nothing is heard, volume stuck
+     * on call group." NAV breaks through via its own focus request, but on NAV end
+     * the system falls back to the still-playing PHONE_CALL track.
+     *
+     * Mirrors stopNavTrack() — pause + flush + reset slot state.
+     */
+    fun stopPhoneCallTrack() {
+        log("[PHONECALL_STOP] stopPhoneCallTrack() called")
+        synchronized(lock) {
+            val slot = phoneCallSlot ?: run {
+                log("[PHONECALL_STOP] phoneCallSlot is null, nothing to stop")
+                return
+            }
+            slot.track?.let { track ->
+                if (track.playState == AudioTrack.PLAYSTATE_PLAYING) {
+                    try {
+                        track.pause()
+                        track.flush()
+                    } catch (e: Exception) {
+                        log("[PHONECALL_STOP] pause/flush failed: ${e.message}")
+                    }
+                    log("[PHONECALL_STOP] Phone-call track paused+flushed")
+                } else {
+                    log("[PHONECALL_STOP] Track not playing (state=${track.playState}), skipping pause")
+                }
+            }
+            slot.started = false
+            slot.idleSince = 0
+            slot.residualOffset = 0
+            slot.residualCount = 0
+            slot.buffer.clear()
+        }
+    }
 
     /** Stop playback and release all resources. */
     fun release() {
@@ -635,6 +776,7 @@ class DualStreamAudioManager(
                 logDebug("[AUDIO_FOCUS] Abandon $purpose (release)")
             }
             activeFocusRequests.clear()
+            focusListeners.clear()
 
             navBuffer?.clear()
             navBuffer = null
@@ -646,12 +788,16 @@ class DualStreamAudioManager(
     // ========== Private Methods ==========
 
     /** Create a pre-allocated purpose slot with AudioTrack + ring buffer. */
-    private fun createPurposeSlot(purpose: StreamPurpose, format: AudioFormatConfig): PurposeSlot {
-        val buffer = AudioRingBuffer(
-            capacityMs = audioConfig.mediaBufferCapacityMs,
-            sampleRate = format.sampleRate,
-            channels = format.channelCount,
-        )
+    private fun createPurposeSlot(
+        purpose: StreamPurpose,
+        format: AudioFormatConfig,
+    ): PurposeSlot {
+        val buffer =
+            AudioRingBuffer(
+                capacityMs = audioConfig.mediaBufferCapacityMs,
+                sampleRate = format.sampleRate,
+                channels = format.channelCount,
+            )
         val chunkSize = format.sampleRate * format.channelCount * 2 * 5 / 1000
         val track = createAudioTrack(format, purpose)
         log(
@@ -673,21 +819,46 @@ class DualStreamAudioManager(
      * During transitions (e.g., SIRI_START sent but adapter still sending media PCM),
      * the format won't match the target purpose, so media PCM stays on the MEDIA track.
      */
-    private fun resolveTargetSlot(format: AudioFormatConfig, state: AudioRoutingState): PurposeSlot {
-        if (state.isPhoneCallActive && format.sampleRate <= 8000 && format.channelCount == 1) {
-            return phoneCallSlot!!
+    private fun resolveTargetSlot(
+        format: AudioFormatConfig,
+        state: AudioRoutingState,
+    ): PurposeSlot? {
+        // 8kHz = AA phone calls (HFP/SCO narrowband), 16kHz = CarPlay phone calls (iAP2 wideband)
+        val slot =
+            if (state.isPhoneCallActive && (format.sampleRate == 8000 || format.sampleRate == 16000) && format.channelCount == 1) {
+                phoneCallSlot
+            } else if (state.isSiriActive && format.sampleRate == 16000 && format.channelCount == 1) {
+                siriSlot
+            } else if (state.isAlertActive) {
+                alertSlot // Format-agnostic: ensureSlotFormat() handles 48kHz/2ch (CarPlay) or 24kHz/1ch (AA)
+            } else {
+                mediaSlot // Default: all other audio (including transition-period media)
+            }
+        val purpose = slot?.purpose
+        if (purpose != lastRoutePurpose || format.sampleRate != lastRouteSampleRate || format.channelCount != lastRouteChannels) {
+            if (routeRepeatCount > 0) {
+                logDebug("[AUDIO_ROUTE] (suppressed $routeRepeatCount identical)")
+            }
+            logDebug(
+                "[AUDIO_ROUTE] ${format.sampleRate}Hz/${format.channelCount}ch " +
+                    "state=(call=${state.isPhoneCallActive} siri=${state.isSiriActive} alert=${state.isAlertActive}) " +
+                    "→ ${purpose ?: "null"}",
+            )
+            lastRoutePurpose = purpose
+            lastRouteSampleRate = format.sampleRate
+            lastRouteChannels = format.channelCount
+            routeRepeatCount = 0
+        } else {
+            routeRepeatCount++
         }
-        if (state.isSiriActive && format.sampleRate == 16000 && format.channelCount == 1) {
-            return siriSlot!!
-        }
-        if (state.isAlertActive && format.sampleRate == 24000 && format.channelCount == 1) {
-            return alertSlot!!
-        }
-        return mediaSlot!! // Default: all other audio (including transition-period media)
+        return slot
     }
 
     /** Ensure slot's AudioTrack matches incoming format; recreate if different (rare). */
-    private fun ensureSlotFormat(slot: PurposeSlot, incomingFormat: AudioFormatConfig) {
+    private fun ensureSlotFormat(
+        slot: PurposeSlot,
+        incomingFormat: AudioFormatConfig,
+    ) {
         if (slot.format == incomingFormat && slot.track != null) return
 
         synchronized(lock) {
@@ -701,14 +872,16 @@ class DualStreamAudioManager(
                         if (track.playState == AudioTrack.PLAYSTATE_PLAYING) track.pause()
                         track.release()
                     }
-                } catch (_: Exception) {}
+                } catch (_: Exception) {
+                }
 
                 slot.format = incomingFormat
-                slot.buffer = AudioRingBuffer(
-                    capacityMs = audioConfig.mediaBufferCapacityMs,
-                    sampleRate = incomingFormat.sampleRate,
-                    channels = incomingFormat.channelCount,
-                )
+                slot.buffer =
+                    AudioRingBuffer(
+                        capacityMs = audioConfig.mediaBufferCapacityMs,
+                        sampleRate = incomingFormat.sampleRate,
+                        channels = incomingFormat.channelCount,
+                    )
                 val chunkSize = incomingFormat.sampleRate * incomingFormat.channelCount * 2 * 5 / 1000
                 slot.tempBuffer = ByteArray(chunkSize * 20)
                 slot.track = createAudioTrack(incomingFormat, slot.purpose)
@@ -746,7 +919,7 @@ class DualStreamAudioManager(
                     navStartTime = System.currentTimeMillis()
                     // Request nav focus on resume
                     onPurposeChanged(StreamPurpose.NAVIGATION)
-                    log("[AUDIO] Resumed paused nav track with flush (same format ${format.sampleRate}Hz)")
+                    log("[AUDIO] Resumed paused nav track with flush — discarded=${discardedMs}ms (same format ${format.sampleRate}Hz)")
                     return
                 }
             }
@@ -775,12 +948,17 @@ class DualStreamAudioManager(
     /**
      * Create an AudioTrack with per-purpose AudioAttributes for AAOS CarAudioContext mapping.
      *
-     * AAOS CarAudioContext Mapping:
-     * - USAGE_MEDIA → MUSIC context
-     * - USAGE_VOICE_COMMUNICATION → CALL context
-     * - USAGE_ASSISTANT → VOICE_COMMAND context
-     * - USAGE_NOTIFICATION_RINGTONE → CALL_RING context
-     * - USAGE_ASSISTANCE_NAVIGATION_GUIDANCE → NAVIGATION context
+     * AAOS CarAudioContext Mapping (this file's actual emissions):
+     * - MEDIA        → USAGE_MEDIA                          → MUSIC context
+     * - PHONE_CALL   → USAGE_VOICE_COMMUNICATION            → CALL context
+     * - SIRI         → USAGE_ASSISTANT                      → VOICE_COMMAND context
+     * - ALERT        → USAGE_VOICE_COMMUNICATION_SIGNALLING → CALL_RING (intended; GM-specific)
+     * - NAVIGATION   → USAGE_ASSISTANCE_NAVIGATION_GUIDANCE → NAVIGATION context
+     *
+     * The ALERT mapping is a deliberate GM-AAOS workaround (not the AOSP default of
+     * USAGE_NOTIFICATION_RINGTONE → CALL_RING). See [purposeToAttributes] for the
+     * rationale and `documents/reference/gminfo/audio/audio_subsystem.md` for the
+     * authoritative GM volume-group / bus-routing tables.
      */
     private fun createAudioTrack(
         format: AudioFormatConfig,
@@ -832,7 +1010,7 @@ class DualStreamAudioManager(
             val volume =
                 when (purpose) {
                     StreamPurpose.NAVIGATION -> navVolume
-                    StreamPurpose.MEDIA -> if (isDucked) mediaVolume * minOf(duckLevel, focusDuckLevel) else mediaVolume
+                    StreamPurpose.MEDIA -> mediaVolume * minOf(if (isDucked) duckLevel else 1.0f, focusDuckLevel)
                     else -> 1.0f // Non-media purpose slots stay at full volume
                 }
             track.setVolume(volume)
@@ -904,6 +1082,10 @@ class DualStreamAudioManager(
     private inner class AudioPlaybackThread : Thread("AudioPlayback") {
         // Nav temp buffer (sized for max nav format: 48kHz stereo, 100ms bulk)
         private val navTempBuffer = ByteArray(audioConfig.sampleRate * 2 * 2 / 10)
+
+        // Pre-allocated silence for MEDIA idle-fill (10ms at 48kHz/stereo/16bit = 1920 bytes).
+        // Keeps AudioTrack PLAYING to avoid AudioFlinger state-transition overhead.
+        private val silenceBuffer = ByteArray(1920)
 
         // Residual tracking for nav partial WRITE_NON_BLOCKING returns
         private var navResidualOffset = 0
@@ -992,13 +1174,8 @@ class DualStreamAudioManager(
                             }
                         }
 
-                        // Skip new reads while residual pending or below min buffer
+                        // Skip new reads while residual pending or buffer empty
                         if (slot.residualCount > 0 || currentFillMs <= minBufferLevelMs) {
-                            // Check idle-pause even when below min buffer — this is the primary
-                            // path where a drained slot sits with no new data arriving.
-                            // Use currentFillMs <= minBufferLevelMs (not availableForRead()==0)
-                            // because the playback thread never reads below minBufferLevelMs,
-                            // leaving ~50ms permanently trapped in the buffer.
                             if (track.playState == AudioTrack.PLAYSTATE_PLAYING &&
                                 currentFillMs <= minBufferLevelMs && slot.residualCount == 0
                             ) {
@@ -1006,13 +1183,37 @@ class DualStreamAudioManager(
                                 if (slot.idleSince == 0L) {
                                     slot.idleSince = now
                                 } else if (now - slot.idleSince >= idlePauseMs) {
-                                    track.pause()
-                                    slot.started = false
-                                    slot.idleSince = 0
-                                    logDebug(
-                                        "[AUDIO] ${slot.purpose} idle-paused " +
-                                            "(no data for ${idlePauseMs}ms)",
-                                    )
+                                    if (slot.purpose == StreamPurpose.MEDIA ||
+                                        slot.purpose == StreamPurpose.PHONE_CALL ||
+                                        slot.purpose == StreamPurpose.SIRI
+                                    ) {
+                                        // MEDIA, PHONE_CALL, SIRI: write silence to keep AudioTrack
+                                        // PLAYING. These streams have natural inter-packet gaps
+                                        // (VAD/silence frames in calls; inter-utterance pauses in
+                                        // Siri/Assistant TTS) that would otherwise trigger
+                                        // pause/resume churn — releasing the volume context to
+                                        // AAOS and causing volume keys to flap to MEDIA mid-session.
+                                        // Their lifecycle is gated by explicit STOP commands
+                                        // (AUDIO_PHONECALL_STOP / AUDIO_SIRI_STOP) which call
+                                        // stopPhoneCallTrack() / stopSiriTrack() to release the
+                                        // volume context — not by buffer drain.
+                                        track.write(
+                                            silenceBuffer,
+                                            0,
+                                            silenceBuffer.size,
+                                            AudioTrack.WRITE_NON_BLOCKING,
+                                        )
+                                    } else {
+                                        // ALERT: pause to release AAOS volume context.
+                                        // Short bursts with defined start/end signals.
+                                        track.pause()
+                                        slot.started = false
+                                        slot.idleSince = 0
+                                        logDebug(
+                                            "[AUDIO] ${slot.purpose} idle-paused " +
+                                                "(no data for ${idlePauseMs}ms)",
+                                        )
+                                    }
                                 }
                             } else {
                                 slot.idleSince = 0
@@ -1078,30 +1279,9 @@ class DualStreamAudioManager(
                                 )
                             }
                         }
-
-                        // Idle-pause: pause track after buffer empty for idlePauseMs.
-                        // Prevents AAOS volume keys from being hijacked by stale PLAYING tracks.
-                        if (track.playState == AudioTrack.PLAYSTATE_PLAYING &&
-                            currentFillMs <= minBufferLevelMs && slot.residualCount == 0
-                        ) {
-                            val now = System.currentTimeMillis()
-                            if (slot.idleSince == 0L) {
-                                slot.idleSince = now
-                            } else if (now - slot.idleSince >= idlePauseMs) {
-                                track.pause()
-                                slot.started = false
-                                slot.idleSince = 0
-                                logDebug(
-                                    "[AUDIO] ${slot.purpose} idle-paused " +
-                                        "(no data for ${idlePauseMs}ms)",
-                                )
-                            }
-                        } else {
-                            slot.idleSince = 0
-                        }
                     }
 
-                    // === Navigation: single track (unchanged) ===
+                    // === Navigation: single track ===
                     navBuffer?.let { buffer ->
                         navTrack?.let { track ->
                             if (track.playState == AudioTrack.PLAYSTATE_PLAYING || navPendingPlay) {
@@ -1236,7 +1416,12 @@ class DualStreamAudioManager(
                         }
                     }
 
-                    if (!didWork) sleep(5)
+                    // Pace every pass, not just idle ones. Each pass can already stage up
+                    // to ~100ms/slot (tempBuffer) into a 750ms ring + the AudioTrack buffer,
+                    // so a fixed 5ms cadence cannot underfeed at 1x realtime — it removes the
+                    // active-playback busy-spin (previously this only slept when fully idle).
+                    // NOTE: `didWork` is now vestigial (assigned but unread) — harmless.
+                    sleep(5)
 
                     // 30s aggregate stats (gated by AUDIO_PERF tag)
                     val now = System.currentTimeMillis()
@@ -1293,7 +1478,7 @@ class DualStreamAudioManager(
                             .append(mUrun)
                         if (mRes > 0) sb.append(" Res:").append(mRes)
 
-                        // Nav stats (unchanged)
+                        // Nav stats
                         val nFill = navBuffer?.fillLevelMs() ?: 0
                         val nOvf = (navBuffer?.overflowCount ?: 0) - prevNavOverflow
                         val nUrun = navUnderruns - prevNavUnderruns
@@ -1316,6 +1501,9 @@ class DualStreamAudioManager(
                         if (nRes > 0) sb.append(" Res:").append(nRes)
                         sb.append("]")
                         if (zf > 0) sb.append(" Zero:").append(zf)
+                        val suppressed = routeRepeatCount
+                        if (suppressed > 0) sb.append(" Route:").append(lastRoutePurpose?.name ?: "?").append("x").append(suppressed)
+                        routeRepeatCount = 0
                         sb.append(" Duck:").append(if (isDucked) "Y" else "N")
                         sb.append(" FDuck:").append((focusDuckLevel * 100).toInt()).append("%")
                         val focusPurposes = activeFocusRequests.keys.joinToString(",")
@@ -1354,7 +1542,7 @@ class DualStreamAudioManager(
                             slot.pendingPlay = false
                             slot.residualCount = 0
                         } else {
-                            // NAV path (unchanged)
+                            // NAV path
                             when (streamType) {
                                 "NAV" -> {
                                     try {

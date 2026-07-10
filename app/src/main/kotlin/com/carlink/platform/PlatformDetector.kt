@@ -7,6 +7,7 @@ import android.os.Build
 import android.util.Log
 import android.view.WindowManager
 import com.carlink.BuildConfig
+import com.carlink.util.WindowMetricsCompat
 
 /**
  * PlatformDetector - Detects hardware platform characteristics for configuration selection.
@@ -22,8 +23,16 @@ import com.carlink.BuildConfig
  * - AudioManager.PROPERTY_OUTPUT_SAMPLE_RATE: Native audio sample rate
  *
  * USAGE:
- * Call detect(context) once during plugin initialization. The returned PlatformInfo
- * is used by AudioConfig to select appropriate settings.
+ * Call detect(context) during video/audio subsystem initialization. PlatformInfo is
+ * NOT cached at this layer — every call re-runs all detection steps. CarlinkManager
+ * stores the returned PlatformInfo locally and forwards it to AudioConfig.forPlatform;
+ * the cluster platform-switch TODO in CarlinkClusterService also plans to consume
+ * PlatformInfo.isGmAaos from here. Re-detection on display-mode reinit is redundant
+ * but cheap (Build properties + one MediaCodecList scan).
+ *
+ * Log output uses android.util.Log directly rather than the project Logger — this
+ * class runs before the Logger is fully wired and any failure here should not
+ * propagate into the file-log pipeline.
  *
  * Reference: https://developer.android.com/ndk/guides/abis
  */
@@ -34,17 +43,31 @@ object PlatformDetector {
      * Platform information data class.
      *
      * @property isIntel True if CPU architecture is x86 or x86_64
-     * @property isGmAaos True if device is GM AAOS (Harman_Samsung manufacturer or gminfo product)
+     * @property isGmAaos True if device is GM AAOS. Matches on Harman_Samsung manufacturer
+     *   OR "gminfo" in product OR device starts with "gminfo". 2024 Silverado gminfo37
+     *   reports Build.MANUFACTURER="gm" (confirmed 6 detections across 3 POTATO sessions
+     *   2026-04-20: product=full_gminfo37_gb, device=gminfo37). The Harman_Samsung branch
+     *   is DEAD CODE on this hardware — kept defensively for hypothetical OEM variants.
      * @property cpuArch Primary CPU ABI (e.g., "arm64-v8a", "x86_64")
-     * @property hasIntelCodec True if an Intel video codec is available
+     * @property hasIntelCodec True if an Intel video codec is available. Naive
+     *   substring match on ".contains("Intel")" in the decoder name — fragile if the
+     *   vendor ever renames.
      * @property hardwareH264DecoderName The detected hardware H.264 decoder name (any vendor)
      * @property nativeSampleRate Device's native audio output sample rate in Hz
      * @property manufacturer Device manufacturer string
      * @property product Device product string
      * @property device Device name string
-     * @property isBroxton True if device is Intel Broxton/Apollo Lake platform (gminfo37)
-     * @property displayWidth Native display width in pixels (0 if unknown)
-     * @property displayHeight Native display height in pixels (0 if unknown)
+     * @property buildId Build fingerprint id (Build.ID). On the GM VCU/VCUNH1 platform this
+     *   carries the "VCU" family prefix (CT5 firmware: "VCUUM-371.5"); used by [isVcuCluster].
+     * @property isBroxton True if Build.BOARD/HARDWARE/PRODUCT contains "broxton".
+     *   EMPIRICALLY FALSE on gminfo37 (POTATO 2026-04-20 "Broxton platform: false" despite
+     *   gminfo37 being Apollo Lake — GM does not publish the SoC codename at Build level).
+     *   Effectively unreachable on all known devices; delete unless a Build property ever
+     *   surfaces "broxton".
+     * @property displayWidth Native display width in pixels (0 if unknown). CURRENTLY
+     *   UNUSED beyond debug logging — MainActivity re-reads WindowMetrics independently
+     *   to compute adapter viewArea/safeArea; this copy is redundant.
+     * @property displayHeight Native display height in pixels (0 if unknown). See [displayWidth].
      */
     data class PlatformInfo(
         val isIntel: Boolean,
@@ -56,15 +79,60 @@ object PlatformDetector {
         val manufacturer: String,
         val product: String,
         val device: String,
+        val buildId: String = "",
         val isBroxton: Boolean = false,
         val displayWidth: Int = 0,
         val displayHeight: Int = 0,
     ) {
         /**
          * Returns true if device is the GM gminfo37 (2400x960 display).
-         * This enables specific optimizations for this hardware configuration.
+         * CURRENTLY UNUSED — reserved for gminfo37-specific tuning that may or may not
+         * materialize. Consider deleting if [isGmAaos] + [isBroxton] ever prove
+         * sufficient for all cases in the audio/video config paths.
          */
         fun isGmInfo37(): Boolean = device.equals("gminfo37", ignoreCase = true)
+
+        /**
+         * Returns true if running on Google's AAOS reference emulator
+         * (product=sdk_gcar_arm64 / sdk_gcar_x86 / sdk_gcar_*). Used as a stand-in for
+         * gminfo37 during local development — same 3P-app constraints, and the only way
+         * to validate gminfo37-specific defaults without the Silverado hardware.
+         */
+        fun isAaosEmulator(): Boolean = product.startsWith("sdk_gcar", ignoreCase = true)
+
+        /**
+         * Composite: device should receive "gminfo37-like" UI defaults
+         * (fullscreen-immersive, OEM icon hidden, etc.). True on gminfo37 itself.
+         * False elsewhere — including the AAOS emulator (a DEBUG APK on the emulator
+         * no longer defaults to immersive) — preserves existing factory defaults for
+         * non-GM 3P targets.
+         */
+        fun requiresImmersiveDefaults(): Boolean = isGmInfo37()
+
+        /**
+         * Returns true on the GM VCU / VCUNH1 (Bosch, AAOS 14) platform — e.g. the 2026 CT5.
+         *
+         * On VCUNH1 the instrument cluster is driven by a separate QNX safety-domain VM that
+         * renders a native GM Altia sprite chosen from the `Maneuver.TYPE_*` enum; the app-side
+         * maneuver bitmap / CarIcon URI is MASKED and never reaches the cluster (see
+         * `documents/reference/gminfo/projection/cluster_maneuver_mapping.md` §0/§4). So on this
+         * platform the per-maneuver bitmap compose ([com.carlink.navigation.compose.ComposedIconStore] /
+         * IconBitmapRenderer) and the AA-bitmap cluster-icon shim are pure wasted work — callers
+         * use this to skip them while keeping the enum/angle lever (the only thing that matters here).
+         *
+         * Detection signature (BEST-EFFORT / UNTESTED — no VCUNH1 hardware on hand) derived from the
+         * CT5 `Radio-IVE-86384258-AAOS14-UQBM` build.prop:
+         *   ro.product.{system,vendor}.device = "burmese"
+         *   ro.product.{system,vendor}.name   = "burmese_orange"
+         *   ro.build.id / ro.vendor.build.id  = "VCUUM-371.5"   (the "VCU" family prefix)
+         *   ro.product.board / ro.board.platform = "msmnile"     (shared SoC — NOT keyed on)
+         * gminfo37 (Silverado) reports device="gminfo37" / product="full_gminfo37_gb" and Build.ID
+         * without the VCU prefix, so it does NOT match here — gminfo3.7 behavior is unaffected.
+         */
+        fun isVcuCluster(): Boolean =
+            device.equals("burmese", ignoreCase = true) ||
+                product.contains("burmese", ignoreCase = true) ||
+                buildId.startsWith("VCU", ignoreCase = true)
 
         /**
          * Returns true if Intel-specific MediaCodec fixes should be applied.
@@ -83,7 +151,8 @@ object PlatformDetector {
         override fun toString(): String =
             "PlatformInfo(arch=$cpuArch, intel=$isIntel, gm=$isGmAaos, " +
                 "hwDecoder=${hardwareH264DecoderName ?: "software"}, " +
-                "nativeRate=${nativeSampleRate}Hz, mfr=$manufacturer, product=$product, device=$device)"
+                "nativeRate=${nativeSampleRate}Hz, mfr=$manufacturer, product=$product, device=$device, " +
+                "buildId=$buildId, vcu=${isVcuCluster()})"
     }
 
     /**
@@ -101,6 +170,7 @@ object PlatformDetector {
         val device = Build.DEVICE ?: ""
         val board = Build.BOARD ?: ""
         val hardware = Build.HARDWARE ?: ""
+        val buildId = Build.ID ?: ""
 
         val isGmAaos = detectGmAaos(manufacturer, product, device)
         val (_, hardwareH264DecoderName) = detectHardwareH264Decoder()
@@ -128,6 +198,7 @@ object PlatformDetector {
                 manufacturer = manufacturer,
                 product = product,
                 device = device,
+                buildId = buildId,
                 isBroxton = isBroxton,
                 displayWidth = displayWidth,
                 displayHeight = displayHeight,
@@ -154,8 +225,8 @@ object PlatformDetector {
         try {
             val windowManager = context.getSystemService(Context.WINDOW_SERVICE) as? WindowManager
             if (windowManager != null) {
-                // minSdk 32 >= API 30 (R), so currentWindowMetrics is always available
-                val bounds = windowManager.currentWindowMetrics.bounds
+                // WindowMetricsCompat: currentWindowMetrics on API 30+, getRealMetrics on API 29.
+                val bounds = WindowMetricsCompat.displayBounds(windowManager)
                 Pair(bounds.width(), bounds.height())
             } else {
                 Pair(0, 0)
@@ -181,10 +252,13 @@ object PlatformDetector {
     /**
      * Detect if device is GM AAOS based on manufacturer, product, and device strings.
      *
-     * Known GM AAOS identifiers:
-     * - Manufacturer: "Harman_Samsung"
-     * - Product: contains "gminfo" (e.g., "full_gminfo37_gb")
-     * - Device: "gminfo37", etc.
+     * Observed on 2024 Silverado gminfo37 (root README.md):
+     * - Manufacturer: "gm"                    (Harman_Samsung branch does NOT fire)
+     * - Product: "full_gminfo37_gb"           (matches via contains("gminfo"))
+     * - Device: "gminfo37"                    (matches via startsWith("gminfo"))
+     *
+     * The Harman_Samsung branch is kept defensively for hypothetical OEM variants that
+     * expose the underlying Harman/Samsung manufacturer at the Build level.
      */
     private fun detectGmAaos(
         manufacturer: String,
@@ -197,6 +271,11 @@ object PlatformDetector {
 
     /**
      * Detect the best available hardware H.264 decoder.
+     *
+     * Uses MediaCodecList.REGULAR_CODECS — deliberately excludes ALL_CODECS, since
+     * vendor-specific non-regular decoders are rarely suitable for real-time video
+     * playback without additional tuning. If no hardware decoder is surfaced as
+     * REGULAR the method returns (false, null) and the app falls back to software.
      *
      * @return Pair of (isHardwareDecoder, codecName)
      */

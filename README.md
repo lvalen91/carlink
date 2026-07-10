@@ -1,11 +1,11 @@
 # Carlink
 
-Carlink is a **native** Kotlin code implementation from the original [Flutter-based](https://github.com/lvalen91/Carlink) app.
+Carlink is a **native** Kotlin code implementation from the original [Flutter-based](https://github.com/lvalen91/carlink_flutter)  app.
 I did this app for me and my use, but sharing so others can use it. Don't expect or demand support but I'll help where i can.
 
 ### Requirments
 
-- For AAOS 12 and higher
+- For AAOS 10 (Android 10) and higher
 - For (Carlinkit CPC200-CCPA)[https://www.carlinkit.com/ccpa] on firmware 2025.10
 
 
@@ -14,6 +14,28 @@ I did this app for me and my use, but sharing so others can use it. Don't expect
 
 ## Work In progress - Something is always changing.. Not always good
 
+> [!IMPORTANT]
+>
+> Limitations
+> Instrument Panel Cluster and Heads Up Display (HUD) Support
+>
+> Song Information:
+> Due to an AAOS bug. Song metadata displaying on the Cluster can go blank. The simplified explanation, the App creates a session 'token' and hands it to the OS. The Native Media Player and the Cluster both read song info from it. The boot/auto-launch, head unit reboot, and adapter config-change cases have been fixed, so those now repopulate the Cluster card correctly. The one case still left is force-stopping the app and relaunching it: the OS-side CarLauncher controller is nulled when the session is destroyed and never rebound (an AOSP limitation), so the Cluster keeps holding the dead controller and goes blank. There are no known ways for third-party apps to fix that last case. Emulator testing shows Apple Music and Spotify hit the same stale card, confirming it's a platform limitation, not app-side.
+>
+> Navigation Turn-By-Turn
+> On STOCK adapter firmware, the firmware strips away the rich nav details iPhones provide and narrows it down to basic manuvers. The custom adapter firmware (see below) restores full iAP2 route information, so CarPlay now gets complete maneuver/route data. CarPlay itself does not send ready-made navigation icons, so the app generates them on-device from the recovered iAP2 geometry (including correct roundabouts drawn from the real junction arms). Android Auto does provide manuver images, which are forwarded to the cluster. They are more detailed and accurate.
+>
+> Vehicles running the GM VCU radio (Bosch VCUNH1 — most EVs and newer Fuel/ICE vehicles) on GM AAOS 14+ do not use any icon provided by the app. GM VMSPlugin still passes them, but the Cluster ECU ignores it and renders from its own internal icon set based on the manuver type (VMSPlugin's setManeuverType() enum forces the GM glyph). Earlier VCU vehicles on AAOS 12 or 13 may have behaved differently before being upgraded.
+>
+> Cluster Navigation Icons for forks / other developers (gminfo3.7):
+> This mechanism only does anything useful on the **gminfo3.7** platform (Info 3.7, AAOS 12, e.g. my Silverado). The hook itself (the unregistered authority) is firmware-verified to be open/claimable on the newer **GM VCU** platform too (Bosch VCUNH1 — the EV and newer-ICE radios on AAOS 14, which ships the same unmodified Google Templates Host), but on VCUNH1 it is **bypassed**: GM's VMSPlugin force-renders the cluster glyph from a maneuver-type enum (setManeuverType), so the app's icon is masked regardless of who owns the authority (see the GM VCU note above). The way the app gets its own maneuver icons into the gminfo3.7 cluster is by claiming a content provider 'hook' (the authority `com.google.android.apps.automotive.templates.host.ClusterIconContentProvider`) that GM's Templates Host references but never registers — GM leaves it open/unclaimed. The app registers a provider on that authority so the cluster's icon calls land on it and get the forwarded Android Auto maneuver bitmaps. Because I was the first developer to upload a bundle claiming that authority, Google reserved it to me — Google enforces that a content provider authority is globally unique and locked to its first publisher. The catch is for everyone else: because GM exposes only that ONE open hook and I already claimed it, no other developer's bundle can claim the same authority — Google rejects it on upload. The code is left in place so another dev can still build and ship from this repo with one change: a fork changes only its `applicationId` and the `play` flavor automatically derives a unique authority (`<applicationId>.ClusterIconContentProvider`) to get past the Play Console check. But GM AAOS only ever calls the real GM authority, so that derived provider is never invoked on the head unit — it lets a fork upload, it does not actually deliver icons to the cluster. Net result: a fork can publish, but without the GM authority the cluster shows text navigation only — no maneuver icons at all.
+>
+> My truck doesn't have an HUD, so i cannot test this. However, some Silverado and Hummer EV users have reported that the HUD does show navigation. I can only test for the software in my Silverado. GM and others can easily change how that is controlled so if it works, great. If it doesnt.. too bad.
+
+> [!TIP]
+> Before complaining about Audio issues.
+> 1. Disconnect and forget the Phone and Vehicle from each others Bluetooth. The adapter defaults to audio routing THROUGH the adapter for both microhone input and audio output. Make sure you allowed microphone access to the app.
+> 2. Steering Wheel Voice/Call Control doesn't work. That is a system-level app featuer and this is not that. If you want Steering Wheel Voice Controls, then ignore #1 and set the in-app adapter audio routing to Bluetooth. THe Phone and Vehicle will stay connected for ALL audio related events.
 
 > [!IMPORTANT]
 >My 2024 Silverado gminfo3.7 Intel AAOS radio is the target Platform and my only hardware for testing. 
@@ -37,6 +59,13 @@ Buffers create corruption. Queues create lies.
 Audio is a continuous time signal that must never stall.
 Video may drop. Audio may buffer. Neither may block the other
 
+> [!IMPORTANT]
+> Adapter-SIde Binaries were patched to correct to problems and require use of custom firmware on the adapter itself.
+> 1. Carlinkit Stripped away rich iAP2 navigation data rcvd from iPhone, that has been corrected in custom firmware. Full iAP2 route information is now forwarded and rcvd.
+> 2. Carlinkit AndroidAuto incorrectly parsed rcvd Vehicle GPS NMEA when app forwarded to Phone. That is now patched so correct and accura NMEA is rcvd by Android Phone.
+>
+> Custom adapter firmware for complete/correct Carplay Route information and Correct GPS-Forwarding support on Android Auto. While not necessary to have, it provides a better and closer to stock experience if you do load.
+
 ```
 Video:
 - Represents live UI state
@@ -55,7 +84,7 @@ Audio:
 
 
 > [!IMPORTANT]
-> My Primary smartphone is an iPHone and therefor Carplay as gotten the most tuning and testing. A Google Pixel 10 is used for testing basic functionality, cannot do real-world 'Day to Day' testing.
+> My Primary smartphone is an iPhone and therefor Carplay as gotten the most tuning and testing. A Google Pixel 10 is used for testing basic functionality, cannot do real-world 'Day to Day' testing.
 
 ## Screen Shots from Android Emulator with USB-PassThrough for CPC200-CCPA Use
 

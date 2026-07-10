@@ -1,4 +1,4 @@
-AAOS Emulator USB Passthrough (macOS)
+ AAOS Emulator USB Passthrough (macOS)
 
 Passes the Carlinkit CPC200-CCPA USB adapter into an Android Automotive OS emulator on macOS for development and testing without a physical head unit.
 
