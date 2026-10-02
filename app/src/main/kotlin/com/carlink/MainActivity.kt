@@ -511,7 +511,9 @@ class MainActivity : ComponentActivity() {
         val userSelectedResolution = !userConfig.videoResolution.isAuto
         val (configWidth, configHeight) =
             if (userConfig.videoResolution.isAuto) {
-                Pair(evenWidth, evenHeight)
+                // Some decoders cannot configure the full display size even though their
+                // advertised capabilities say they can (see DecoderCompat).
+                com.carlink.platform.DecoderCompat.adjust(evenWidth, evenHeight)
             } else {
                 // User selected a specific resolution - use it for adapter config
                 // Note: Surface size remains the actual display size for touch normalization
