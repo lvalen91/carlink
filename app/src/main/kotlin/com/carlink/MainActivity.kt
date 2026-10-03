@@ -13,6 +13,7 @@ import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import android.view.WindowManager
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
@@ -92,6 +93,15 @@ import java.nio.ByteOrder
  *    [SettingsScreen] on top via AnimatedVisibility rather than replacing it.
  */
 class MainActivity : ComponentActivity() {
+    // Short activity transitions can use the codec-only pause/resume path. A vehicle
+    // sleep lasting longer than this may suspend/recreate AAOS USB, audio, or Surface
+    // resources while the process survives, so rebuild the complete session on return.
+    private var stoppedAtElapsedMs: Long = 0L
+
+    private companion object {
+        const val LONG_BACKGROUND_RECOVERY_MS = 3 * 60_000L
+    }
+
     // Nullable to prevent UninitializedPropertyAccessException if Activity
     // is destroyed before initialization completes (e.g., low memory kill)
     private var carlinkManager: CarlinkManager? = null
@@ -295,15 +305,45 @@ class MainActivity : ComponentActivity() {
 
     override fun onStart() {
         super.onStart()
-        // Resume video decoding when app returns to foreground
-        // On AAOS, Surface may remain valid while app is in background, but
-        // BufferQueue can stall. Resume codec and request keyframe for immediate video.
-        logInfo("[LIFECYCLE] onStart - resuming video", tag = "MAIN")
-        carlinkManager?.resumeVideo()
+        val stoppedAt = stoppedAtElapsedMs
+        stoppedAtElapsedMs = 0L
+        val backgroundDurationMs =
+            if (stoppedAt > 0L) {
+                (SystemClock.elapsedRealtime() - stoppedAt).coerceAtLeast(0L)
+            } else {
+                0L
+            }
+
+        val manager = carlinkManager
+        if (manager != null && backgroundDurationMs >= LONG_BACKGROUND_RECOVERY_MS) {
+            logInfo(
+                "[LIFECYCLE] onStart - long background (${backgroundDurationMs}ms), " +
+                    "rebuilding adapter session",
+                tag = "MAIN",
+            )
+            CoroutineScope(Dispatchers.IO).launch {
+                try {
+                    manager.recoverAfterLongBackground(backgroundDurationMs)
+                } catch (e: kotlinx.coroutines.CancellationException) {
+                    throw e
+                } catch (e: Exception) {
+                    logWarn(
+                        "[LIFECYCLE] Long-background recovery failed: " +
+                            (e.message ?: e.javaClass.simpleName),
+                        tag = "MAIN",
+                    )
+                }
+            }
+        } else {
+            // Short transitions retain the low-latency codec-only path.
+            logInfo("[LIFECYCLE] onStart - resuming video", tag = "MAIN")
+            manager?.resumeVideo()
+        }
     }
 
     override fun onStop() {
         super.onStop()
+        stoppedAtElapsedMs = SystemClock.elapsedRealtime()
         // Pause video decoding when app goes to background
         // On AAOS, when another app covers this app (Maps, Phone, etc.), the Surface
         // may remain valid but SurfaceFlinger stops consuming frames. This causes

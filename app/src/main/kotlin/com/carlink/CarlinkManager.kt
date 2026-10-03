@@ -1,7 +1,6 @@
 package com.carlink
 
 import android.content.Context
-import android.hardware.usb.UsbManager
 import android.os.PowerManager
 import android.view.Surface
 import androidx.core.content.edit
@@ -49,7 +48,8 @@ import com.carlink.protocol.VideoStreamingSignal
 import com.carlink.ui.settings.AdapterConfigPreference
 import com.carlink.ui.settings.MicSourceConfig
 import com.carlink.ui.settings.WiFiBandConfig
-import com.carlink.usb.UsbDeviceWrapper
+import com.carlink.usb.RemoteUsbTransport
+import com.carlink.usb.UsbTransport
 import com.carlink.util.AppExecutors
 import com.carlink.util.LogCallback
 import com.carlink.video.H264Renderer
@@ -143,6 +143,10 @@ class CarlinkManager(
     companion object {
         private const val USB_WAIT_PERIOD_MS = 3000L
         private const val PAIR_TIMEOUT_MS = 15000L
+        // If the adapter remains in CONNECTING without ever emitting PLUGGED,
+        // its wireless/session state can be stale after AAOS sleep. Give the
+        // pairing retry time to work, then rebuild the session automatically.
+        private const val PHONE_HANDSHAKE_TIMEOUT_MS = 30000L
 
         // Auto-reconnect constants
         private const val MAX_RECONNECT_ATTEMPTS = 5
@@ -322,8 +326,7 @@ class CarlinkManager(
     private var callback: Callback? = null
 
     // USB
-    private val usbManager = context.getSystemService(Context.USB_SERVICE) as UsbManager
-    private var usbDevice: UsbDeviceWrapper? = null
+    private var usbDevice: UsbTransport? = null
 
     // Wake lock to prevent CPU sleep during USB streaming
     // PARTIAL_WAKE_LOCK keeps CPU running but allows screen to turn off
@@ -876,15 +879,25 @@ class CarlinkManager(
 
         // Find device
         log("Searching for Carlinkit device...")
-        val device = findDevice()
-        if (device == null) {
-            logError("Failed to find Carlinkit device", tag = Logger.Tags.USB)
+        val device = RemoteUsbTransport(context) { log(it) }
+        if (!device.connect()) {
+            val reason = device.failureDetail.ifBlank { "unknown helper connection failure" }
+            // connect() may have successfully bound the helper before its USB
+            // enumeration was ready. Always tear that transport down before a
+            // retry; otherwise the next attempt can inherit a stale Binder
+            // connection or a shut-down callback executor.
+            device.close()
+            logError("USB helper unavailable: $reason", tag = Logger.Tags.USB)
             setState(State.DISCONNECTED)
-            setStatusText("Adapter not found")
+            setStatusText("USB helper unavailable: $reason")
+            // A USB attach broadcast can arrive before UsbManager's device list
+            // and the GM fixed-handler permission grant settle. Retry through the
+            // normal backoff path instead of requiring the user to press Reset.
+            scheduleReconnect()
             return
         }
 
-        log("Device found, opening")
+        log("USB helper connected")
         usbDevice = device
         setStatusText("Adapter found — opening...")
 
@@ -912,13 +925,6 @@ class CarlinkManager(
             },
             tag = Logger.Tags.VIDEO,
         )
-
-        if (!device.openWithPermission()) {
-            logError("Failed to open USB device", tag = Logger.Tags.USB)
-            setState(State.DISCONNECTED)
-            setStatusText("USB permission denied")
-            return
-        }
 
         // Clear any stale adapter session left by a prior force-kill or crash.
         // The adapter firmware retains session state across USB reconnects. If the previous
@@ -1034,6 +1040,33 @@ class CarlinkManager(
                         }
                     },
                     PAIR_TIMEOUT_MS,
+                )
+                schedule(
+                    object : TimerTask() {
+                        override fun run() {
+                            if (state == State.CONNECTING && currentPhoneType == null) {
+                                logWarn(
+                                    "[PAIR] No PLUGGED phone handshake after " +
+                                        "${PHONE_HANDSHAKE_TIMEOUT_MS}ms; restarting session",
+                                    tag = Logger.Tags.ADAPTR,
+                                )
+                                scope.launch {
+                                    try {
+                                        restart()
+                                    } catch (error: kotlinx.coroutines.CancellationException) {
+                                        throw error
+                                    } catch (error: Exception) {
+                                        logWarn(
+                                            "[PAIR] Automatic session restart failed: " +
+                                                (error.message ?: error.javaClass.simpleName),
+                                            tag = Logger.Tags.ADAPTR,
+                                        )
+                                    }
+                                }
+                            }
+                        }
+                    },
+                    PHONE_HANDSHAKE_TIMEOUT_MS,
                 )
             }
     }
@@ -1553,6 +1586,30 @@ class CarlinkManager(
     }
 
     /**
+     * Rebuild the complete adapter session after a prolonged AAOS background period.
+     *
+     * A short activity transition only needs the codec flush in [pauseVideo]. After a
+     * long vehicle sleep, however, AAOS may suspend/recreate the USB, audio, or Surface
+     * pipelines while this process remains alive. In that state the old session can
+     * report as connected while delivering corrupted/stalled audio and video. Releasing
+     * the transport, audio tracks, codec state, and adapter protocol session together
+     * mirrors the recovery that users currently get by force-stopping and reopening the
+     * app, without requiring user intervention.
+     *
+     * The caller should run this from a background dispatcher because [start] contains
+     * deliberate protocol pacing delays.
+     */
+    suspend fun recoverAfterLongBackground(backgroundDurationMs: Long) {
+        logWarn(
+            "[LIFECYCLE] Recovering full adapter session after " +
+                "${backgroundDurationMs}ms in background",
+            tag = Logger.Tags.ADAPTR,
+        )
+        stop()
+        start()
+    }
+
+    /**
      * Recover video after settings overlay closes.
      * Flushes the codec to release stalled BufferQueue buffers, then requests
      * a keyframe (CarPlay only — AA keyframe resets phone UI).
@@ -1714,26 +1771,6 @@ class CarlinkManager(
             wakeLock.release()
             logInfo("[WAKE_LOCK] Released wake lock", tag = Logger.Tags.USB)
         }
-    }
-
-    private suspend fun findDevice(): UsbDeviceWrapper? {
-        var device: UsbDeviceWrapper? = null
-        var attempts = 0
-
-        while (device == null && attempts < 10) {
-            device = UsbDeviceWrapper.findFirst(context, usbManager) { log(it) }
-
-            if (device == null) {
-                attempts++
-                delay(USB_WAIT_PERIOD_MS)
-            }
-        }
-
-        if (device != null) {
-            log("Carlinkit device found!")
-        }
-
-        return device
     }
 
     private fun handleMessage(message: Message) {
@@ -3052,8 +3089,8 @@ class CarlinkManager(
      * - offset 12: pts (4 bytes) - SOURCE PRESENTATION TIMESTAMP (milliseconds, logged only — codec uses elapsed-time PTS)
      * - offset 16: flags (4 bytes) - usually 0 (reserved)
      */
-    private fun createVideoProcessor(): UsbDeviceWrapper.VideoDataProcessor {
-        return object : UsbDeviceWrapper.VideoDataProcessor {
+    private fun createVideoProcessor(): UsbTransport.VideoDataProcessor {
+        return object : UsbTransport.VideoDataProcessor {
             override fun processVideoDirect(
                 data: ByteArray,
                 dataLength: Int,

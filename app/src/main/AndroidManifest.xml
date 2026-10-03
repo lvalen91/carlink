@@ -2,6 +2,12 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     xmlns:tools="http://schemas.android.com/tools">
 
+    <!-- The USB bridge is a separately installed helper application. Make its
+         exported service visible to PackageManager on Android 11+/AAOS. -->
+    <queries>
+        <package android:name="android.car.usb.handler" />
+    </queries>
+
     <!-- Permissions -->
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
     <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
@@ -29,15 +35,6 @@
         android:name="com.carlink.permission.NAVI_VIDEO_STREAM"
         android:protectionLevel="signature|privileged" />
     <uses-permission android:name="com.carlink.permission.NAVI_VIDEO_STREAM" />
-
-    <!-- USB Host. required=false on purpose: the CPC200 adapter needs USB host at
-         runtime, but GM AAOS (gm/gminfo37) does NOT advertise android.hardware.usb.host
-         in its Play device profile, so required=true filtered the truck out of the AAOS
-         track. required=false stops Play filtering on it; the UsbManager API + the
-         usb_device_filter below are unaffected and still work at runtime. -->
-    <uses-feature
-        android:name="android.hardware.usb.host"
-        android:required="false" />
 
     <!-- Optional Features -->
     <uses-feature
@@ -101,15 +98,6 @@
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.APP_MUSIC" />
             </intent-filter>
-
-            <!-- USB Device Attachment -->
-            <intent-filter>
-                <action android:name="android.hardware.usb.action.USB_DEVICE_ATTACHED" />
-            </intent-filter>
-
-            <meta-data
-                android:name="android.hardware.usb.action.USB_DEVICE_ATTACHED"
-                android:resource="@xml/usb_device_filter" />
 
             <!-- AAOS Distraction Optimization for Activity -->
             <meta-data

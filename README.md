@@ -8,6 +8,18 @@ I did this app for me and my use, but sharing so others can use it. Don't expect
 - For AAOS 10 (Android 10) and higher
 - For (Carlinkit CPC200-CCPA)[https://www.carlinkit.com/ccpa] on firmware 2025.10
 
+### GM USB / Play split architecture
+
+On the target GM AAOS 12 radio, USB ownership and Play-distributed driving
+behavior require different package identities. The repository therefore builds
+the Play UI as `ey.carlink` and a separate sideloaded USB owner as
+`android.car.usb.handler`. The helper owns the CPC200 USB connection and
+forwards protocol messages to the Play app over Binder/AIDL; the Play app keeps
+the distraction-optimized UI and does not request USB permission directly.
+
+See [USB bridge architecture](documents/reference/usb_bridge_architecture.md)
+for the component names, build commands, installation order, and diagnostics.
+
 
 ## [XDA Developer Forums](https://xdaforums.com/t/carlink.4774308/)
 

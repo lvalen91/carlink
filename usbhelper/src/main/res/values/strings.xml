@@ -1,0 +1,4 @@
+<resources>
+    <string name="app_name">CL USB Helper</string>
+    <string name="bridge_channel">Carlink USB bridge</string>
+</resources>

@@ -12,6 +12,8 @@ android {
     // Owner identity for the cluster icon ContentProvider hook (issue #6).
     // A FORK changes ONLY ownerApplicationId below — applicationId and the play-flavor
     // cluster icon authority both follow it automatically.
+    // Play-distributed UI application. USB access is provided by the separately
+    // sideloaded :usbhelper application under android.car.usb.handler.
     val ownerApplicationId = "zeno.carlink"
     val gmClusterIconAuthority =
         "com.google.android.apps.automotive.templates.host.ClusterIconContentProvider"
@@ -165,7 +167,8 @@ detekt {
     ignoreFailures = true // report only on first run
 }
 
-dependencies {
+    dependencies {
+    implementation(project(":usbbridge"))
     // Kotlin
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.10.2")
 
@@ -218,4 +221,3 @@ dependencies {
     debugImplementation("androidx.compose.ui:ui-tooling")
     debugImplementation("androidx.compose.ui:ui-test-manifest")
 }
-

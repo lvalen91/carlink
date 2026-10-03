@@ -59,6 +59,7 @@ import com.carlink.BuildConfig
 import com.carlink.CarlinkManager
 import com.carlink.R
 import com.carlink.logging.logDebug
+import com.carlink.logging.logError
 import com.carlink.logging.logInfo
 import com.carlink.protocol.MessageSerializer
 import com.carlink.protocol.MultiTouchAction
@@ -162,7 +163,16 @@ fun MainScreen(
             )
             if (!hasStartedConnection) {
                 hasStartedConnection = true
-                carlinkManager.start()
+                try {
+                    carlinkManager.start()
+                } catch (e: kotlinx.coroutines.CancellationException) {
+                    throw e
+                } catch (e: Exception) {
+                    val message = e.message ?: e.javaClass.simpleName
+                    logError("[STARTUP] Adapter startup failed: $message", tag = "UI")
+                    connectionState = CarlinkManager.State.DISCONNECTED
+                    statusText = "Adapter startup failed: $message"
+                }
             }
         }
     }

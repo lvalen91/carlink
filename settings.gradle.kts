@@ -19,3 +19,5 @@ dependencyResolutionManagement {
 
 rootProject.name = "carlink-native"
 include(":app")
+include(":usbbridge")
+include(":usbhelper")

@@ -1,7 +1,7 @@
 package com.carlink.protocol
 
 import com.carlink.protocol.MultiTouchAction
-import com.carlink.usb.UsbDeviceWrapper
+import com.carlink.usb.UsbTransport
 import java.util.Locale
 import java.util.Timer
 import java.util.TimerTask
@@ -37,13 +37,13 @@ import java.util.concurrent.atomic.AtomicLong
  *    track state externally.
  */
 class AdapterDriver(
-    private val usbDevice: UsbDeviceWrapper,
+    private val usbDevice: UsbTransport,
     private val messageHandler: (Message) -> Unit,
     private val errorHandler: (String) -> Unit,
     private val logCallback: (String) -> Unit,
     private val readTimeout: Int = 30000,
     private val writeTimeout: Int = 1000,
-    private val videoProcessor: UsbDeviceWrapper.VideoDataProcessor? = null,
+    private val videoProcessor: UsbTransport.VideoDataProcessor? = null,
 ) {
     private var heartbeatTimer: Timer? = null
     private var wifiConnectTimer: Timer? = null
@@ -381,7 +381,7 @@ class AdapterDriver(
 
     private fun startReadingLoop() {
         usbDevice.startReadingLoop(
-            object : UsbDeviceWrapper.ReadingLoopCallback {
+            object : UsbTransport.ReadingLoopCallback {
                 override fun onMessage(
                     type: Int,
                     data: ByteArray?,
